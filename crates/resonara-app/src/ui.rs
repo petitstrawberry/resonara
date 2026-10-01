@@ -1,5 +1,5 @@
 //! Shared ScarletUI composition and visual tokens.
-use scarlet_ui::{prelude::*, views::containers::ViewTuple};
+use scarlet_ui::{prelude::*, views::containers::ViewTuple, vstack};
 use std::any::Any;
 
 pub const BG: Color = Color::rgb_f32(0.075, 0.083, 0.101);
@@ -12,6 +12,39 @@ pub const ACCENT: Color = Color::rgb_f32(0.35, 0.77, 0.75);
 pub const GOLD: Color = Color::rgb_f32(0.98, 0.74, 0.34);
 pub const ROW: f32 = 84.;
 pub const HEADER: f32 = 210.;
+pub const CONTROL_HEIGHT: f32 = 28.;
+pub const CONTROL_FONT: f32 = 11.;
+pub const CONTROL_GAP: f32 = 8.;
+pub const TRANSPORT_GROUP_HEIGHT: f32 = 48.;
+pub fn compact_button(text: impl Into<String>) -> Button {
+    button(text).font_size(CONTROL_FONT).padding(4.)
+}
+pub fn compact_field(state: State<String>) -> TextField {
+    field(state).font_size(CONTROL_FONT).padding(4.)
+}
+pub fn transport_group(title: &str, control: impl View + Clone + 'static, width: f32) -> AnyView {
+    AnyView::new(
+        vstack! {
+            caption(title).font_size(9.).frame(width,12.),
+            control.frame(width,CONTROL_HEIGHT)
+        }
+        .spacing(4.)
+        .frame(width, TRANSPORT_GROUP_HEIGHT),
+    )
+}
+
+pub fn lcd_field(state: State<String>) -> TextField {
+    compact_field(state)
+        .text_color(ACCENT)
+        .border_color(Color::TRANSPARENT)
+        .focused_border_color(Color::TRANSPARENT)
+}
+pub fn lcd_group(title: &str, control: impl View + Clone + 'static, width: f32) -> AnyView {
+    AnyView::new(vstack! {
+        caption(title).font_size(9.).padding_insets(EdgeInsets::new(4.,0.,0.,0.)).frame(width,10.),
+        control.frame(width,CONTROL_HEIGHT)
+    }.spacing(2.).frame(width,40.))
+}
 
 #[derive(Clone)]
 pub struct AnyView(pub Box<dyn View>);
@@ -126,6 +159,8 @@ impl View for ShortcutBoundary {
             inner: self.0.create_element(),
             suppress: false,
             horizontal: None,
+            input: None,
+            track_area: None,
         })
     }
     fn listenables(&self) -> Vec<&dyn Listenable> {
@@ -141,7 +176,11 @@ struct ShortcutBoundaryElement {
     inner: Box<dyn scarlet_ui::Element>,
     suppress: bool,
     horizontal: Option<std::rc::Rc<dyn Fn(i32)>>,
+    input: Option<InputCallback>,
+    track_area: Option<Option<usize>>,
 }
+type InputCallback =
+    std::rc::Rc<dyn Fn(&dyn scarlet_ui::Element, &scarlet_ui::event::Event) -> bool>;
 fn command_in_text_field(
     element: &mut dyn scarlet_ui::Element,
     event: &scarlet_ui::event::Event,
@@ -186,6 +225,12 @@ impl scarlet_ui::Element for ShortcutBoundaryElement {
             self.inner.update(&v.0)
         } else if let Some(v) = v.as_any().downcast_ref::<HorizontalWheel>() {
             self.horizontal = Some(v.1.clone());
+            self.inner.update(&v.0)
+        } else if let Some(v) = v.as_any().downcast_ref::<InputBoundary>() {
+            self.input = Some(v.1.clone());
+            self.inner.update(&v.0)
+        } else if let Some(v) = v.as_any().downcast_ref::<TrackArea>() {
+            self.track_area = Some(v.1);
             self.inner.update(&v.0)
         } else {
             scarlet_ui::element::UpdateResult::Replaced
@@ -239,6 +284,14 @@ impl scarlet_ui::Element for ShortcutBoundaryElement {
         phase: scarlet_ui::event::Phase,
     ) -> bool {
         use scarlet_ui::event::{Event, KeyEvent, Phase};
+        if matches!(phase, Phase::Capture | Phase::Target)
+            && self
+                .input
+                .as_ref()
+                .is_some_and(|callback| callback(self.inner.as_ref(), e))
+        {
+            return true;
+        }
         // After the first tick the dispatcher captures a wheel transaction
         // to this element, so subsequent ticks arrive at Target rather than Capture.
         if phase == Phase::Target {
@@ -304,6 +357,8 @@ impl View for HorizontalWheel {
             inner: self.0.create_element(),
             suppress: false,
             horizontal: Some(self.1.clone()),
+            input: None,
+            track_area: None,
         })
     }
     fn listenables(&self) -> Vec<&dyn Listenable> {
@@ -311,6 +366,99 @@ impl View for HorizontalWheel {
     }
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+/// Capture secondary-click requests before header buttons/sliders can act.
+#[derive(Clone)]
+pub struct InputBoundary(pub AnyView, pub InputCallback);
+impl View for InputBoundary {
+    fn create_element(&self) -> Box<dyn scarlet_ui::Element> {
+        Box::new(ShortcutBoundaryElement {
+            inner: self.0.create_element(),
+            suppress: false,
+            horizontal: None,
+            input: Some(self.1.clone()),
+            track_area: None,
+        })
+    }
+    fn listenables(&self) -> Vec<&dyn Listenable> {
+        self.0.listenables()
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+/// Identifies a track header, or the header column's blank viewport (None).
+#[derive(Clone)]
+pub struct TrackArea(pub AnyView, pub Option<usize>);
+impl View for TrackArea {
+    fn create_element(&self) -> Box<dyn scarlet_ui::Element> {
+        Box::new(ShortcutBoundaryElement {
+            inner: self.0.create_element(),
+            suppress: false,
+            horizontal: None,
+            input: None,
+            track_area: Some(self.1),
+        })
+    }
+    fn listenables(&self) -> Vec<&dyn Listenable> {
+        self.0.listenables()
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+pub fn track_at(
+    element: &dyn scarlet_ui::Element,
+    parent: Point,
+    point: Point,
+) -> Option<Option<usize>> {
+    let origin = Point::new(
+        parent.x + element.position().x,
+        parent.y + element.position().y,
+    );
+    if !Rect::from_xywh(
+        origin.x,
+        origin.y,
+        element.bounds().size.width,
+        element.bounds().size.height,
+    )
+    .contains(point)
+    {
+        return None;
+    }
+    for child in element.children().iter().rev() {
+        if let Some(target) = track_at(child.as_ref(), origin, point) {
+            return Some(target);
+        }
+    }
+    let area = element
+        .as_any()
+        .downcast_ref::<ShortcutBoundaryElement>()?
+        .track_area?;
+    if area.is_some() || point.x - origin.x < HEADER {
+        Some(area)
+    } else {
+        None
+    }
+}
+
+pub fn mac_control_down() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // MouseEvent in the pinned framework has no modifiers. Read only the
+        // system's current Control flag; no new native-menu dependency or OS
+        // preference change. Apply this solely within the marked track column.
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGEventSourceFlagsState(state_id: i32) -> u64;
+        }
+        // kCGEventSourceStateCombinedSessionState = 0, kCGEventFlagMaskControl.
+        unsafe { CGEventSourceFlagsState(0) & (1 << 18) != 0 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 pub fn elide(text: &str, max: usize) -> String {

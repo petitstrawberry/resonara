@@ -49,6 +49,15 @@ Spectrum's actual numbers, not a claim that Apple specifies or certifies them.
 Native tick density may be reduced at short control heights to keep labels
 readable; the underlying transfer functions must not change with tick density.
 
+## Native interaction
+
+The native left gain labels are clickable: +6, 0, −6, −18 and −48 dB map
+directly to linear gain, while −∞ sets zero. Selection chooses the nearest
+painted label center at compact heights. The track/thumb still supports
+continuous pointer and keyboard adjustment; double-clicking the thumb resets
+to unity. Right-hand Peak dBFS meter labels are read-only. Track and Master use
+the same interaction and preserve one history entry per gesture.
+
 ## Attribution and licensing evidence
 
 Spectrum is authored by petitstrawberry. Its

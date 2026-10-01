@@ -16,14 +16,19 @@ preserved. No ScarletUI/SGFX source, revision or lockfile was changed.
 
 - Apple M3 Pro, arm64, macOS 26.6.2; the existing Nix installation successfully
   entered the pinned development shell. Debug and release builds passed.
-- `scripts/verify` passed 114 tests: 64 app and 50 core integration, zero failed;
+- `scripts/verify` passed 125 tests: 74 app and 51 core integration, zero failed;
   one optional stress test remained excluded. Formatting, dependency identity
-  and shell syntax checks passed. Log: `artifacts/mac-final-verify.log`.
+  and shell syntax checks passed. Logs: `artifacts/mac-workbench-final-verify.log`
+  and `artifacts/mac-workbench-final-build.log`.
 - Native renderer diagnostics selected **Apple M3 Pro / Metal**, rather than
   software Vulkan. Logs: `artifacts/mac-release-native.log` and
   `artifacts/mac-latest-native.log`. The final release was separately relaunched
-  and its complete arrangement/mixer and adjacent musical counter/BPM controls
-  were observed in the real application. Log: `artifacts/mac-final-native.log`.
+  and its complete arrangement/mixer and integrated musical counter/BPM/meter
+  controls were observed in the real application, including rounded LCD border,
+  inset labels and borderless inputs. Logs: `artifacts/mac-final-native.log` and
+  `artifacts/mac-workbench-final-native.log`. Initial screenshots on two launches
+  showed a narrow partial window; subsequent read-only snapshots showed the full
+  window without agent input. The resize cause was not isolated.
 - The user operated playback and confirmed audible output. The reported default
   output was MacBook Pro speakers, 48 kHz stereo. No OS volume/device setting was
   changed and no input recording was started. This is audible-output acceptance,
@@ -40,25 +45,49 @@ User feedback produced these application changes:
 - Master gain now publishes its control state during pointer movement. A real
   ElementTree event-dispatch regression verifies successive thumb-state changes
   and one grouped drag history entry, including undo/redo.
-- Counter, ruler and waveform grid default to bars/beats/ticks at fixed 4/4,
-  960 ticks per quarter note. Adjacent BPM entry accepts 20–400 including
+- Counter, ruler and waveform grid default to bars/beats/ticks,
+  960 ticks per quarter note. BPM entry in a shared rounded LCD accepts 20–400 including
   fractional values. Time and sample-position displays remain selectable.
-  Persistence defaults legacy projects to 120 BPM; validation rejects invalid
-  tempos. Tests cover beat/bar carry, grid density, input, history, save/load and
-  byte-identical WAV export across a tempo change. Tempo edits stop playback;
+  Persistence defaults legacy projects to 120 BPM and 4/4; validation rejects invalid
+  tempos and meters. Meter numerator accepts 1–32 and denominator 1, 2, 4, 8, 16
+  or 32; BPM remains quarter notes per minute. Tests cover beat/bar carry, grid
+  density, input, history, save/load and byte-identical WAV export across tempo
+  and meter changes. Tempo/meter edits stop playback;
   they change display conversion, not sample positions or audio stretching.
 - The pinned ScarletUI `KeyModifiers::primary()` only checks Control. The app
   translates Command for the focused TextField through its existing input
   boundary. An event-dispatch test covers Command+A, fractional BPM entry and
   Enter without triggering global DAW shortcuts. This is an application
   workaround, not a framework fix. Framework pins remain intact.
+- Gain scale clicks on both track and Master set exact +6, 0, −6, −18,
+  −48 dB or silence. The separate dBFS meter remains read-only. Tests check
+  state/model/audio agreement, neighboring controls, cancel and grouped history.
+- Track header context menus select the clicked track before Add/Duplicate/Delete;
+  blank track-column context and the ruler's + add empty tracks. Inspector
+  contains properties. Event-dispatch tests cover menu actions, Escape/outside
+  dismissal, empty projects, shortcuts, selection, Undo/Redo and persistence.
+  Pinned MouseEvent has no modifier snapshot, so Mac Control-click reads
+  CoreGraphics combined-session flags on button press. This narrow compatibility
+  path has semantic tests but awaits a native manual check.
+- Follow/Fixed toggles paged follow at 90% of the viewport. Mounted pipeline tests
+  show no body rebuild/static-wave refresh during playback inside a page; a
+  viewport page shift refreshes the grid. Ruler capture previews seeks through
+  pointer moves/outside bounds, stops the audio stream once on press, and resumes
+  once on release if previously playing; Escape restores the previous position.
+  This implements seek dragging, not audible scrubbing.
+- Header/transport controls use common height/type/padding. Counter, borderless
+  BPM and meter fields share one rounded LCD; label inset and vertical padding
+  keep text away from its border. All formats fit the minimum 1000-pixel window
+  in layout tests. Non-4/4 tests cover carry, odd-bar grid alignment and actual
+  meter-field Command+A/type/Enter routing.
 
 The final transport grouping was informed by the official
 [Logic Pro LCD guide](https://support.apple.com/en-euro/guide/logicpro/lgcp127f51bc/mac)
 and [Cubase transport sections](https://www.steinberg.help/r/cubase-pro/15.0/en/cubase_nuendo/topics/playback/playback_transport_panel_sections_r.html?contentId=abquVlhKSd8RxOz1CvpAGw).
 Region drag, edge trim, Split tool and S behavior were not redesigned. Snap and
 the precise locator/inspector fields still explicitly use seconds/milliseconds.
-There is no editable meter, tempo map or beat-based audio stretching.
+There is one editable project meter; tempo/meter maps and beat-based audio
+stretching remain unimplemented.
 
 ### Mac limitations still open
 

@@ -30,6 +30,31 @@ pub struct Track {
     pub mute: bool,
     pub solo: bool,
 }
+/// Display meter; tempo remains quarter notes per minute and audio stays sample based.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct TimeSignature {
+    pub numerator: u8,
+    pub denominator: u8,
+}
+impl Default for TimeSignature {
+    fn default() -> Self {
+        Self {
+            numerator: 4,
+            denominator: 4,
+        }
+    }
+}
+impl TimeSignature {
+    pub fn valid(self) -> bool {
+        (1..=32).contains(&self.numerator) && [1, 2, 4, 8, 16, 32].contains(&self.denominator)
+    }
+    pub fn beat_seconds(self, tempo: f64) -> f64 {
+        60. / tempo * 4. / self.denominator as f64
+    }
+    pub fn ticks_per_beat(self) -> u64 {
+        3840 / self.denominator as u64
+    }
+}
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Project {
     pub version: u32,
@@ -38,6 +63,8 @@ pub struct Project {
     pub master: f32,
     #[serde(default = "default_tempo")]
     pub tempo: f64,
+    #[serde(default)]
+    pub time_signature: TimeSignature,
 }
 fn default_tempo() -> f64 {
     120.
@@ -50,6 +77,7 @@ impl Default for Project {
             tracks: vec![],
             master: 0.8,
             tempo: default_tempo(),
+            time_signature: TimeSignature::default(),
         }
     }
 }
@@ -59,6 +87,7 @@ impl Project {
             || !(8000..=192000).contains(&self.sample_rate)
             || !self.master.is_finite()
             || !(0.0..=2.0).contains(&self.master)
+            || !self.time_signature.valid()
             || !self.tempo.is_finite()
             || !(20.0..=400.0).contains(&self.tempo)
         {

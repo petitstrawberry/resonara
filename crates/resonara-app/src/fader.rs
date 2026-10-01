@@ -96,7 +96,7 @@ impl View for FaderTrack {
                 labels: scale_labels(),
                 stereo_labels: ["L", "R"].map(|text| (text.to_string(), ink_center(text, 7.))),
                 before: 1.,
-                reset: false,
+                fixed_gain: None,
             },
             |r, s| {
                 r.control = s.0.clone();
@@ -116,7 +116,7 @@ struct FaderRender {
     control: Fader,
     size: Size,
     before: f32,
-    reset: bool,
+    fixed_gain: Option<f32>,
     labels: Vec<ScaleLabel>,
     stereo_labels: [(String, Point); 2],
 }
@@ -412,23 +412,29 @@ impl ElementRenderObject for FaderRender {
         match e {
             Event::Mouse(MouseEvent::ButtonPressed {
                 button: MouseButton::Left,
+                x,
                 y,
                 click_count,
                 ..
             }) => {
+                let g = Geometry::new(self.size);
+                let tick = self.gain_tick_at(*x as f32, *y as f32);
+                if tick.is_none() && (*x as f32 - g.axis).abs() > 12. {
+                    return false;
+                }
                 self.before = self.control.gain.get();
-                self.reset = *click_count >= 2;
+                self.fixed_gain = tick.or_else(|| (*click_count >= 2).then_some(1.));
                 self.control.dragging.set(true);
                 self.control.focused.set(true);
-                if self.reset {
-                    (self.control.changed)(1.);
+                if let Some(gain) = self.fixed_gain {
+                    (self.control.changed)(gain);
                 } else {
                     change(*y as f32);
                 }
                 true
             }
             Event::Mouse(MouseEvent::Moved { y, .. }) if self.control.dragging.get() => {
-                if !self.reset {
+                if self.fixed_gain.is_none() {
                     change(*y as f32);
                 }
                 true
@@ -438,13 +444,13 @@ impl ElementRenderObject for FaderRender {
                 y,
                 ..
             }) if self.control.dragging.get() => {
-                if !self.reset {
+                if self.fixed_gain.is_none() {
                     change(*y as f32);
                 }
                 self.control.dragging.set(false);
                 true
             }
-            Event::Mouse(MouseEvent::ButtonCancelled { .. }) => {
+            Event::Mouse(MouseEvent::ButtonCancelled { .. }) if self.control.dragging.get() => {
                 (self.control.changed)(self.before);
                 self.control.dragging.set(false);
                 true
@@ -452,6 +458,31 @@ impl ElementRenderObject for FaderRender {
             Event::Keyboard(k) => self.control.handle_key(*k),
             _ => false,
         }
+    }
+}
+impl FaderRender {
+    fn gain_tick_at(&self, x: f32, y: f32) -> Option<f32> {
+        let g = Geometry::new(self.size);
+        // The left label/tick column owns these targets. The thumb, meter and
+        // neighboring strips cannot hit them. Close bottom ticks use the nearest
+        // painted center so silence and -48 dB remain distinct at short heights.
+        if !(0. ..g.axis - 12.).contains(&x) || !(0. ..self.size.height).contains(&y) {
+            return None;
+        }
+        let (label, distance) = self
+            .labels
+            .iter()
+            .filter(|label| label.db != -60.)
+            .map(|label| (label, (y - g.y(gain_fraction(label.db))).abs()))
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        if distance > 8. {
+            return None;
+        }
+        Some(if label.db == -100. {
+            0.
+        } else {
+            10f32.powf(label.db / 20.)
+        })
     }
 }
 #[cfg(test)]

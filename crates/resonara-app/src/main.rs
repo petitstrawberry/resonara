@@ -8,6 +8,8 @@ mod tests;
 mod timeline;
 mod ui;
 mod wave;
+mod workbench;
+use workbench::{RulerDrag, TrackMenu};
 
 use resonara_core::{Clip, Project, Result};
 use resonara_platform::Audio;
@@ -124,6 +126,11 @@ struct Daw {
     clock: State<String>,
     time_format: State<timeline::Format>,
     tempo_input: State<String>,
+    signature_input: State<String>,
+    track_menu: State<Option<TrackMenu>>,
+    menu_choice: State<usize>,
+    follow_playhead: State<bool>,
+    ruler_drag: Rc<RefCell<Option<RulerDrag>>>,
     cursor: State<String>,
     range_end: State<String>,
     track_name: State<String>,
@@ -189,6 +196,11 @@ impl Daw {
             clock: state(5, "00:00.000".into()),
             time_format: state(30, timeline::Format::Bars),
             tempo_input: state(31, String::new()),
+            signature_input: state(35, String::new()),
+            track_menu: state(32, None),
+            menu_choice: state(33, 0),
+            follow_playhead: state(34, false),
+            ruler_drag: Rc::new(RefCell::new(None)),
             cursor: state(6, "0.000".into()),
             range_end: state(7, "1.000".into()),
             track_name: state(8, String::new()),
@@ -293,6 +305,36 @@ impl Daw {
             self.tempo_input.set(format!("{tempo}"));
         }
     }
+    fn submit_signature(&self) {
+        let text = self.signature_input.get();
+        let parsed = text
+            .trim()
+            .split_once('/')
+            .and_then(|(n, d)| {
+                Some(resonara_core::TimeSignature {
+                    numerator: n.trim().parse().ok()?,
+                    denominator: d.trim().parse().ok()?,
+                })
+            })
+            .filter(|m| m.valid());
+        if let Some(meter) = parsed {
+            if self.model.borrow().project.time_signature != meter {
+                self.edit("Set time signature", |m| {
+                    m.project.time_signature = meter;
+                    Ok(())
+                });
+            } else {
+                self.signature_input
+                    .set(format!("{}/{}", meter.numerator, meter.denominator));
+            }
+        } else {
+            self.status
+                .set("Meter: 1–32 beats, denominator 1, 2, 4, 8, 16 or 32".into());
+            let meter = self.model.borrow().project.time_signature;
+            self.signature_input
+                .set(format!("{}/{}", meter.numerator, meter.denominator));
+        }
+    }
     fn cycle_time_format(&self) {
         self.time_format.set(self.time_format.get().next());
         self.refresh(true);
@@ -300,10 +342,15 @@ impl Daw {
     fn refresh(&self, waveforms: bool) {
         let mut m = self.model.borrow_mut();
         self.tempo_input.set(format!("{}", m.project.tempo));
+        self.signature_input.set(format!(
+            "{}/{}",
+            m.project.time_signature.numerator, m.project.time_signature.denominator
+        ));
         self.clock.set(self.time_format.get().position(
             self.playhead.get(),
             m.project.tempo,
             m.project.sample_rate,
+            m.project.time_signature,
         ));
         m.selected = m.selected.min(m.project.tracks.len().saturating_sub(1));
         if let Some(t) = m.project.tracks.get(m.selected) {
@@ -365,9 +412,12 @@ impl Daw {
                     ROW,
                     start,
                     span,
-                    self.time_format
-                        .get()
-                        .step(span, project.tempo, project.sample_rate),
+                    self.time_format.get().step(
+                        span,
+                        project.tempo,
+                        project.sample_rate,
+                        project.time_signature,
+                    ),
                     project.sample_rate,
                     peaks,
                     channels[i].mesh.handle(),
@@ -384,13 +434,17 @@ impl Daw {
             self.playhead.set(position);
         }
         let m = self.model.borrow();
-        let clock =
-            self.time_format
-                .get()
-                .position(position, m.project.tempo, m.project.sample_rate);
+        let clock = self.time_format.get().position(
+            position,
+            m.project.tempo,
+            m.project.sample_rate,
+            m.project.time_signature,
+        );
         if self.clock.get() != clock {
             self.clock.set(clock);
         }
+        drop(m);
+        self.follow_position(position);
         if self.profiler.borrow().active() {
             self.profiler.borrow_mut().playhead_updates += 1;
         }
@@ -434,6 +488,7 @@ impl Daw {
         self.changed();
     }
     fn edit(&self, label: &str, f: impl FnOnce(&mut Model) -> Result<()>) {
+        self.track_menu.set(None);
         if self.model.borrow().io.is_some() {
             return;
         }
@@ -594,6 +649,7 @@ impl Daw {
                 pos,
                 m.project.tempo,
                 m.project.sample_rate,
+                m.project.time_signature,
             ));
         }
         if message {
@@ -714,7 +770,10 @@ impl Daw {
                         t.clips.remove(i);
                         m.clip = None;
                     } else {
-                        return Err("Select a region, or use Delete track in the inspector".into());
+                        return Err(
+                            "Select a region, or right-click its track header to delete the track"
+                                .into(),
+                        );
                     }
                 } else {
                     m.project.tracks.remove(m.selected);
@@ -1238,7 +1297,11 @@ impl Daw {
         match keycode {
             KeyCode::Space => self.play(),
             KeyCode::Home => self.seek(0.),
-            KeyCode::Escape => self.cancel_drag(),
+            KeyCode::Escape => {
+                if !self.cancel_ruler_drag() {
+                    self.cancel_drag();
+                }
+            }
             KeyCode::Delete | KeyCode::Backspace => self.delete(false),
             KeyCode::Up => self.select(-1),
             KeyCode::Down => self.select(1),
@@ -1360,7 +1423,9 @@ impl Daw {
                 }
             }
         }
-        let source_kind = if t.clips.iter().all(|c| c.source_channels == 1) {
+        let source_kind = if t.clips.is_empty() {
+            "AUDIO"
+        } else if t.clips.iter().all(|c| c.source_channels == 1) {
             "MONO"
         } else if t.clips.iter().all(|c| c.source_channels == 2) {
             "STEREO"
@@ -1368,11 +1433,11 @@ impl Daw {
             "MIXED"
         };
         AnyView::new(row!{
-            row!{Rectangle::new().fill(ui::color(index)).frame(3.,ROW),vstack!{
+            TrackArea(AnyView::new(row!{Rectangle::new().fill(ui::color(index)).frame(3.,ROW),vstack!{
                 row!{caption(format!("{:02}",index+1)),ui::name_label(&t.name,22,12.,self.status.clone()).frame_width(135.)}.spacing(6.),
                 row!{ui::button("M").background_color(if t.mute{GOLD}else{RAISED}).text_color(if t.mute{BG}else{TEXT}).on_click(move||mute.mix(index,None,None,Some(false))).frame(27.,24.),ui::button("S").background_color(if t.solo{GOLD}else{RAISED}).text_color(if t.solo{BG}else{TEXT}).on_click(move||solo.mix(index,None,None,Some(true))).frame(27.,24.),Slider::new(c.gain_normalized.clone()).min(0.).max(1.).dragging_state(c.dragging_gain.clone()).on_change(move|v|gain.mix_normalized(index,v)).frame_width(98.)}.spacing(5.),
                 row!{caption(ui::db(t.gain)),Spacer::new(),caption(source_kind)}
-            }.spacing(4.).padding(8.).frame(HEADER-3.,ROW)}.spacing(0.).background(if selected{RAISED}else{PANEL}).on_click(move||select.choose(index,None)),
+            }.spacing(4.).padding(8.).frame(HEADER-3.,ROW)}.spacing(0.).background(if selected{RAISED}else{PANEL}).on_click(move||select.choose(index,None))),Some(index)),
             ZStack::new(Children(overlays)).alignment(Alignment::TopLeading).frame(width,ROW).clip().on_event(move|e|event.timeline_event(index,e))
         }.spacing(0.).frame(HEADER+width,ROW))
     }
@@ -1382,7 +1447,12 @@ impl Daw {
         let span = self.view_span.get();
         let m = self.model.borrow();
         let format = self.time_format.get();
-        let step = format.step(span, m.project.tempo, m.project.sample_rate);
+        let step = format.step(
+            span,
+            m.project.tempo,
+            m.project.sample_rate,
+            m.project.time_signature,
+        );
         let first = (start / step).floor() as i64;
         let mut labels: Vec<Box<dyn View>> = vec![];
         for i in first..=first + 12 {
@@ -1390,15 +1460,20 @@ impl Daw {
             let x = ((seconds - start) / span) as f32 * width;
             if x >= 0. && x < width - 85. {
                 labels.push(Box::new(
-                    caption(format.tick(seconds, m.project.tempo, m.project.sample_rate))
-                        .font_size(10.)
-                        .frame(90., 26.)
-                        .padding_insets(EdgeInsets::new(x + 5., 0., 0., 0.)),
+                    caption(format.tick(
+                        seconds,
+                        m.project.tempo,
+                        m.project.sample_rate,
+                        m.project.time_signature,
+                    ))
+                    .font_size(10.)
+                    .frame(90., 26.)
+                    .padding_insets(EdgeInsets::new(x + 5., 0., 0., 0.)),
                 ));
             }
         }
         let s = self.clone();
-        AnyView::new(row!{row!{caption("TRACKS"),Spacer::new(),caption(format!("{}",self.model.borrow().project.tracks.len()))}.padding(10.).frame(HEADER,30.).background(PANEL),ZStack::new(Children(labels)).alignment(Alignment::TopLeading).frame(width,30.).background(RAISED).on_event(move|e|{if let Event::Mouse(MouseEvent::ButtonPressed{button:MouseButton::Left,x,..})=e{s.seek((start+*x as f64/width as f64*span).max(0.));true}else{false}})}.spacing(0.))
+        AnyView::new(row!{row!{caption("TRACKS"),Spacer::new(),caption(format!("{}",self.model.borrow().project.tracks.len())),self.button("+","Add an empty audio track",|s|{let after=(!s.model.borrow().project.tracks.is_empty()).then_some(s.model.borrow().selected);s.add_track(after);}).frame(24.,24.)}.spacing(5.).padding_insets(EdgeInsets::new(10.,3.,6.,3.)).frame(HEADER,30.).background(PANEL),ZStack::new(Children(labels)).alignment(Alignment::TopLeading).frame(width,30.).background(RAISED).on_event(move|e|s.ruler_event(e,start,span,width))}.spacing(0.))
     }
     fn arrangement(&self) -> AnyView {
         let size = self.arrangement_size.get();
@@ -1415,7 +1490,7 @@ impl Daw {
                     .frame(size.width, (size.height - 60.).max(100.)),
             )
         };
-        let layout=AnyView::new(vstack!{self.ruler(),content,row!{self.icon(Icon::ChevronLeft,"Scroll timeline left",false,|s|{s.view_start.set((s.view_start.get()-s.view_span.get()*0.5).max(0.));s.refresh(true);}),caption(format!("{:.2}s — {:.2}s",self.view_start.get(),self.view_start.get()+self.view_span.get())),Spacer::new(),caption("Drag region • edge = trim • S = split"),self.icon(Icon::ChevronRight,"Scroll timeline right",false,|s|{s.view_start.set(s.view_start.get()+s.view_span.get()*0.5);s.refresh(true);})}.spacing(6.).padding_insets(EdgeInsets::new(8.,0.,8.,0.)).frame_height(30.).background(PANEL)}.spacing(0.).background(BG).on_geometry_change(|g|g.size(),move|size|{let old=resize.arrangement_size.get();if(old.width-size.width).abs()>1.||(old.height-size.height).abs()>1.{resize.arrangement_size.set(size);if resize.mixer_visible.get(){let full=(resize.size.get().height-44.-66.-36.-28.-4.).max(1.);resize.mixer_fraction.set((size.height/full).clamp(0.1,0.9));}resize.refresh(true);}}));
+        let layout=AnyView::new(vstack!{self.ruler(),TrackArea(content,None),row!{self.icon(Icon::ChevronLeft,"Scroll timeline left",false,|s|{s.view_start.set((s.view_start.get()-s.view_span.get()*0.5).max(0.));s.refresh(true);}),caption(format!("{:.2}s — {:.2}s",self.view_start.get(),self.view_start.get()+self.view_span.get())),Spacer::new(),caption("Drag region • edge = trim • S = split"),self.icon(Icon::ChevronRight,"Scroll timeline right",false,|s|{s.view_start.set(s.view_start.get()+s.view_span.get()*0.5);s.refresh(true);})}.spacing(6.).padding_insets(EdgeInsets::new(8.,0.,8.,0.)).frame_height(30.).background(PANEL)}.spacing(0.).background(BG).on_geometry_change(|g|g.size(),move|size|{let old=resize.arrangement_size.get();if(old.width-size.width).abs()>1.||(old.height-size.height).abs()>1.{resize.arrangement_size.set(size);if resize.mixer_visible.get(){let full=(resize.size.get().height-44.-66.-36.-28.-4.).max(1.);resize.mixer_fraction.set((size.height/full).clamp(0.1,0.9));}resize.refresh(true);}}));
         let wheel = self.clone();
         AnyView::new(HorizontalWheel(
             layout,
@@ -1482,12 +1557,6 @@ impl Daw {
             } else {
                 rows.push(Box::new(caption("Click a waveform to select a region")));
             }
-            rows.push(Box::new(self.button(
-                "Split at playhead",
-                "Split region at current position · S",
-                |s| s.split(),
-            )));
-            rows.push(Box::new(row!{self.button("Duplicate track","Duplicate selected track · Ctrl/Cmd+D",|s|s.duplicate()),self.icon(Icon::Trash,"Delete selected track (undoable)",false,|s|s.delete(true))}.spacing(6.)));
             rows.push(Box::new(Rectangle::new().fill(LINE).frame(190., 1.)));
             rows.push(Box::new(caption("PRECISE RANGE · SECONDS")));
             rows.push(Box::new(row!{ui::field(self.cursor.clone()).frame_width(90.).input_guard(),ui::field(self.range_end.clone()).frame_width(90.).input_guard()}.spacing(8.)));
@@ -1557,7 +1626,7 @@ impl Daw {
             label(format!("Gain {}",ui::db(m.project.master))).font_size(10.).alignment(Alignment::Center).frame(90.,14.),animation::Readout::new(self.master_meter.clone(),9.,ACCENT,Size::new(90.,12.)).on_hover(move||master_status.set(master_peak.get().detail(true)))
         }.spacing(2.).padding(4.).frame(100.,254.).background(RAISED).border(LINE,1.)));
         let width = channels.len() as f32 * 100.;
-        AnyView::new(vstack!{row!{caption("MIXER"),caption(format!("{} audio channels",m.project.tracks.len())),Spacer::new(),caption("Gain dB · Peak dBFS L/R  |  ↑ / ↓ · Shift = fine · double-click = reset"),self.icon(Icon::X,"Hide mixer · X",false,|s|s.mixer_visible.set(false))}.spacing(12.).padding_insets(EdgeInsets::new(12.,0.,8.,0.)).frame_height(30.).background(PANEL),ScrollView::new(HStack::new(Children(channels)).spacing(0.).alignment(Alignment::TopLeading)).horizontal().content_size(width,256.).frame_height(256.)}.spacing(0.).background(BG))
+        AnyView::new(vstack!{row!{caption("MIXER"),caption(format!("{} audio channels",m.project.tracks.len())),Spacer::new(),caption("Click gain ticks · ↑ / ↓ · Shift = fine · double-click thumb = reset"),self.icon(Icon::X,"Hide mixer · X",false,|s|s.mixer_visible.set(false))}.spacing(12.).padding_insets(EdgeInsets::new(12.,0.,8.,0.)).frame_height(30.).background(PANEL),ScrollView::new(HStack::new(Children(channels)).spacing(0.).alignment(Alignment::TopLeading)).horizontal().content_size(width,256.).frame_height(256.)}.spacing(0.).background(BG))
     }
     fn toolbar(&self) -> AnyView {
         let m = self.model.borrow();
@@ -1569,7 +1638,7 @@ impl Daw {
             .unwrap_or_else(|| "Untitled session".into());
         let dirty = m.version != m.saved_version;
         let busy = m.io.is_some();
-        AnyView::new(row!{Text::new("resonara").font_size(19.).color(TEXT),caption("AUDIO WORKSTATION"),Spacer::new(),label(format!("{}{}",name,if dirty{"  •"}else{""})),Spacer::new(),self.button("Open…","Open a Resonara project · Ctrl/Cmd+O",|s|s.request_open()),self.icon(Icon::DeviceFloppy,"Save project · Ctrl/Cmd+S",false,|s|s.save()),self.button("Import WAV…","Import mono or stereo WAV · Ctrl/Cmd+I",|s|s.open_dialog(FileAction::Import)),self.button("Export…","Export stereo WAV · Ctrl/Cmd+E",|s|s.open_dialog(FileAction::Export)),self.icon(Icon::HelpCircle,"Keyboard shortcuts and editing help",false,|s|s.dialog.set(Dialog::Help)),caption(if busy{"Working…"}else{""})}.spacing(10.).padding_insets(EdgeInsets::new(14.,6.,12.,6.)).frame_height(44.).background(PANEL))
+        AnyView::new(row!{Text::new("resonara").font_size(19.).color(TEXT),caption("AUDIO WORKSTATION"),Spacer::new(),label(format!("{}{}",ui::elide(&name,29),if dirty{"  •"}else{""})),Spacer::new(),self.header_button("Open…","Open a Resonara project · Ctrl/Cmd+O",|s|s.request_open()),self.header_icon(Icon::DeviceFloppy,"Save project · Ctrl/Cmd+S",false,|s|s.save()),self.header_button("Import WAV…","Import mono or stereo WAV · Ctrl/Cmd+I",|s|s.open_dialog(FileAction::Import)),self.header_button("Export…","Export stereo WAV · Ctrl/Cmd+E",|s|s.open_dialog(FileAction::Export)),self.header_icon(Icon::HelpCircle,"Keyboard shortcuts and editing help",false,|s|s.dialog.set(Dialog::Help)),caption(if busy{"Working…"}else{""})}.spacing(10.).padding_insets(EdgeInsets::new(14.,6.,12.,6.)).frame_height(44.).background(PANEL))
     }
     fn transport(&self) -> AnyView {
         let m = self.model.borrow();
@@ -1577,23 +1646,32 @@ impl Daw {
         let duration = m.project.duration() as f64 / m.project.sample_rate as f64;
         let seek = self.clone();
         let tempo = self.clone();
+        let signature = self.clone();
         let format = self.time_format.get();
         AnyView::new(row!{
-            self.icon(Icon::ChevronLeft,"Return to start · Home",false,|s|s.seek(0.)),self.icon(if playing{Icon::PlayerPause}else{Icon::PlayerPlay},"Play / stop · Space",playing,|s|s.play()),self.button("Stop","Stop playback",|s|s.stop_audio(true)),
-            vstack!{caption(format.caption()),animation::Readout::new(self.clock.clone(),25.,ACCENT,Size::new(172.,32.))}.spacing(1.).frame(172.,48.).background(BG).border(LINE,1.),
-            vstack!{caption("BPM · 4/4"),ui::field(self.tempo_input.clone()).on_submit(move||tempo.submit_tempo()).blur_on_submit(true).frame(68.,26.).input_guard()}.spacing(2.),
-            self.button(format.name(),"Switch musical, elapsed-time and sample-position displays",|s|s.cycle_time_format()).frame_width(92.),
-            vstack!{caption("GO TO · SECONDS"),ui::field(self.cursor.clone()).on_submit(move||{if let Ok(at)=seek.seconds(&seek.cursor.get()){let rate=seek.model.borrow().project.sample_rate;seek.seek(at as f64/rate as f64);}}).blur_on_submit(true).frame(88.,26.).input_guard()}.spacing(2.),
-            vstack!{caption("PROJECT LENGTH"),label(format.duration(duration,m.project.tempo,m.project.sample_rate)).font_size(16.)}.spacing(5.),Spacer::new(),caption(format!("{} Hz  /  STEREO",m.project.sample_rate))
-        }.spacing(10.).padding_insets(EdgeInsets::new(14.,7.,14.,7.)).frame_height(66.).background(RAISED))
+            ui::transport_group("TRANSPORT",row!{
+                self.header_icon(Icon::ChevronLeft,"Return to start · Home",false,|s|s.seek(0.)),
+                self.header_icon(if playing{Icon::PlayerPause}else{Icon::PlayerPlay},"Play / stop · Space",playing,|s|s.play()),
+                self.header_button("Stop","Stop playback",|s|s.stop_audio(true))
+            }.spacing(6.),116.),
+            Surface::section(row!{
+                ui::lcd_group(format.caption(),animation::Readout::new(self.clock.clone(),24.,ACCENT,Size::new(172.,CONTROL_HEIGHT)),172.),
+                ui::lcd_group("BPM",ui::lcd_field(self.tempo_input.clone()).on_submit(move||tempo.submit_tempo()).blur_on_submit(true).input_guard(),56.),
+                ui::lcd_group("METER",ui::lcd_field(self.signature_input.clone()).on_submit(move||signature.submit_signature()).blur_on_submit(true).input_guard(),52.)
+            }.spacing(CONTROL_GAP).padding_insets(EdgeInsets::new(CONTROL_GAP,4.,CONTROL_GAP,4.))).fill(BG).border_color(LINE).corner_radius(8.),
+            ui::transport_group("DISPLAY",self.header_button(format.name(),"Switch musical, elapsed-time and sample-position displays",|s|s.cycle_time_format()),88.),
+            ui::transport_group("GO TO · SECONDS",ui::compact_field(self.cursor.clone()).on_submit(move||{if let Ok(at)=seek.seconds(&seek.cursor.get()){let rate=seek.model.borrow().project.sample_rate;seek.seek(at as f64/rate as f64);}}).blur_on_submit(true).input_guard(),88.),
+            ui::transport_group("PROJECT LENGTH",label(format.duration(duration,m.project.tempo,m.project.sample_rate,m.project.time_signature)).font_size(14.),110.),
+            Spacer::new(),ui::transport_group("OUTPUT",caption(format!("{} Hz / STEREO",m.project.sample_rate)).font_size(CONTROL_FONT),116.)
+        }.spacing(CONTROL_GAP).padding_insets(EdgeInsets::new(14.,9.,14.,9.)).frame_height(66.).background(RAISED))
     }
     fn editbar(&self) -> AnyView {
         AnyView::new(row!{
-            self.icon(Icon::ArrowBackUp,"Undo · Ctrl/Cmd+Z",false,|s|s.undo(false)),self.icon(Icon::ArrowForwardUp,"Redo · Ctrl/Cmd+Shift+Z",false,|s|s.undo(true)),Rectangle::new().fill(LINE).frame(1.,20.),
-            self.button(if self.tool.get()==0{"• Pointer  1"}else{"Pointer  1"},"Pointer: select, move, trim edges · 1",|s|s.tool.set(0)),self.button(if self.tool.get()==1{"• Split  2"}else{"Split  2"},"Scissors: click a region to split · 2",|s|s.tool.set(1)),
-            self.button(if self.snap.get(){"Snap: 100 ms"}else{"Snap: off"},"Toggle absolute 100 ms grid snapping",|s|s.snap.set(!s.snap.get())),Spacer::new(),
-            self.icon(Icon::ZoomOut,"Zoom out · −",false,|s|s.zoom(2.)),self.icon(Icon::ZoomIn,"Zoom in · +",false,|s|s.zoom(0.5)),self.button("Fit","Fit project to timeline · F",|s|s.fit()),Rectangle::new().fill(LINE).frame(1.,20.),
-            self.icon(Icon::List,"Toggle inspector · I",self.inspector.get(),|s|s.inspector.set(!s.inspector.get())),self.icon(Icon::Adjustments,"Toggle mixer · X",self.mixer_visible.get(),|s|s.mixer_visible.set(!s.mixer_visible.get()))
+            self.header_icon(Icon::ArrowBackUp,"Undo · Ctrl/Cmd+Z",false,|s|s.undo(false)),self.header_icon(Icon::ArrowForwardUp,"Redo · Ctrl/Cmd+Shift+Z",false,|s|s.undo(true)),Rectangle::new().fill(LINE).frame(1.,20.),
+            self.header_button(if self.tool.get()==0{"• Pointer  1"}else{"Pointer  1"},"Pointer: select, move, trim edges · 1",|s|s.tool.set(0)),self.header_button(if self.tool.get()==1{"• Split  2"}else{"Split  2"},"Scissors: click a region to split · 2",|s|s.tool.set(1)),
+            self.header_button(if self.snap.get(){"Snap: 100 ms"}else{"Snap: off"},"Toggle absolute 100 ms grid snapping",|s|s.snap.set(!s.snap.get())),Spacer::new(),
+            self.header_button(if self.follow_playhead.get(){"Follow"}else{"Fixed"},"Toggle playhead-follow scrolling",|s|s.toggle_follow()),self.header_icon(Icon::ZoomOut,"Zoom out · −",false,|s|s.zoom(2.)),self.header_icon(Icon::ZoomIn,"Zoom in · +",false,|s|s.zoom(0.5)),self.header_button("Fit","Fit project to timeline · F",|s|s.fit()),Rectangle::new().fill(LINE).frame(1.,20.),
+            self.header_icon(Icon::List,"Toggle inspector · I",self.inspector.get(),|s|s.inspector.set(!s.inspector.get())),self.header_icon(Icon::Adjustments,"Toggle mixer · X",self.mixer_visible.get(),|s|s.mixer_visible.set(!s.mixer_visible.get()))
         }.spacing(6.).padding_insets(EdgeInsets::new(10.,3.,10.,3.)).frame_height(36.).background(PANEL))
     }
     fn workspace(&self) -> AnyView {
@@ -1807,7 +1885,40 @@ impl Daw {
         } else {
             AnyView::new(content.on_key(move |e| key.handle_key(e)))
         };
-        AnyView::new(ShortcutBoundary(inner))
+        let content = if let Some(menu) = self.track_menu.get() {
+            AnyView::new(
+                ZStack::new(Children(vec![
+                    Box::new(inner),
+                    Box::new(
+                        Rectangle::new()
+                            .fill(Color::rgba(0., 0., 0., 0.))
+                            .frame(self.size.get().width, self.size.get().height),
+                    ),
+                    Box::new(self.track_menu_view(menu)),
+                ]))
+                .alignment(Alignment::TopLeading)
+                .frame(self.size.get().width, self.size.get().height),
+            )
+        } else {
+            inner
+        };
+        let context = self.clone();
+        AnyView::new(InputBoundary(
+            AnyView::new(ShortcutBoundary(content)),
+            Rc::new(move |root, e| {
+                context.track_context_event(
+                    root,
+                    e,
+                    matches!(
+                        e,
+                        Event::Mouse(MouseEvent::ButtonPressed {
+                            button: MouseButton::Left,
+                            ..
+                        })
+                    ) && ui::mac_control_down(),
+                )
+            }),
+        ))
     }
 }
 impl View for Daw {
@@ -1833,6 +1944,10 @@ impl View for Daw {
             &self.view_span,
             &self.dialog_error,
             &self.time_format,
+            &self.track_menu,
+            &self.menu_choice,
+            &self.follow_playhead,
+            &self.signature_input,
         ]
     }
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1863,6 +1978,7 @@ impl Application for Daw {
             return false;
         }
         self.finish_mix();
+        self.track_menu.set(None);
         if self.dirty() {
             self.dialog.set(Dialog::ConfirmClose);
             false
@@ -1914,13 +2030,14 @@ impl Application for Daw {
         }
         let mut ended = false;
         let mut failure = false;
+        let mut next_position = None;
         {
             let m = self.model.borrow();
             if let Some(a) = &m.audio {
                 if playhead_due {
                     let pos = a.controls.position.load(Ordering::Relaxed) as f64
                         / m.project.sample_rate as f64;
-                    self.animate_playhead(pos);
+                    next_position = Some(pos);
                 }
                 if meter_due {
                     self.update_meters(Some(&a.controls), meter_elapsed.as_secs_f32());
@@ -1930,6 +2047,9 @@ impl Application for Daw {
             } else if meter_due {
                 self.update_meters(None, meter_elapsed.as_secs_f32());
             }
+        }
+        if let Some(pos) = next_position {
+            self.animate_playhead(pos);
         }
         if ended || failure {
             self.stop_audio(false);

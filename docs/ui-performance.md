@@ -114,7 +114,7 @@ isolate ScrollView, layout, paint, encoder or presentation cost.
 
 The mounted playback/resize regressions pass on Mac, as do the new full-height
 mixer-hidden layout and Master pointer-state regressions. The final release's
-initial native screen displays the bars/beats counter and adjacent BPM field
+initial native screen displays the bars/beats counter and integrated BPM/meter fields
 with the complete arrangement and mixer. No F9 report was generated and agent
 GUI input was deferred while the user operated the session. The 30/20 Hz targets
 and final native resize/scroll/stop-restart acceptance remain unmeasured.
@@ -125,3 +125,11 @@ observed without that error, but no reproduction or fix is established. Keep
 `artifacts/mac-latest-native.log`, `artifacts/mac-final-native.log` and
 `artifacts/mac-final-verify.log` separate from cloud timing comparisons. Framework
 pins and dependency implementation files were left unchanged.
+
+The Follow/Fixed and ruler-capture regressions exercise the mounted pipeline:
+playback within a Follow page keeps body rebuild and static-wave refresh at zero;
+only a viewport shift refreshes the wave grid. Ruler moves preview the retained
+playhead without waveform generation. These are model/pipeline observations,
+not native GPU or ScrollView performance measurements. Latest check logs are
+`artifacts/mac-workbench-final-verify.log` and
+`artifacts/mac-workbench-final-build.log`.

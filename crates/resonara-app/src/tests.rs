@@ -31,6 +31,7 @@ fn assert_project(actual: &Project, expected: &Project) {
     assert_eq!(actual.sample_rate, expected.sample_rate);
     assert_eq!(actual.master, expected.master);
     assert_eq!(actual.tempo, expected.tempo);
+    assert_eq!(actual.time_signature, expected.time_signature);
     assert_eq!(actual.tracks.len(), expected.tracks.len());
     for (a, b) in actual.tracks.iter().zip(&expected.tracks) {
         assert_eq!(a.name, b.name);
@@ -3664,4 +3665,611 @@ fn native_resize_notifications_coalesce_to_final_size_without_duplicate_scene_de
     );
     s.size.unsubscribe(subscription);
     pipeline.teardown();
+}
+
+#[test]
+fn gain_scale_clicks_set_exact_track_and_master_values_without_touching_neighbors() {
+    for target in [0, 2] {
+        for db in [6., 0., -6., -18., -48., -100.] {
+            let mut p = stereo_meter_project();
+            p.tracks[0].gain = 0.7;
+            p.master = 0.8;
+            let original = p.clone();
+            let s = Daw::new(p);
+            s.choose(1, None);
+            let mut tree = scarlet_ui::ElementTree::new();
+            tree.set_root(s.mixer().create_element());
+            tree.layout(scarlet_ui::LayoutConstraints::tight(600., 286.));
+            let mut bounds = Vec::new();
+            control_bounds(
+                tree.root().unwrap(),
+                Point::ZERO,
+                "::fader::FaderRender",
+                &mut bounds,
+            );
+            let (origin, size) = bounds[target];
+            let g = fader::Geometry::new(size);
+            let x = (origin.x + g.gain_label - 5.).round() as i32;
+            let y = (origin.y + g.y(fader::gain_fraction(db))).round() as i32;
+            let expected = if db == -100. {
+                0.
+            } else {
+                10f32.powf(db / 20.)
+            };
+            let mut dispatcher = scarlet_ui::EventDispatcher::new();
+            for event in [
+                MouseEvent::ButtonPressed {
+                    button: MouseButton::Left,
+                    x,
+                    y,
+                    click_count: 1,
+                },
+                MouseEvent::Moved { x: x + 2, y: y - 2 },
+                MouseEvent::ButtonReleased {
+                    button: MouseButton::Left,
+                    x: x + 2,
+                    y: y - 2,
+                    click_count: 1,
+                },
+            ] {
+                assert!(dispatcher.dispatch(&mut tree, &Event::Mouse(event)));
+            }
+            s.finish_mix();
+            let mut wanted = original.clone();
+            if target == 0 {
+                wanted.tracks[0].gain = expected;
+            } else {
+                wanted.master = expected;
+            }
+            assert_project(&s.model.borrow().project, &wanted);
+            assert_eq!(s.master.get(), wanted.master);
+            assert_gain_controls_coherent(&s);
+            assert_eq!(s.model.borrow().selected, 1);
+            assert_eq!(s.model.borrow().undo.len(), 1);
+            assert!(s.dirty());
+            let actual = s.model.borrow().project.clone();
+            let controls = Arc::new(resonara_core::Controls::new(&actual));
+            let mut output = [0.; 16];
+            resonara_core::Engine::new(&actual, controls, actual.sample_rate, 0)
+                .render(&mut output, 2);
+            let mut reference = [0.; 16];
+            resonara_core::Engine::new(
+                &wanted,
+                Arc::new(resonara_core::Controls::new(&wanted)),
+                wanted.sample_rate,
+                0,
+            )
+            .render(&mut reference, 2);
+            assert_eq!(output, reference);
+            s.undo(false);
+            assert_project(&s.model.borrow().project, &original);
+            assert!(!s.dirty());
+            s.undo(true);
+            assert_project(&s.model.borrow().project, &wanted);
+            assert_gain_controls_coherent(&s);
+        }
+    }
+}
+
+#[test]
+fn gain_scale_targets_ignore_meter_and_gaps_and_cancel_restores_gain() {
+    let gain = state(9400, 0.8);
+    let dragging = state(9401, false);
+    let changed = gain.clone();
+    let fader = fader::Fader::new(
+        gain.clone(),
+        state(9402, meter::StereoMeter::default()),
+        dragging.clone(),
+        state(9403, false),
+        move |v| changed.set(v),
+    );
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(fader.create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(90., 112.));
+    let g = fader::Geometry::new(Size::new(90., 112.));
+    let mut dispatcher = scarlet_ui::EventDispatcher::new();
+    for (x, y) in [
+        (g.meter_left, 30.),
+        (g.peak_label, g.y(fader::peak_fraction(-6.))),
+        (g.gain_label, 18.),
+        (g.axis + 15., 60.),
+    ] {
+        for e in [
+            MouseEvent::ButtonPressed {
+                button: MouseButton::Left,
+                x: x as i32,
+                y: y as i32,
+                click_count: 1,
+            },
+            MouseEvent::ButtonReleased {
+                button: MouseButton::Left,
+                x: x as i32,
+                y: y as i32,
+                click_count: 1,
+            },
+        ] {
+            dispatcher.dispatch(&mut tree, &Event::Mouse(e));
+        }
+        assert_eq!(gain.get(), 0.8);
+        assert!(!dragging.get());
+    }
+    let x = g.gain_label as i32;
+    let y = g.y(fader::gain_fraction(-6.)).round() as i32;
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Mouse(MouseEvent::ButtonPressed {
+            button: MouseButton::Left,
+            x,
+            y,
+            click_count: 1
+        })
+    ));
+    assert_eq!(gain.get(), 10f32.powf(-6. / 20.));
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Mouse(MouseEvent::ButtonCancelled {
+            button: MouseButton::Left,
+            x,
+            y
+        })
+    ));
+    assert_eq!(gain.get(), 0.8);
+    assert!(!dragging.get());
+}
+
+fn context_tree(s: &Daw) -> scarlet_ui::ElementTree {
+    s.size.set(Size::new(1000., 790.));
+    s.inspector.set(false);
+    s.mixer_visible.set(false);
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1000., 790.));
+    tree
+}
+fn context_point(tree: &scarlet_ui::ElementTree, target: Option<usize>) -> Point {
+    (0..790)
+        .step_by(4)
+        .find_map(|y| {
+            let p = Point::new(100., y as f32);
+            (ui::track_at(tree.root().unwrap(), Point::ZERO, p) == Some(target)).then_some(p)
+        })
+        .expect("track header or blank column must have a secondary-click target")
+}
+fn dispatch_mouse(
+    dispatcher: &mut scarlet_ui::EventDispatcher,
+    tree: &mut scarlet_ui::ElementTree,
+    button: MouseButton,
+    p: Point,
+    pressed: bool,
+) {
+    let e = if pressed {
+        MouseEvent::ButtonPressed {
+            button,
+            x: p.x as i32,
+            y: p.y as i32,
+            click_count: 1,
+        }
+    } else {
+        MouseEvent::ButtonReleased {
+            button,
+            x: p.x as i32,
+            y: p.y as i32,
+            click_count: 1,
+        }
+    };
+    dispatcher.dispatch(tree, &Event::Mouse(e));
+}
+fn rebuild_context(tree: &mut scarlet_ui::ElementTree) {
+    tree.root_mut().unwrap().rebuild();
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1000., 790.));
+}
+#[test]
+fn track_context_menu_dispatches_to_clicked_header_and_undoes_duplicate_and_delete() {
+    for (row, action_index) in [(0, 1), (1, 2)] {
+        let s = Daw::new(project());
+        s.choose(1 - row, Some(0));
+        let mut tree = context_tree(&s);
+        let mut dispatcher = scarlet_ui::EventDispatcher::new();
+        let p = context_point(&tree, Some(row));
+        dispatch_mouse(&mut dispatcher, &mut tree, MouseButton::Right, p, true);
+        dispatch_mouse(&mut dispatcher, &mut tree, MouseButton::Right, p, false);
+        let menu = s.track_menu.get().expect("right-click opens a menu");
+        assert_eq!(menu.target, Some(row));
+        assert_eq!(s.model.borrow().selected, row);
+        assert!(s.model.borrow().undo.is_empty());
+        assert!(!s.dirty());
+        rebuild_context(&mut tree);
+        let action = Point::new(
+            menu.anchor.x + 80.,
+            menu.anchor.y + 6. + action_index as f32 * 32. + 16.,
+        );
+        dispatch_mouse(&mut dispatcher, &mut tree, MouseButton::Left, action, true);
+        dispatch_mouse(&mut dispatcher, &mut tree, MouseButton::Left, action, false);
+        assert!(s.track_menu.get().is_none());
+        let edited = s.model.borrow().project.clone();
+        if action_index == 1 {
+            assert_eq!(edited.tracks.len(), 3);
+            assert_eq!(edited.tracks[1].name, "Track 0 copy");
+            assert!(Arc::ptr_eq(
+                &edited.tracks[0].clips[0].samples,
+                &edited.tracks[1].clips[0].samples
+            ));
+        } else {
+            assert_eq!(edited.tracks.len(), 1);
+            assert_eq!(edited.tracks[0].name, "Track 0");
+        }
+        assert_eq!(s.model.borrow().undo.len(), 1);
+        assert!(s.dirty());
+        s.undo(false);
+        assert_project(&s.model.borrow().project, &project());
+        assert!(!s.dirty());
+        s.undo(true);
+        assert_project(&s.model.borrow().project, &edited);
+    }
+}
+#[test]
+fn track_menu_escape_outside_cancel_control_click_and_shortcuts_preserve_roles() {
+    let s = Daw::new(project());
+    let mut tree = context_tree(&s);
+    let p = context_point(&tree, Some(1));
+    let event = Event::Mouse(MouseEvent::ButtonPressed {
+        button: MouseButton::Left,
+        x: p.x as i32,
+        y: p.y as i32,
+        click_count: 1,
+    });
+    assert!(s.track_context_event(tree.root().unwrap(), &event, true));
+    assert_eq!(s.track_menu.get().unwrap().target, Some(1));
+    let mut dispatcher = scarlet_ui::EventDispatcher::new();
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Keyboard(KeyEvent::Pressed {
+            keycode: KeyCode::Escape,
+            modifiers: KeyModifiers::default()
+        })
+    ));
+    assert!(s.track_menu.get().is_none());
+    let wave = Event::Mouse(MouseEvent::ButtonPressed {
+        button: MouseButton::Left,
+        x: 400,
+        y: p.y as i32,
+        click_count: 1,
+    });
+    assert!(
+        !s.track_context_event(tree.root().unwrap(), &wave, true),
+        "Control-click in the audio timeline remains outside track management"
+    );
+    for cancel in [false, true] {
+        s.open_track_menu(Some(0), p);
+        rebuild_context(&mut tree);
+        let event = if cancel {
+            MouseEvent::ButtonCancelled {
+                button: MouseButton::Right,
+                x: 900,
+                y: 50,
+            }
+        } else {
+            MouseEvent::ButtonPressed {
+                button: MouseButton::Left,
+                x: 900,
+                y: 50,
+                click_count: 1,
+            }
+        };
+        dispatcher.dispatch(&mut tree, &Event::Mouse(event));
+        assert!(s.track_menu.get().is_none());
+        assert_project(&s.model.borrow().project, &project());
+        assert!(!s.dirty());
+    }
+    rebuild_context(&mut tree);
+    assert!(s.handle_key(KeyEvent::Pressed {
+        keycode: KeyCode::Char('d'),
+        modifiers: KeyModifiers {
+            super_key: true,
+            ..KeyModifiers::default()
+        }
+    }));
+    assert_eq!(s.model.borrow().project.tracks.len(), 3);
+    let mut inspector = s.inspector_panel().create_element();
+    inspector.layout(scarlet_ui::LayoutConstraints::tight(220., 630.));
+    let mut paint = scarlet_ui::renderer::PaintContext::new();
+    paint_text_recursive(inspector.as_ref(), &mut paint);
+    assert!(!paint.commands().iter().any(|c|matches!(c,scarlet_ui::renderer::PaintCommand::DrawText{text,..} if text=="Duplicate track"||text=="Delete track"||text=="Split at playhead")));
+}
+fn paint_text_recursive<'a>(
+    e: &'a dyn scarlet_ui::Element,
+    ctx: &mut scarlet_ui::renderer::PaintContext<'a>,
+) {
+    if let Some(r) = e.render_object() {
+        r.paint(ctx, Point::ZERO);
+    }
+    for child in e.children() {
+        paint_text_recursive(child.as_ref(), ctx);
+    }
+}
+#[test]
+fn blank_track_column_and_plus_add_empty_tracks_with_history_and_persistence() {
+    for initial in [Project::default(), project()] {
+        let s = Daw::new(initial.clone());
+        let mut tree = context_tree(&s);
+        let mut dispatcher = scarlet_ui::EventDispatcher::new();
+        let blank = context_point(&tree, None);
+        dispatch_mouse(&mut dispatcher, &mut tree, MouseButton::Right, blank, true);
+        dispatch_mouse(&mut dispatcher, &mut tree, MouseButton::Right, blank, false);
+        assert_eq!(s.track_menu.get().unwrap().target, None);
+        rebuild_context(&mut tree);
+        assert!(dispatcher.dispatch(
+            &mut tree,
+            &Event::Keyboard(KeyEvent::Pressed {
+                keycode: KeyCode::Enter,
+                modifiers: KeyModifiers::default()
+            })
+        ));
+        let edited = s.model.borrow().project.clone();
+        assert_eq!(edited.tracks.len(), initial.tracks.len() + 1);
+        assert!(edited.tracks.last().unwrap().clips.is_empty());
+        assert_eq!(s.model.borrow().selected, initial.tracks.len());
+        assert!(s.dirty());
+        let temp = Temp::new();
+        edited.save(&temp.0.join("context.json")).unwrap();
+        assert_project(
+            &Project::load(&temp.0.join("context.json")).unwrap(),
+            &edited,
+        );
+        s.undo(false);
+        assert_project(&s.model.borrow().project, &initial);
+        assert!(!s.dirty());
+        s.undo(true);
+        assert_project(&s.model.borrow().project, &edited);
+        s.delete(true);
+        assert_project(&s.model.borrow().project, &initial);
+        // The small + in the track-list header uses the same add operation.
+        let mut ruler = scarlet_ui::ElementTree::new();
+        ruler.set_root(s.ruler().create_element());
+        ruler.layout(scarlet_ui::LayoutConstraints::tight(1000., 30.));
+        dispatched_click(&mut ruler, HEADER as i32 - 18, 15);
+        assert_eq!(
+            s.model.borrow().project.tracks.len(),
+            initial.tracks.len() + 1
+        );
+    }
+}
+#[test]
+fn ruler_capture_follows_drag_without_rebuilding_waveforms_and_clamps_and_cancels() {
+    let s = Daw::new(project());
+    s.seek(0.4);
+    s.view_start.set(0.2);
+    s.view_span.set(0.8);
+    s.arrangement_size.set(Size::new(1000., 500.));
+    s.refresh(true);
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.ruler().create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1000., 30.));
+    let mut dispatcher = scarlet_ui::EventDispatcher::new();
+    let p = Point::new(HEADER + 395., 15.);
+    dispatch_mouse(&mut dispatcher, &mut tree, MouseButton::Left, p, true);
+    assert!((s.playhead.get() - 0.6).abs() < 1e-6);
+    let mesh = s.model.borrow().channels[0].mesh.clone();
+    let frame = s.model.borrow().channels[0].frame.get();
+    let revision = s.revision.get();
+    for (x, expected) in [
+        (HEADER as i32 + 100, 0.2 + 100. / 790. * 0.8),
+        (-200, 0.2),
+        (2000, 1.),
+    ] {
+        assert!(dispatcher.dispatch(&mut tree, &Event::Mouse(MouseEvent::Moved { x, y: 1000 })));
+        assert!((s.playhead.get() - expected).abs() < 1e-6);
+        assert!(Arc::ptr_eq(&mesh, &s.model.borrow().channels[0].mesh));
+        assert!(Arc::ptr_eq(
+            &frame,
+            &s.model.borrow().channels[0].frame.get()
+        ));
+        assert_eq!(s.revision.get(), revision);
+        assert!(s.model.borrow().audio.is_none());
+    }
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Mouse(MouseEvent::ButtonCancelled {
+            button: MouseButton::Left,
+            x: 2000,
+            y: 1000
+        })
+    ));
+    assert!((s.playhead.get() - 0.4).abs() < 1e-6);
+    assert!(s.ruler_drag.borrow().is_none());
+    dispatch_mouse(&mut dispatcher, &mut tree, MouseButton::Left, p, true);
+    dispatch_mouse(
+        &mut dispatcher,
+        &mut tree,
+        MouseButton::Left,
+        Point::new(2000., 1000.),
+        false,
+    );
+    assert!((s.playhead.get() - 1.).abs() < 1e-6);
+    assert!(s.ruler_drag.borrow().is_none());
+    assert!(!s.dirty());
+    s.ruler_event(
+        &Event::Mouse(MouseEvent::ButtonPressed {
+            button: MouseButton::Left,
+            x: 1000,
+            y: 15,
+            click_count: 1,
+        }),
+        0.,
+        5.,
+        790.,
+    );
+    assert!((s.playhead.get() - 1.2).abs() < 1e-6);
+    assert!(s.cancel_ruler_drag());
+}
+#[test]
+fn follow_pages_keep_playhead_visible_and_fixed_mode_preserves_retained_geometry() {
+    wait_for_test_font();
+    let s = Daw::new(Project::demo());
+    s.view_span.set(1.);
+    s.refresh(true);
+    let mut pipeline = scarlet_ui::RenderingPipeline::new();
+    pipeline.set_root(
+        Window::new("Follow mode", s.clone())
+            .size(Size::new(1280., 860.))
+            .create_element(),
+    );
+    pipeline.layout_initial();
+    for _ in 0..8 {
+        let _ = pipeline.render();
+    }
+    let fixed = s.view_start.get();
+    let mesh = s.model.borrow().channels[0].mesh.clone();
+    for position in [0.25, 0.5, 1., 2., 3.] {
+        s.animate_playhead(position);
+        let _ = pipeline.render();
+    }
+    assert_eq!(s.view_start.get(), fixed);
+    assert!(Arc::ptr_eq(&mesh, &s.model.borrow().channels[0].mesh));
+    s.animate_playhead(0.);
+    s.toggle_follow();
+    for _ in 0..3 {
+        let _ = pipeline.render();
+    }
+    let temp = Temp::new();
+    s.profiler.borrow_mut().path = Some(temp.0.join("follow.json"));
+    s.profiler.borrow_mut().begin_at(Instant::now());
+    for position in [0.2, 0.3, 0.8] {
+        s.animate_playhead(position);
+        let _ = pipeline.render();
+    }
+    assert_eq!(s.profiler.borrow().body_builds, 0);
+    assert_eq!(s.profiler.borrow().waveform_refreshes, 0);
+    s.animate_playhead(0.95);
+    let _ = pipeline.render();
+    assert!((s.view_start.get() - 0.85).abs() < 1e-6);
+    let builds = s.profiler.borrow().body_builds;
+    let refreshes = s.profiler.borrow().waveform_refreshes;
+    assert!(builds > 0 && refreshes > 0);
+    for position in [1., 1.2, 1.6] {
+        s.animate_playhead(position);
+        let _ = pipeline.render();
+    }
+    assert_eq!(s.profiler.borrow().body_builds, builds);
+    assert_eq!(s.profiler.borrow().waveform_refreshes, refreshes);
+    s.animate_playhead(0.2);
+    let _ = pipeline.render();
+    assert!((s.view_start.get() - 0.1).abs() < 1e-6);
+    s.toggle_follow();
+    let start = s.view_start.get();
+    s.animate_playhead(3.);
+    assert_eq!(s.view_start.get(), start);
+    assert!(!s.dirty());
+}
+#[test]
+fn transport_controls_use_common_heights_and_fit_minimum_window_in_all_formats() {
+    wait_for_test_font();
+    let s = Daw::new(project());
+    for mode in [
+        timeline::Format::Bars,
+        timeline::Format::Seconds,
+        timeline::Format::Samples,
+    ] {
+        s.time_format.set(mode);
+        s.refresh(true);
+        let mut tree = scarlet_ui::ElementTree::new();
+        tree.set_root(s.transport().create_element());
+        tree.layout(scarlet_ui::LayoutConstraints::tight(1000., 66.));
+        for control in [
+            "::views::text_field::TextFieldRenderObject",
+            "::views::button::ButtonRenderObject",
+        ] {
+            let mut bounds = Vec::new();
+            control_bounds(tree.root().unwrap(), Point::ZERO, control, &mut bounds);
+            assert!(!bounds.is_empty());
+            for (origin, size) in bounds {
+                assert_eq!(size.height, CONTROL_HEIGHT);
+                assert!(origin.x >= 0. && origin.x + size.width <= 1000.);
+                assert!(origin.y >= 0. && origin.y + size.height <= 66.);
+            }
+        }
+        let mut text = Vec::new();
+        text_layouts(tree.root().unwrap(), Point::ZERO, &mut text);
+        for (_, origin, size) in text {
+            assert!(origin.x + size.width <= 1000. && origin.y + size.height <= 66.);
+        }
+    }
+}
+
+#[test]
+fn meter_field_enter_updates_counter_ruler_and_history_without_retiming_audio() {
+    wait_for_test_font();
+    let s = Daw::new(project());
+    s.seek(1.5);
+    let before = s.model.borrow().project.clone();
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1000., 790.));
+    let mut fields = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::views::text_field::TextFieldRenderObject",
+        &mut fields,
+    );
+    let (origin, _) = fields[1];
+    let mut dispatcher = scarlet_ui::EventDispatcher::new();
+    for e in [
+        MouseEvent::ButtonPressed {
+            button: MouseButton::Left,
+            x: (origin.x + 10.) as i32,
+            y: (origin.y + 10.) as i32,
+            click_count: 1,
+        },
+        MouseEvent::ButtonReleased {
+            button: MouseButton::Left,
+            x: (origin.x + 10.) as i32,
+            y: (origin.y + 10.) as i32,
+            click_count: 1,
+        },
+    ] {
+        dispatcher.dispatch(&mut tree, &Event::Mouse(e));
+    }
+    physical_key_and_text(
+        &mut dispatcher,
+        &mut tree,
+        'a',
+        KeyModifiers {
+            super_key: true,
+            ..KeyModifiers::default()
+        },
+    );
+    for c in "3/4".chars() {
+        physical_key_and_text(&mut dispatcher, &mut tree, c, KeyModifiers::default());
+    }
+    assert_eq!(s.signature_input.get(), "3/4");
+    dispatcher.dispatch(
+        &mut tree,
+        &Event::Keyboard(KeyEvent::Pressed {
+            keycode: KeyCode::Enter,
+            modifiers: KeyModifiers::default(),
+        }),
+    );
+    assert_eq!(s.clock.get(), "002.01.000");
+    assert_eq!(s.playhead.get(), 1.5);
+    assert_eq!(s.model.borrow().project.duration(), before.duration());
+    assert!(s.dirty());
+    let mesh = s.model.borrow().channels[0].mesh.revision();
+    s.undo(false);
+    assert_eq!(s.signature_input.get(), "4/4");
+    assert_eq!(s.clock.get(), "001.04.000");
+    s.undo(true);
+    assert_eq!(s.signature_input.get(), "3/4");
+    assert!(s.model.borrow().channels[0].mesh.revision() > mesh);
+    for invalid in ["0/4", "3/3", "33/8", "6/0", "wat"] {
+        s.signature_input.set(invalid.into());
+        s.submit_signature();
+        assert_eq!(s.signature_input.get(), "3/4");
+        assert_eq!(s.model.borrow().undo.len(), 1);
+    }
+    let mut labels = Vec::new();
+    tree.set_root(s.ruler().create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1000., 30.));
+    text_layouts(tree.root().unwrap(), Point::ZERO, &mut labels);
+    assert!(labels.iter().any(|(text, _, _)| text.starts_with("002.")));
 }

@@ -225,3 +225,38 @@ fn validation_rejects_invalid_channels_and_mono_metadata_that_hides_stereo_audio
     p.tracks[0].clips[0].source_channels = 2;
     p.validate().unwrap();
 }
+
+#[test]
+fn meter_persistence_legacy_default_validation_and_export_are_sample_neutral() {
+    use resonara_core::TimeSignature;
+    let d = Temp::new();
+    let mut p = Project::demo();
+    let mut legacy = serde_json::to_value(&p).unwrap();
+    legacy.as_object_mut().unwrap().remove("time_signature");
+    let old: Project = serde_json::from_value(legacy).unwrap();
+    assert_eq!(old.time_signature, TimeSignature::default());
+    p.export_wav(&d.0.join("before-meter.wav")).unwrap();
+    let duration = p.duration();
+    for (n, den) in [(3, 4), (6, 8), (7, 8), (5, 4), (32, 32)] {
+        p.time_signature = TimeSignature {
+            numerator: n,
+            denominator: den,
+        };
+        p.save(&d.0.join("meter.json")).unwrap();
+        let loaded = Project::load(&d.0.join("meter.json")).unwrap();
+        assert_eq!(loaded.time_signature, p.time_signature);
+        assert_eq!(loaded.duration(), duration);
+        loaded.export_wav(&d.0.join("after-meter.wav")).unwrap();
+        assert_eq!(
+            std::fs::read(d.0.join("before-meter.wav")).unwrap(),
+            std::fs::read(d.0.join("after-meter.wav")).unwrap()
+        );
+    }
+    for (n, den) in [(0, 4), (33, 4), (4, 0), (4, 3), (4, 64)] {
+        p.time_signature = TimeSignature {
+            numerator: n,
+            denominator: den,
+        };
+        assert!(p.validate().is_err());
+    }
+}
