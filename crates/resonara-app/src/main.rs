@@ -1,4 +1,5 @@
 mod animation;
+mod counter;
 mod fader;
 mod knob;
 mod meter;
@@ -12,6 +13,7 @@ mod workbench;
 use workbench::{RulerDrag, TrackMenu};
 
 use resonara_core::{Clip, Project, Result};
+#[cfg(not(test))]
 use resonara_platform::Audio;
 use scarlet_ui::{
     WindowContext,
@@ -26,6 +28,8 @@ use std::{
     sync::{Arc, atomic::Ordering, mpsc},
     time::Instant,
 };
+#[cfg(test)]
+use tests::TestAudio as Audio;
 use ui::*;
 macro_rules! row { ($($v:expr),* $(,)?) => { HStack::new(Children(vec![$(Box::new($v) as Box<dyn View>),*])) }; }
 
@@ -130,6 +134,7 @@ struct Daw {
     track_menu: State<Option<TrackMenu>>,
     menu_choice: State<usize>,
     follow_playhead: State<bool>,
+    follow_suspended: Rc<Cell<bool>>,
     ruler_drag: Rc<RefCell<Option<RulerDrag>>>,
     cursor: State<String>,
     range_end: State<String>,
@@ -200,6 +205,7 @@ impl Daw {
             track_menu: state(32, None),
             menu_choice: state(33, 0),
             follow_playhead: state(34, false),
+            follow_suspended: Rc::new(Cell::new(false)),
             ruler_drag: Rc::new(RefCell::new(None)),
             cursor: state(6, "0.000".into()),
             range_end: state(7, "1.000".into()),
@@ -217,7 +223,7 @@ impl Daw {
             dialog_error: state(16, String::new()),
             inspector: state(17, true),
             inspector_fraction: state(26, 0.185),
-            mixer_fraction: state(27, 0.59),
+            mixer_fraction: state(27, 0.),
             mixer_visible: state(18, true),
             snap: state(19, true),
             tool: state(20, 0),
@@ -631,10 +637,16 @@ impl Daw {
             let a = Audio::start(&m.project, start)?;
             self.status.set(format!("Playing · {}", a.device));
             m.audio = Some(a);
+            self.playhead
+                .set(start as f64 / m.project.sample_rate as f64);
+            self.follow_suspended.set(false);
             Ok(())
         });
         if let Err(e) = result {
             self.status.set(format!("Playback unavailable: {e}"));
+        }
+        if self.model.borrow().audio.is_some() {
+            self.animate_playhead(self.playhead.get());
         }
         self.changed();
     }
@@ -719,6 +731,20 @@ impl Daw {
         if was_playing {
             self.play();
         }
+    }
+    fn release_meters(&self, elapsed: f32) {
+        let release = |state: &State<meter::StereoMeter>| {
+            let old = state.get();
+            let mut next = old;
+            next.release(elapsed);
+            if next != old {
+                state.set(next);
+            }
+        };
+        for channel in &self.model.borrow().channels {
+            release(&channel.peak);
+        }
+        release(&self.master_peak);
     }
     fn split(&self) {
         let at = match self.seconds(&self.cursor.get()) {
@@ -974,6 +1000,7 @@ impl Daw {
                 true
             }
             Event::Mouse(MouseEvent::Wheel { delta_x, .. }) if *delta_x != 0 => {
+                self.suspend_follow();
                 self.view_start.set(
                     (self.view_start.get()
                         - *delta_x as f64 * 0.25 / width as f64 * self.view_span.get())
@@ -1490,18 +1517,13 @@ impl Daw {
                     .frame(size.width, (size.height - 60.).max(100.)),
             )
         };
-        let layout=AnyView::new(vstack!{self.ruler(),TrackArea(content,None),row!{self.icon(Icon::ChevronLeft,"Scroll timeline left",false,|s|{s.view_start.set((s.view_start.get()-s.view_span.get()*0.5).max(0.));s.refresh(true);}),caption(format!("{:.2}s — {:.2}s",self.view_start.get(),self.view_start.get()+self.view_span.get())),Spacer::new(),caption("Drag region • edge = trim • S = split"),self.icon(Icon::ChevronRight,"Scroll timeline right",false,|s|{s.view_start.set(s.view_start.get()+s.view_span.get()*0.5);s.refresh(true);})}.spacing(6.).padding_insets(EdgeInsets::new(8.,0.,8.,0.)).frame_height(30.).background(PANEL)}.spacing(0.).background(BG).on_geometry_change(|g|g.size(),move|size|{let old=resize.arrangement_size.get();if(old.width-size.width).abs()>1.||(old.height-size.height).abs()>1.{resize.arrangement_size.set(size);if resize.mixer_visible.get(){let full=(resize.size.get().height-44.-66.-36.-28.-4.).max(1.);resize.mixer_fraction.set((size.height/full).clamp(0.1,0.9));}resize.refresh(true);}}));
+        let layout=AnyView::new(vstack!{self.ruler(),TrackArea(content,None),row!{self.icon(Icon::ChevronLeft,"Scroll timeline left",false,|s|{s.scroll_timeline(-s.view_span.get()*0.5);}),caption(format!("{:.2}s — {:.2}s",self.view_start.get(),self.view_start.get()+self.view_span.get())),Spacer::new(),caption("Drag region • edge = trim • S = split"),self.icon(Icon::ChevronRight,"Scroll timeline right",false,|s|{s.scroll_timeline(s.view_span.get()*0.5);})}.spacing(6.).padding_insets(EdgeInsets::new(8.,0.,8.,0.)).frame_height(30.).background(PANEL)}.spacing(0.).background(BG).on_geometry_change(|g|g.size(),move|size|{let old=resize.arrangement_size.get();if(old.width-size.width).abs()>1.||(old.height-size.height).abs()>1.{resize.arrangement_size.set(size);if resize.mixer_visible.get(){let full=(resize.size.get().height-44.-66.-36.-28.-4.).max(1.);resize.mixer_fraction.set((size.height/full).clamp(0.1,0.9));}resize.refresh(true);}}));
         let wheel = self.clone();
         AnyView::new(HorizontalWheel(
             layout,
             Rc::new(move |dx| {
                 let width = (wheel.arrangement_size.get().width - HEADER).max(200.);
-                wheel.view_start.set(
-                    (wheel.view_start.get()
-                        - dx as f64 * 0.25 / width as f64 * wheel.view_span.get())
-                    .max(0.),
-                );
-                wheel.refresh(true);
+                wheel.scroll_timeline(-dx as f64 * 0.25 / width as f64 * wheel.view_span.get());
             }),
         ))
     }
@@ -1593,7 +1615,17 @@ impl Daw {
             ),
         )
     }
+    fn mixer_fader_height(&self) -> f32 {
+        let available = (self.size.get().height - 174.).max(320.) - 4.;
+        let max_first = (available - MIXER_MIN_HEIGHT).max(0.);
+        let min_first = (available - MIXER_MAX_HEIGHT).max(230.).min(max_first);
+        let first = (available * self.mixer_fraction.get()).clamp(min_first, max_first);
+        (available - first - MIXER_HEADER_HEIGHT - MIXER_STRIP_OVERHEAD)
+            .clamp(112., MIXER_FADER_MAX_HEIGHT)
+    }
     fn mixer(&self) -> AnyView {
+        let fader_height = self.mixer_fader_height();
+        let strip_height = MIXER_STRIP_OVERHEAD + fader_height;
         let m = self.model.borrow();
         let mut channels: Vec<Box<dyn View>> = vec![];
         for (i, t) in m.project.tracks.iter().enumerate() {
@@ -1612,21 +1644,21 @@ impl Daw {
                 ui::button(format!("{:02} {}",i+1,ui::elide(&t.name,11))).font_size(10.).on_click(move||select.choose(i,None)).frame(92.,24.).on_hover(move||status.set(full_name.clone())),
                 row!{ui::button("M").background_color(if t.mute{GOLD}else{RAISED}).text_color(if t.mute{BG}else{TEXT}).on_click(move||mute.mix(i,None,None,Some(false))),ui::button("S").background_color(if t.solo{GOLD}else{RAISED}).text_color(if t.solo{BG}else{TEXT}).on_click(move||solo.mix(i,None,None,Some(true)))}.spacing(6.).frame_height(24.),
                 vstack!{knob::PanKnob::new(c.pan.clone(),c.dragging_pan.clone(),c.pan_focused.clone(),move|v|pan.mix(i,None,Some(v),None)).frame(32.,32.),caption(ui::pan(t.pan)).font_size(10.)}.spacing(0.).frame(90.,44.),
-                fader::Fader::new(c.gain.clone(),c.peak.clone(),c.dragging_gain.clone(),c.focused.clone(),move|v|gain.mix(i,Some(v),None,None)).frame(90.,112.),
+                fader::Fader::new(c.gain.clone(),c.peak.clone(),c.dragging_gain.clone(),c.focused.clone(),move|v|gain.mix(i,Some(v),None,None)).frame(90.,fader_height),
                 label(format!("Gain {}",ui::db(t.gain))).font_size(10.).alignment(Alignment::Center).frame(90.,14.),
                 animation::Readout::new(c.meter.clone(),9.,ACCENT,Size::new(90.,12.)).on_hover(move||meter_status.set(meter_peak.get().detail(false))),
-            }.spacing(2.).padding(4.).frame(100.,254.).background(if i==m.selected{RAISED}else{PANEL}).border(LINE,1.)));
+            }.spacing(2.).padding(4.).frame(100.,strip_height - 2.).background(if i==m.selected{RAISED}else{PANEL}).border(LINE,1.)));
         }
         let master = self.clone();
         let master_status = self.status.clone();
         let master_peak = self.master_peak.clone();
         channels.push(Box::new(vstack!{
             Rectangle::new().fill(TEXT).frame(90.,3.),label("STEREO OUT").font_size(11.).alignment(Alignment::Center).frame(92.,24.),caption("MASTER").alignment(Alignment::Center).frame(90.,24.),caption("Post gain · pre clip").font_size(9.).alignment(Alignment::Center).frame(90.,44.),
-            fader::Fader::new(self.master.clone(),self.master_peak.clone(),self.master_dragging.clone(),self.master_focus.clone(),move|v|master.master_change(v)).frame(90.,112.),
+            fader::Fader::new(self.master.clone(),self.master_peak.clone(),self.master_dragging.clone(),self.master_focus.clone(),move|v|master.master_change(v)).frame(90.,fader_height),
             label(format!("Gain {}",ui::db(m.project.master))).font_size(10.).alignment(Alignment::Center).frame(90.,14.),animation::Readout::new(self.master_meter.clone(),9.,ACCENT,Size::new(90.,12.)).on_hover(move||master_status.set(master_peak.get().detail(true)))
-        }.spacing(2.).padding(4.).frame(100.,254.).background(RAISED).border(LINE,1.)));
+        }.spacing(2.).padding(4.).frame(100.,strip_height - 2.).background(RAISED).border(LINE,1.)));
         let width = channels.len() as f32 * 100.;
-        AnyView::new(vstack!{row!{caption("MIXER"),caption(format!("{} audio channels",m.project.tracks.len())),Spacer::new(),caption("Click gain ticks · ↑ / ↓ · Shift = fine · double-click thumb = reset"),self.icon(Icon::X,"Hide mixer · X",false,|s|s.mixer_visible.set(false))}.spacing(12.).padding_insets(EdgeInsets::new(12.,0.,8.,0.)).frame_height(30.).background(PANEL),ScrollView::new(HStack::new(Children(channels)).spacing(0.).alignment(Alignment::TopLeading)).horizontal().content_size(width,256.).frame_height(256.)}.spacing(0.).background(BG))
+        AnyView::new(vstack!{row!{caption("MIXER"),caption(format!("{} audio channels",m.project.tracks.len())),Spacer::new(),caption("Click gain ticks · ↑ / ↓ · Shift = fine · double-click thumb = reset"),self.icon(Icon::X,"Hide mixer · X",false,|s|s.mixer_visible.set(false))}.spacing(12.).padding_insets(EdgeInsets::new(12.,0.,8.,0.)).frame_height(MIXER_HEADER_HEIGHT).background(PANEL),ScrollView::new(HStack::new(Children(channels)).spacing(0.).alignment(Alignment::TopLeading)).both_axes().content_size(width,strip_height).frame_height(strip_height)}.spacing(0.).background(BG))
     }
     fn toolbar(&self) -> AnyView {
         let m = self.model.borrow();
@@ -1654,7 +1686,7 @@ impl Daw {
                 self.header_button("Stop","Stop playback",|s|s.stop_audio(true))
             }.spacing(6.),116.),
             Surface::section(row!{
-                ui::lcd_group(format.caption(),animation::Readout::new(self.clock.clone(),24.,ACCENT,Size::new(172.,CONTROL_HEIGHT)),172.),
+                ui::lcd_group(format.caption(),counter::Counter::new(self.clock.clone()),COUNTER_WIDTH),
                 ui::lcd_group("BPM",ui::lcd_field(self.tempo_input.clone()).on_submit(move||tempo.submit_tempo()).blur_on_submit(true).input_guard(),56.),
                 ui::lcd_group("METER",ui::lcd_field(self.signature_input.clone()).on_submit(move||signature.submit_signature()).blur_on_submit(true).input_guard(),52.)
             }.spacing(CONTROL_GAP).padding_insets(EdgeInsets::new(CONTROL_GAP,4.,CONTROL_GAP,4.))).fill(BG).border_color(LINE).corner_radius(8.),
@@ -1694,8 +1726,8 @@ impl Daw {
                 SplitView::new(arrangement, self.mixer())
                     .axis(SplitAxis::Vertical)
                     .fraction(self.mixer_fraction.get())
-                    .min_first(230.)
-                    .min_second(286.)
+                    .min_first((height - 4. - MIXER_MAX_HEIGHT).max(230.))
+                    .min_second(MIXER_MIN_HEIGHT)
                     .divider_thickness(4.)
                     .divider_colors(LINE, ACCENT)
                     .frame(size.width, height),
@@ -2015,8 +2047,8 @@ impl Application for Daw {
         let now = Instant::now();
         let meter_elapsed = now.duration_since(self.last_meter.get());
         let meter_due = meter_elapsed >= animation::METER_INTERVAL;
-        let playhead_due =
-            now.duration_since(self.last_playhead.get()) >= animation::PLAYHEAD_INTERVAL;
+        let playhead_elapsed = now.duration_since(self.last_playhead.get());
+        let playhead_due = playhead_elapsed >= animation::PLAYHEAD_INTERVAL;
         if !meter_due && !playhead_due {
             return;
         }
@@ -2046,10 +2078,13 @@ impl Application for Daw {
                 self.update_meters(None, meter_elapsed.as_secs_f32());
             }
         }
-        if let Some(pos) = next_position {
+        if meter_due {
+            self.release_meters(meter_elapsed.as_secs_f32());
+        }
+        if let Some(pos) = next_position.filter(|_| self.ruler_drag.borrow().is_none()) {
             self.animate_playhead(pos);
         }
-        if ended || failure {
+        if (ended && self.ruler_drag.borrow().is_none()) || failure {
             self.stop_audio(false);
             self.status.set(
                 if failure {

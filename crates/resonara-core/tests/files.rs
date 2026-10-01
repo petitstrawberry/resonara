@@ -107,6 +107,76 @@ fn imports_mono_pcm_and_resamples() {
         assert_eq!(c.samples[0], [0.5, 0.5]);
     }
 }
+
+fn counted_padding_wav(sample_rate: u32, channels: u16, samples: &[i32], tail: &[u8]) -> Vec<u8> {
+    let mut bytes = b"RIFF\0\0\0\0WAVEJUNK\x04\0\0\0\0\0\0\0fmt \x10\0\0\0".to_vec();
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&(sample_rate * u32::from(channels) * 3).to_le_bytes());
+    bytes.extend_from_slice(&(channels * 3).to_le_bytes());
+    bytes.extend_from_slice(&24u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    let length = (samples.len() * 3 + tail.len()) as u32;
+    bytes.extend_from_slice(&length.to_le_bytes());
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes()[..3]);
+    }
+    bytes.extend_from_slice(tail);
+    if length % 2 != 0 {
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(b"LGWV\x04\0\0\0meta");
+    let riff_length = bytes.len() as u32 - 8;
+    bytes[4..8].copy_from_slice(&riff_length.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn imports_logic_counted_padding_without_losing_samples_or_reading_metadata() {
+    let d = Temp::new();
+    let source = [1 << 22, -(1 << 22), 1 << 21];
+    for rate in [44100, 48000, 96000] {
+        let path = d.0.join(format!("logic-{rate}.wav"));
+        let bytes = counted_padding_wav(rate, 1, &source, &[0]);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(hound::WavReader::open(&path).is_err());
+        let mut p = Project {
+            sample_rate: rate,
+            ..Project::default()
+        };
+        p.import_wav(&path).unwrap();
+        let clip = &p.tracks[0].clips[0];
+        assert_eq!(clip.source_channels, 1);
+        assert_eq!(clip.frames, 3);
+        assert_eq!(clip.samples.as_ref(), &vec![[0.5; 2], [-0.5; 2], [0.25; 2]]);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        p.validate().unwrap();
+    }
+}
+
+#[test]
+fn rejects_partial_samples_and_frames_instead_of_discarding_audio() {
+    let d = Temp::new();
+    for (channels, samples, tail) in [
+        (1, vec![1, 2, 3], vec![1]),    // The extra byte is not zero padding.
+        (1, vec![1, 2], vec![0]),       // Even sample counts need no RIFF padding.
+        (1, vec![1, 2, 3], vec![0, 0]), // More than one byte is incomplete audio.
+        (2, vec![1, 2, 3], vec![0]),    // A partial stereo frame must not be accepted.
+    ] {
+        let path = d.0.join("incomplete.wav");
+        std::fs::write(&path, counted_padding_wav(48000, channels, &samples, &tail)).unwrap();
+        let mut p = Project::demo();
+        assert!(p.import_wav(&path).is_err());
+        assert_eq!(p.tracks.len(), 3);
+    }
+    let path = d.0.join("truncated.wav");
+    let mut bytes = counted_padding_wav(48000, 1, &[1, 2, 3], &[0]);
+    bytes.truncate(56); // Ends before the declared data payload is complete.
+    std::fs::write(&path, bytes).unwrap();
+    assert!(Project::default().import_wav(&path).is_err());
+}
+
 #[test]
 fn rejects_surround_and_nonfinite_wav_and_corrupt_project() {
     let d = Temp::new();

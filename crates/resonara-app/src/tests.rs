@@ -3,6 +3,31 @@ use resonara_core::Track;
 use scarlet_ui::{SgfxCanvasRenderObject, WindowId, event::KeyModifiers, pipeline::PipelineId};
 use std::{sync::atomic::AtomicU64, time::Duration};
 
+// Exercise the real render engine and transport state without opening a device.
+pub(super) struct TestAudio {
+    pub controls: Arc<resonara_core::Controls>,
+    pub device: String,
+    engine: RefCell<resonara_core::Engine>,
+}
+impl TestAudio {
+    pub fn start(project: &Project, start: u64) -> Result<Self> {
+        project.validate()?;
+        let controls = Arc::new(resonara_core::Controls::new(project));
+        let engine =
+            resonara_core::Engine::new(project, controls.clone(), project.sample_rate, start);
+        Ok(Self {
+            controls,
+            device: "Test output".into(),
+            engine: RefCell::new(engine),
+        })
+    }
+    fn render(&self, frames: usize) {
+        self.engine
+            .borrow_mut()
+            .render(&mut vec![0f32; frames * 2], 2);
+    }
+}
+
 fn project() -> Project {
     Project {
         sample_rate: 8000,
@@ -1342,6 +1367,7 @@ fn retained_fader_paint_aligns_thumb_ticks_and_visible_label_ink() {
                     9401,
                     meter::StereoMeter {
                         peak: [gain; 2],
+                        display: [gain; 2],
                         ..Default::default()
                     },
                 ),
@@ -1611,6 +1637,12 @@ fn text_layouts(
         parent.x + element.position().x,
         parent.y + element.position().y,
     );
+    if let Some(counter) = element
+        .render_object()
+        .and_then(|r| r.as_any().downcast_ref::<counter::CounterRender>())
+    {
+        out.push((counter.text(), origin, element.bounds().size));
+    }
     if element.children().is_empty()
         && (element
             .type_name_debug()
@@ -2297,15 +2329,14 @@ fn stereo_meter_poll_uses_one_snapshot_for_bars_text_and_master_overrange() {
     assert_eq!(controls.master_peak_right.load(Ordering::Relaxed), 0);
     drop(model);
 
-    // A second poll has no new samples: both text and live bars become silent,
-    // while the independently timed peak marker may remain visible.
+    // Raw measurements become silent; displayed bars decay and peak numbers hold.
     s.update_meters(Some(&controls), 0.05);
     assert_eq!(s.master_peak.get().peak, [0.; 2]);
     assert_eq!(s.master_peak.get().held, [2., 0.25]);
-    assert_eq!(s.master_meter.get(), "Peak −∞ dBFS");
+    assert_eq!(s.master_meter.get(), "Peak +6.0 dBFS");
     for channel in &s.model.borrow().channels {
         assert_eq!(channel.peak.get().peak, [0.; 2]);
-        assert_eq!(channel.meter.get(), "Peak −∞ dBFS");
+        assert_eq!(channel.meter.get(), channel.peak.get().summary());
     }
 
     controls.tracks[0]
@@ -2377,7 +2408,7 @@ fn complete_mixer_paints_unequal_stereo_track_and_master_bars_and_hover_values()
     );
     let expected = [[0.75f32, 0.25], [0.25, 0.125], [2., 0.25]];
     for ((origin, size, commands), peaks) in paints.iter().zip(expected) {
-        assert_eq!(*size, Size::new(90., 112.));
+        assert_eq!(*size, Size::new(90., s.mixer_fader_height()));
         let g = crate::fader::Geometry::new(*size);
         let mut tops = [f32::NAN; 2];
         let mut labels = Vec::new();
@@ -2484,6 +2515,7 @@ fn stereo_meter_peak_and_clip_holds_expire_on_stop_and_reset_for_new_playback() 
     assert_eq!(reading.held, [1.25, 0.25]);
     assert!(reading.clip_seconds[0] > 0.);
     reading.advance([0.; 2], 0.02);
+    reading.release(3.);
     assert_eq!(reading, meter::StereoMeter::default());
 
     let s = Daw::new(stereo_meter_project());
@@ -2504,8 +2536,9 @@ fn stereo_meter_peak_and_clip_holds_expire_on_stop_and_reset_for_new_playback() 
     s.stop_audio(false);
     assert_eq!(s.master_peak.get().peak, [0.; 2]);
     assert_eq!(s.master_peak.get().held, [2., 0.5]);
-    assert_eq!(s.master_meter.get(), "Peak −∞ dBFS");
+    assert_eq!(s.master_meter.get(), "Peak +6.0 dBFS");
     s.update_meters(None, 1.01);
+    s.release_meters(3.);
     assert_eq!(s.master_peak.get(), meter::StereoMeter::default());
     assert!(
         s.model
@@ -3605,8 +3638,14 @@ fn hiding_mixer_fills_arrangement_and_restores_split_after_resize() {
             for _ in 0..8 {
                 let _ = pipeline.render();
             }
-            assert!((s.mixer_fraction.get() - split).abs() < 0.002);
-            assert!((s.arrangement_size.get().height - 822. * split).abs() <= 1.);
+            let available = s.size.get().height - 174. - 4.;
+            let mixer_height = available - s.arrangement_size.get().height;
+            assert!(mixer_height <= MIXER_MAX_HEIGHT + 1.);
+            assert!(mixer_height >= MIXER_MIN_HEIGHT - 1.);
+            assert!(
+                (s.mixer_fraction.get() - s.arrangement_size.get().height / available).abs()
+                    < 0.002
+            );
             assert_eq!(s.view_start.get(), 0.25);
             pipeline.teardown();
         }
@@ -4101,6 +4140,198 @@ fn ruler_capture_follows_drag_without_rebuilding_waveforms_and_clamps_and_cancel
     );
     assert!((s.playhead.get() - 1.2).abs() < 1e-6);
     assert!(s.cancel_ruler_drag());
+}
+
+#[test]
+fn playing_ruler_drag_keeps_stream_alive_and_seeks_once_on_release() {
+    let mut s = Daw::new(project());
+    s.seek(0.4);
+    s.view_span.set(1.);
+    s.play();
+    let original = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    let revision = s.revision.get();
+    let mesh = s.model.borrow().channels[0].mesh.clone();
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.ruler().create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1044., 30.));
+    let mut dispatcher = scarlet_ui::EventDispatcher::new();
+    dispatch_mouse(
+        &mut dispatcher,
+        &mut tree,
+        MouseButton::Left,
+        Point::new(HEADER + 200., 15.),
+        true,
+    );
+    assert_eq!(s.revision.get(), revision);
+    assert!(Arc::ptr_eq(
+        &original,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Mouse(MouseEvent::Moved {
+            x: HEADER as i32 + 600,
+            y: 400
+        })
+    ));
+    let preview = s.playhead.get();
+    s.model.borrow().audio.as_ref().unwrap().render(800);
+    s.last_playhead
+        .set(Instant::now() - Duration::from_millis(40));
+    s.on_idle();
+    assert!((original.position.load(Ordering::Relaxed) as f64 / 8000. - 0.5).abs() < 1e-6);
+    assert_eq!(s.playhead.get(), preview);
+    assert!(Arc::ptr_eq(&mesh, &s.model.borrow().channels[0].mesh));
+    assert_eq!(s.revision.get(), revision);
+    dispatch_mouse(
+        &mut dispatcher,
+        &mut tree,
+        MouseButton::Left,
+        Point::new(HEADER + 600., 400.),
+        false,
+    );
+    let resumed = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    assert!(!Arc::ptr_eq(&original, &resumed));
+    assert!(resumed.playing.load(Ordering::Relaxed));
+    assert!((resumed.position.load(Ordering::Relaxed) as f64 / 8000. - preview).abs() < 0.002);
+    s.model.borrow().audio.as_ref().unwrap().render(80);
+    assert!(resumed.position.load(Ordering::Relaxed) > (preview * 8000.) as u64);
+    assert!(s.ruler_drag.borrow().is_none());
+    assert!(!s.dirty());
+}
+
+#[test]
+fn cancelling_playing_ruler_drag_preserves_current_audio_position_and_eof_can_seek_again() {
+    let mut s = Daw::new(project());
+    s.seek(0.4);
+    s.play();
+    let original = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    let press = Event::Mouse(MouseEvent::ButtonPressed {
+        button: MouseButton::Left,
+        x: 300,
+        y: 15,
+        click_count: 1,
+    });
+    assert!(s.ruler_event(&press, 0., 1., 800.));
+    s.model.borrow().audio.as_ref().unwrap().render(800);
+    assert!(s.cancel_ruler_drag());
+    assert!(Arc::ptr_eq(
+        &original,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    assert!((s.playhead.get() - 0.5).abs() < 1e-6);
+    assert!(s.ruler_event(&press, 0., 1., 800.));
+    s.model.borrow().audio.as_ref().unwrap().render(8000);
+    assert!(!original.playing.load(Ordering::Relaxed));
+    s.last_playhead
+        .set(Instant::now() - Duration::from_millis(40));
+    s.on_idle();
+    assert!(s.model.borrow().audio.is_some());
+    assert!(s.ruler_event(
+        &Event::Mouse(MouseEvent::ButtonReleased {
+            button: MouseButton::Left,
+            x: 400,
+            y: 15,
+            click_count: 1
+        }),
+        0.,
+        1.,
+        800.
+    ));
+    let audio = s.model.borrow();
+    let audio = audio.audio.as_ref().unwrap();
+    assert!(audio.controls.playing.load(Ordering::Relaxed));
+    assert_eq!(audio.controls.position.load(Ordering::Relaxed), 4000);
+}
+
+#[test]
+fn manual_timeline_scroll_suspends_follow_until_transport_restarts() {
+    use scarlet_ui::event::{ScrollSource, WheelPhase};
+    let s = Daw::new(project());
+    s.view_span.set(0.5);
+    s.toggle_follow();
+    s.play();
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.arrangement().create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1044., 420.));
+    let mut dispatcher = scarlet_ui::EventDispatcher::new();
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Mouse(MouseEvent::Wheel {
+            delta_x: -120,
+            delta_y: 0,
+            x: 310,
+            y: 72,
+            phase: WheelPhase::Started,
+            source: ScrollSource::Trackpad,
+        })
+    ));
+    let start = s.view_start.get();
+    assert!(s.follow_playhead.get());
+    assert!(s.follow_suspended.get());
+    s.animate_playhead(1.);
+    assert_eq!(s.view_start.get(), start);
+    s.stop_audio(true);
+    s.cursor.set("0.900".into());
+    s.play();
+    assert!(!s.follow_suspended.get());
+    assert!((s.view_start.get() - 0.85).abs() < 1e-6);
+    s.scroll_timeline(-0.3);
+    assert!(s.follow_suspended.get());
+    let start = s.view_start.get();
+    s.animate_playhead(0.);
+    assert_eq!(s.view_start.get(), start);
+    s.toggle_follow();
+    s.toggle_follow();
+    assert!(!s.follow_suspended.get());
+    assert_eq!(s.view_start.get(), 0.);
+}
+
+#[test]
+fn mixer_divider_resizes_meter_and_fader_within_the_content_limits() {
+    wait_for_test_font();
+    let s = Daw::new(project());
+    s.sync_content_size(Size::new(1280., 1032.));
+    let mut pipeline = scarlet_ui::RenderingPipeline::new();
+    pipeline.set_root(
+        Window::new("Resizable meters", s.clone())
+            .size(Size::new(1280., 1032.))
+            .create_element(),
+    );
+    pipeline.layout_initial();
+    for _ in 0..8 {
+        let _ = pipeline.render();
+    }
+    let available = s.size.get().height - 174. - 4.;
+    for requested in [0., 1., 0.55, 0.65] {
+        s.mixer_fraction.set(requested);
+        for _ in 0..8 {
+            let _ = pipeline.render();
+        }
+        let height = available - s.arrangement_size.get().height;
+        assert!(
+            height >= MIXER_MIN_HEIGHT - 1. && height <= MIXER_MAX_HEIGHT + 1.,
+            "mixer height {height}"
+        );
+        let mut faders = Vec::new();
+        control_bounds(
+            pipeline.element_tree().root().unwrap(),
+            Point::ZERO,
+            "::fader::FaderRender",
+            &mut faders,
+        );
+        assert_eq!(faders.len(), 3);
+        for (_, size) in faders {
+            assert!((size.height - s.mixer_fader_height()).abs() <= 1.);
+            assert!(
+                size.height >= MIXER_FADER_MIN_HEIGHT - 1.
+                    && size.height <= MIXER_FADER_MAX_HEIGHT + 1.
+            );
+            let g = fader::Geometry::new(size);
+            assert!((fader::gain_at(g.y(fader::gain_fraction(0.)), size.height) - 1.).abs() < 1e-5);
+        }
+    }
+    pipeline.teardown();
 }
 #[test]
 fn follow_pages_keep_playhead_visible_and_fixed_mode_preserves_retained_geometry() {

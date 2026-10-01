@@ -17,10 +17,15 @@ assert 'path' not in dependency, 'Committed ScarletUI dependency must not requir
 packages = tomllib.loads((root / 'Cargo.lock').read_text())['package']
 ui = [p for p in packages if p['name'].startswith('scarlet-ui') or p['name'] == 'scarlet-scroll-motion']
 expected = f'git+{repository}?rev={revision}#{revision}'
-assert ui and all(p.get('source') == expected for p in ui), 'ScarletUI crates must share one pinned source'
+renderer = [p for p in ui if p['name'] == 'scarlet-ui-renderer-sgfx']
+assert len(renderer) == 1 and 'source' not in renderer[0], 'The reviewed renderer patch must be workspace-local'
+assert ui and all(p.get('source') == expected for p in ui if p['name'] != 'scarlet-ui-renderer-sgfx'), 'Other ScarletUI crates must share one pinned source'
+workspace = tomllib.loads((root / 'Cargo.toml').read_text())
+patch = workspace['patch'][repository]['scarlet-ui-renderer-sgfx']
+assert patch == {'path': 'vendor/scarlet-ui-renderer-sgfx'}, 'Renderer patch must be portable'
 assert len(ui) == len({p['name'] for p in ui}), 'Duplicate ScarletUI crate identities'
 core = [p for p in packages if p['name'] == 'sgfx-core']
 assert len(core) == 1, 'SGFX core must resolve to one crate identity'
 assert core[0].get('source', '').startswith('git+https://github.com/petitstrawberry/sgfx?rev='), 'SGFX core must be Git-pinned'
-print(f'Dependency pins verified: {len(ui)} ScarletUI crates, one SGFX core identity')
+print(f'Dependency pins verified: {len(ui) - 1} pinned ScarletUI crates, one local renderer patch, one SGFX core identity')
 PY

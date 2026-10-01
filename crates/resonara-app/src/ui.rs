@@ -13,6 +13,15 @@ pub const GOLD: Color = Color::rgb_f32(0.98, 0.74, 0.34);
 pub const ROW: f32 = 84.;
 pub const HEADER: f32 = 210.;
 pub const CONTROL_HEIGHT: f32 = 28.;
+pub const COUNTER_WIDTH: f32 = 172.;
+pub const MIXER_STRIP_OVERHEAD: f32 = 144.;
+pub const MIXER_FADER_MIN_HEIGHT: f32 = 168.;
+pub const MIXER_FADER_MAX_HEIGHT: f32 = 224.;
+pub const MIXER_HEADER_HEIGHT: f32 = 30.;
+pub const MIXER_MIN_HEIGHT: f32 =
+    MIXER_HEADER_HEIGHT + MIXER_STRIP_OVERHEAD + MIXER_FADER_MIN_HEIGHT;
+pub const MIXER_MAX_HEIGHT: f32 =
+    MIXER_HEADER_HEIGHT + MIXER_STRIP_OVERHEAD + MIXER_FADER_MAX_HEIGHT;
 pub const CONTROL_FONT: f32 = 11.;
 pub const CONTROL_GAP: f32 = 8.;
 pub const TRANSPORT_GROUP_HEIGHT: f32 = 48.;

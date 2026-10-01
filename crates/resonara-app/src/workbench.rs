@@ -58,7 +58,10 @@ impl Daw {
         )
     }
     pub(super) fn follow_position(&self, position: f64) {
-        if !self.follow_playhead.get() || self.ruler_drag.borrow().is_some() {
+        if !self.follow_playhead.get()
+            || self.follow_suspended.get()
+            || self.ruler_drag.borrow().is_some()
+        {
             return;
         }
         let start = self.view_start.get();
@@ -72,8 +75,19 @@ impl Daw {
         }
     }
     pub(super) fn toggle_follow(&self) {
+        self.follow_suspended.set(false);
         self.follow_playhead.set(!self.follow_playhead.get());
         self.follow_position(self.playhead.get());
+    }
+    pub(super) fn suspend_follow(&self) {
+        if self.follow_playhead.get() && self.model.borrow().audio.is_some() {
+            self.follow_suspended.set(true);
+        }
+    }
+    pub(super) fn scroll_timeline(&self, delta: f64) {
+        self.suspend_follow();
+        self.view_start.set((self.view_start.get() + delta).max(0.));
+        self.refresh(true);
     }
     pub(super) fn add_track(&self, after: Option<usize>) {
         self.edit("Add audio track", |m| {
@@ -259,7 +273,6 @@ impl Daw {
                     return false;
                 }
                 let resume = self.model.borrow().audio.is_some();
-                self.stop_audio(false);
                 let drag = RulerDrag {
                     before: self.playhead.get(),
                     resume,
@@ -286,8 +299,9 @@ impl Daw {
                 let Some(drag) = self.ruler_drag.borrow_mut().take() else {
                     return false;
                 };
+                let was_playing = self.model.borrow().audio.is_some();
                 self.seek(self.ruler_position(*x, drag));
-                if drag.resume {
+                if drag.resume && !was_playing {
                     self.play();
                 }
                 true
@@ -300,9 +314,18 @@ impl Daw {
         let Some(drag) = self.ruler_drag.borrow_mut().take() else {
             return false;
         };
-        self.seek(drag.before);
         if drag.resume {
-            self.play();
+            // No seek was committed: keep the existing stream at its current position.
+            let position = {
+                let m = self.model.borrow();
+                m.audio.as_ref().map_or(self.playhead.get(), |audio| {
+                    audio.controls.position.load(Ordering::Relaxed) as f64
+                        / m.project.sample_rate as f64
+                })
+            };
+            self.ruler_preview(position);
+        } else {
+            self.seek(drag.before);
         }
         true
     }

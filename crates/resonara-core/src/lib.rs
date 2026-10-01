@@ -5,6 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 pub mod graph;
+mod wav;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -128,7 +129,7 @@ impl Project {
             .unwrap_or(0)
     }
     pub fn import_wav(&mut self, path: &std::path::Path) -> Result<()> {
-        let mut r = hound::WavReader::open(path)?;
+        let mut r = wav::open(path)?;
         let spec = r.spec();
         if !(1..=2).contains(&spec.channels) || spec.sample_rate == 0 {
             return Err("Only mono/stereo WAV is supported".into());

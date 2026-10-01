@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/resonara-core", "crates/resonara-platform", "crates/resonara-app"]
+members = ["crates/resonara-core", "crates/resonara-platform", "crates/resonara-app", "vendor/scarlet-ui-renderer-sgfx"]
+[patch."https://github.com/petitstrawberry/scarlet-ui"]
+scarlet-ui-renderer-sgfx = { path = "vendor/scarlet-ui-renderer-sgfx" }
 [workspace.dependencies]
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"

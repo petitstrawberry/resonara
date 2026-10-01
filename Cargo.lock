@@ -68,6 +68,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocator-api2"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
 name = "alsa"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -852,6 +858,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -2018,7 +2026,19 @@ version = "1.0.0"
 source = "git+https://github.com/petitstrawberry/Scarlet?rev=b3d2a55740a3d2ca49daad0ec7baba233f706f7a#b3d2a55740a3d2ca49daad0ec7baba233f706f7a"
 dependencies = [
  "scarlet-abi",
+ "scarlet-rt",
  "scarlet-sys",
+]
+
+[[package]]
+name = "scarlet-rt"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=b3d2a55740a3d2ca49daad0ec7baba233f706f7a#b3d2a55740a3d2ca49daad0ec7baba233f706f7a"
+dependencies = [
+ "lock_api",
+ "scarlet-sys",
+ "spin",
+ "talc",
 ]
 
 [[package]]
@@ -2027,6 +2047,19 @@ version = "0.1.0"
 source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=91238ed12c3379c0aea7e7ba86e73139cfb1f550#91238ed12c3379c0aea7e7ba86e73139cfb1f550"
 dependencies = [
  "libm",
+]
+
+[[package]]
+name = "scarlet-std"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=b3d2a55740a3d2ca49daad0ec7baba233f706f7a#b3d2a55740a3d2ca49daad0ec7baba233f706f7a"
+dependencies = [
+ "hashbrown 0.15.5",
+ "scarlet-abi",
+ "scarlet-os",
+ "scarlet-rt",
+ "scarlet-sys",
+ "spin",
 ]
 
 [[package]]
@@ -2058,6 +2091,7 @@ dependencies = [
  "libm",
  "raw-window-handle",
  "scarlet-scroll-motion",
+ "scarlet-std",
  "scarlet-ui-icons-tabler",
  "scarlet-ui-macros",
  "unicode-script",
@@ -2113,7 +2147,6 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-renderer-sgfx"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=91238ed12c3379c0aea7e7ba86e73139cfb1f550#91238ed12c3379c0aea7e7ba86e73139cfb1f550"
 dependencies = [
  "libm",
  "scarlet-ui-core",
@@ -2416,6 +2449,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spin"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
+dependencies = [
+ "lock_api",
+]
+
+[[package]]
 name = "spirv"
 version = "0.3.0+sdk-1.3.268.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2502,6 +2544,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "talc"
+version = "4.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3ae828aa394de34c7de08f522d1b86bd1c182c668d27da69caadda00590f26d"
+dependencies = [
+ "lock_api",
 ]
 
 [[package]]

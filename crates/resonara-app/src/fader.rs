@@ -333,7 +333,7 @@ impl ElementRenderObject for FaderRender {
             ui::BG,
         );
         let reading = self.control.peak.get();
-        for (channel, peak) in reading.peak.into_iter().enumerate() {
+        for (channel, peak) in reading.display.into_iter().enumerate() {
             let left = x + g.meter_left + channel as f32 * 5.;
             let amount = if peak > 0. {
                 peak_fraction(20. * peak.log10())
