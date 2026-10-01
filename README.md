@@ -9,13 +9,13 @@ Nixをインストールした環境で、次を実行します。依存するSc
 ```sh
 git clone https://github.com/petitstrawberry/resonara.git
 cd resonara
-./scripts/dev cargo run --locked -p resonara
+./scripts/dev cargo run --locked --release -p resonara
 ```
 
 ScarletUIはGit revision `91238ed12c3379c0aea7e7ba86e73139cfb1f550` に固定しています。SGFXもScarletUIが指定する固定Git revisionを使い、推移的依存の正確な解決結果を`Cargo.lock`に記録しています。依存先のローカル変更やパッチは不要です。
 
 ```sh
-./scripts/dev cargo run --locked -p resonara
+./scripts/dev cargo run --locked --release -p resonara
 # 空のプロジェクト
 ./scripts/dev cargo run --locked -p resonara -- --empty
 # 保存済みプロジェクト
@@ -31,6 +31,7 @@ ScarletUI自体を編集する場合に限り、未コミットのCargo `[patch]
 - 起動時は3トラックのデモ。上部のImport WAVからアプリ内ファイルブラウザーで音声を選び、トラックを追加。
 - 上部にトランスポート、中央にトラック一覧とアレンジメント、左にインスペクター、下部にミキサー。ウィンドウのリサイズに追従し、インスペクター・ミキサーは開閉可能。
 - Spaceで再生・停止、Homeで先頭へ。ルーラーのクリックやGO TOの秒入力で再生位置を変更。停止時の位置を保持。
+- カウンターとルーラーは小節・拍・tickが初期表示（4/4、四分音符あたり960 tick）。隣のBPM欄に20〜400を入力しEnterで確定。BPMはプロジェクトに保存しUndo/Redo可能。表示ボタンで小節・拍／時間／サンプル位置を切り替える。BPMのない旧プロジェクトは120 BPMとして読み込む。テンポは表示の基準で、音声の位置・長さはサンプル単位のまま保持する。BPM確定時は再生を停止し、タイムストレッチは行わない。
 - トラックヘッダーやリージョンをクリックして選択。リージョン中央をドラッグして移動、端をドラッグして非破壊トリム。Escapeでドラッグを取り消す。Sで再生位置を分割し、Splitツールでは波形をクリックして分割。
 - ステレオ素材のリージョンはL/Rの独立した2段波形、モノ素材は1段波形で表示。元WAVのチャンネル数を分割・トリム・保存後も保持。以前のJSONにチャンネル数の記録がない場合は、音声を失わないようステレオとして読み込む。
 - Snapは100msグリッド。＋/−でズーム、Fで全体表示。トラック一覧・ミキサーはスクロール可能。
@@ -67,7 +68,7 @@ Scarlet版の音声デバイスアダプター・クロスビルドは未実装�
 ./scripts/dev bash scripts/headless bash scripts/gui-smoke
 ```
 
-`verify` はGit依存の固定・同一性、フォーマット、workspaceテスト、ビルド、ALSAファイル出力の音声スモークを実行します。スモーク用ALSA設定はそのプロセス内だけに適用し、システム設定は変更しません。実デバイスを使わず、CPALのコールバック進行と非ゼロの音声出力を検査します。GUIスモークは毎回新しい出力フォルダーを作り、過去の保存・書出し結果で誤って成功しないようにしています。`RESONARA_BIN`でGUI検証用の実行ファイルを変更できます。
+`verify` はGit依存の固定・同一性、フォーマット、workspaceテスト、ビルドを実行します。LinuxではさらにALSAファイル出力の音声スモークを実行します。スモーク用ALSA設定はそのプロセス内だけに適用し、システム設定は変更しません。実デバイスを使わず、CPALのコールバック進行と非ゼロの音声出力を検査します。macOSではALSAスモークを明示的にスキップし、通常起動時のCoreAudio再生を別に確認します。`headless`と`gui-smoke`はLinux専用で、Macではネイティブウィンドウを使います。GUIスモークは毎回新しい出力フォルダーを作り、過去の保存・書出し結果で誤って成功しないようにしています。`RESONARA_BIN`でGUI検証用の実行ファイルを変更できます。
 
 `artifacts/` に検証ログ、保存・再読込プロジェクト、書出しWAV、再生音声、画面PNGを生成します。テストではミックス値、Mute/Solo/Pan/Master、分割後の44.1/96kHz再生一致、保存・書出し、各PCM幅、不正データ、Undo/Redo、キャンセル、非同期I/O、テキスト入力とショートカット、フェーダー、ElementTree上のポインター配送を検証します。スレッド単位の計測allocatorでrenderを1000回実行し、確保・解放ゼロを検査します。
 
@@ -75,4 +76,4 @@ Scarlet版の音声デバイスアダプター・クロスビルドは未実装�
 
 2026-10-01のLinuxクラウド検証では固定flakeの評価に成功しましたが、コンテナーがprivate mount namespaceを許可しないため`nix develop`の起動は未成功です。同じ固定Scarlet Rustを直接起動した環境ではビルド・テスト・ALSA出力に成功しています。制限された環境でのGUI検証には許可された既存デスクトップを使い、セキュリティ設定を変更していません。
 
-macOSでの実機ビルド・再生、実音声ハードウェアのレイテンシ・音質はこのLinuxクラウド環境では未検証です。
+Mac移行では既存Nix経由のdebug/releaseビルドと114テストが通過し、Apple M3 ProのMetal GPUで起動を確認しました。ユーザーの操作でCoreAudioの出音も確認済みです。ScrollView操作の重さ、途中起動の汎用`UI: RenderError`は未解決で、実機フレーム間隔・レイテンシ・ドロップアウトは未計測です。[検証記録](docs/validation.md)と[UI計測の限界](docs/ui-performance.md)を参照してください。

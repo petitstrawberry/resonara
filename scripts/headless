@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "$(uname -s)" != Linux ]; then
+  printf 'Headless GUI verification requires Linux/Xvfb. Use the native macOS window.\n' >&2
+  exit 1
+fi
 mkdir -p artifacts
 # Fail clearly in restricted containers instead of making Xvfb probe thousands
 # of display numbers when the kernel denies every Unix-domain socket.

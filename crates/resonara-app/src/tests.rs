@@ -30,6 +30,7 @@ fn assert_project(actual: &Project, expected: &Project) {
     assert_eq!(actual.version, expected.version);
     assert_eq!(actual.sample_rate, expected.sample_rate);
     assert_eq!(actual.master, expected.master);
+    assert_eq!(actual.tempo, expected.tempo);
     assert_eq!(actual.tracks.len(), expected.tracks.len());
     for (a, b) in actual.tracks.iter().zip(&expected.tracks) {
         assert_eq!(a.name, b.name);
@@ -2651,6 +2652,7 @@ fn waveform_vertices_draw_true_stereo_lanes_and_one_mono_lane_at_each_height() {
                 height,
                 0.,
                 64. / 8000.,
+                wave::tick_step(64. / 8000.),
                 8000,
                 &mut peaks,
             );
@@ -2690,6 +2692,7 @@ fn waveform_vertices_draw_true_stereo_lanes_and_one_mono_lane_at_each_height() {
                 height,
                 0.,
                 64. / 8000.,
+                wave::tick_step(64. / 8000.),
                 8000,
                 &mut peaks,
                 handle,
@@ -3036,7 +3039,16 @@ fn selected_waveform_draws_trim_handles_only_at_real_visible_clip_endpoints() {
             let mut peaks = wave::Peaks::default();
             for selected in [None, Some(0)] {
                 let vertices = wave::vertices(
-                    &track, 0, selected, width, height, offset, span, 8000, &mut peaks,
+                    &track,
+                    0,
+                    selected,
+                    width,
+                    height,
+                    offset,
+                    span,
+                    wave::tick_step(span),
+                    8000,
+                    &mut peaks,
                 );
                 let contains = |expected: &[SgfxCanvasVertex]| {
                     vertices
@@ -3383,6 +3395,221 @@ fn frame_profile_quantiles_and_separate_animation_budgets_are_explicit() {
     );
     assert_eq!(animation::METER_INTERVAL, Duration::from_millis(50));
     assert!(animation::PLAYHEAD_INTERVAL < animation::METER_INTERVAL);
+}
+
+#[test]
+fn bpm_field_next_to_counter_accepts_enter_without_global_shortcuts() {
+    wait_for_test_font();
+    let s = Daw::new(project());
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1000., 790.));
+    let mut fields = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::views::text_field::TextFieldRenderObject",
+        &mut fields,
+    );
+    let (origin, size) = fields[0];
+    let mut labels = Vec::new();
+    text_layouts(tree.root().unwrap(), Point::ZERO, &mut labels);
+    let (_, counter, counter_size) = labels
+        .iter()
+        .find(|(text, _, _)| text == "001.01.000")
+        .unwrap();
+    assert!(origin.x >= counter.x + counter_size.width);
+    assert!(origin.x - (counter.x + counter_size.width) < 24.);
+    assert!(origin.x + size.width <= 1000.);
+    let mut dispatcher = scarlet_ui::EventDispatcher::new();
+    // Use the same dispatcher for focus ownership and subsequent key delivery.
+    for event in [
+        MouseEvent::ButtonPressed {
+            button: MouseButton::Left,
+            x: (origin.x + 20.) as i32,
+            y: (origin.y + 10.) as i32,
+            click_count: 1,
+        },
+        MouseEvent::ButtonReleased {
+            button: MouseButton::Left,
+            x: (origin.x + 20.) as i32,
+            y: (origin.y + 10.) as i32,
+            click_count: 1,
+        },
+    ] {
+        dispatcher.dispatch(&mut tree, &Event::Mouse(event));
+    }
+    physical_key_and_text(
+        &mut dispatcher,
+        &mut tree,
+        'a',
+        KeyModifiers {
+            super_key: true,
+            ..KeyModifiers::default()
+        },
+    );
+    for c in "96.5".chars() {
+        physical_key_and_text(&mut dispatcher, &mut tree, c, KeyModifiers::default());
+    }
+    assert_eq!(s.tempo_input.get(), "96.5");
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Keyboard(KeyEvent::Pressed {
+            keycode: KeyCode::Enter,
+            modifiers: KeyModifiers::default()
+        })
+    ));
+    assert_eq!(s.model.borrow().project.tempo, 96.5);
+    assert_eq!(s.model.borrow().project.tracks.len(), 2);
+    assert!(s.dialog.get() == Dialog::None);
+}
+
+#[test]
+fn master_pointer_drag_updates_thumb_state_until_release_and_groups_history() {
+    let s = Daw::new(project());
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.mixer().create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(600., 286.));
+    let mut faders = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::fader::FaderRender",
+        &mut faders,
+    );
+    let (origin, size) = *faders.last().unwrap();
+    let geometry = fader::Geometry::new(size);
+    let x = (origin.x + geometry.axis).round() as i32;
+    let mut dispatcher = scarlet_ui::EventDispatcher::new();
+    let y = (origin.y + geometry.y(0.25)).round() as i32;
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Mouse(MouseEvent::ButtonPressed {
+            button: MouseButton::Left,
+            x,
+            y,
+            click_count: 1
+        })
+    ));
+    for fraction in [0.35, 0.7, 0.5] {
+        let y = (origin.y + geometry.y(fraction)).round() as i32;
+        assert!(dispatcher.dispatch(&mut tree, &Event::Mouse(MouseEvent::Moved { x, y })));
+        assert!(s.master_dragging.get());
+        let expected = fader::gain_at(y as f32 - origin.y, size.height);
+        assert!(
+            (s.master.get() - expected).abs() < 1e-6,
+            "master thumb stayed at its previous value while dragging"
+        );
+        assert_eq!(s.master.get(), s.model.borrow().project.master);
+        assert!(s.model.borrow().undo.is_empty());
+    }
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Mouse(MouseEvent::ButtonReleased {
+            button: MouseButton::Left,
+            x,
+            y,
+            click_count: 1
+        })
+    ));
+    assert!(!s.master_dragging.get());
+    let final_gain = s.master.get();
+    s.finish_mix();
+    assert_eq!(s.model.borrow().undo.len(), 1);
+    s.undo(false);
+    assert_eq!(s.master.get(), 0.8);
+    s.undo(true);
+    assert_eq!(s.master.get(), final_gain);
+}
+
+#[test]
+fn tempo_entry_is_undoable_and_display_switch_keeps_sample_positions() {
+    let s = Daw::new(project());
+    let original = s.model.borrow().project.clone();
+    assert_eq!(s.time_format.get(), timeline::Format::Bars);
+    s.seek(2.);
+    assert_eq!(s.clock.get(), "002.01.000");
+    for invalid in ["abc", "NaN", "inf", "0", "500"] {
+        s.tempo_input.set(invalid.into());
+        s.submit_tempo();
+        assert_eq!(s.model.borrow().project.tempo, 120.);
+        assert!(s.model.borrow().undo.is_empty());
+    }
+    s.tempo_input.set("60".into());
+    s.submit_tempo();
+    assert_eq!(s.clock.get(), "001.03.000");
+    assert_eq!(
+        s.model.borrow().project.tracks[0].clips[0].start,
+        original.tracks[0].clips[0].start
+    );
+    assert!(Arc::ptr_eq(
+        &s.model.borrow().project.tracks[0].clips[0].samples,
+        &original.tracks[0].clips[0].samples
+    ));
+    s.cycle_time_format();
+    assert_eq!(s.clock.get(), "00:02.000");
+    s.cycle_time_format();
+    assert_eq!(s.clock.get(), "16000");
+    assert_eq!(s.playhead.get(), 2.);
+    assert_eq!(s.cursor.get(), "2.000");
+    s.cycle_time_format();
+    s.undo(false);
+    assert_eq!(s.tempo_input.get(), "120");
+    assert_eq!(s.clock.get(), "002.01.000");
+    s.undo(true);
+    assert_eq!(s.tempo_input.get(), "60");
+}
+
+#[test]
+fn hiding_mixer_fills_arrangement_and_restores_split_after_resize() {
+    wait_for_test_font();
+    for inspector in [true, false] {
+        for empty in [true, false] {
+            let s = Daw::new(if empty { Project::default() } else { project() });
+            s.inspector.set(inspector);
+            s.view_start.set(0.25);
+            let mut pipeline = scarlet_ui::RenderingPipeline::new();
+            pipeline.set_root(
+                Window::new("Mixer visibility", s.clone())
+                    .size(Size::new(1280., 822.))
+                    .create_element(),
+            );
+            pipeline.layout_initial();
+            for _ in 0..8 {
+                let _ = pipeline.render();
+            }
+            let split = s.mixer_fraction.get();
+            let before = s.arrangement_size.get().height;
+            s.mixer_visible.set(false);
+            for _ in 0..8 {
+                let _ = pipeline.render();
+            }
+            let full = s.size.get().height - 174.;
+            assert!(
+                (s.arrangement_size.get().height - full).abs() <= 1.,
+                "hidden mixer left unused space: inspector={inspector}, empty={empty}, arrangement={:?}, expected height={full}",
+                s.arrangement_size.get()
+            );
+            assert!(s.arrangement_size.get().height > before + 280.);
+            assert_eq!(s.mixer_fraction.get(), split);
+
+            s.sync_content_size(Size::new(1280., 1032.));
+            pipeline.resize(Size::new(1280., 1032.));
+            for _ in 0..8 {
+                let _ = pipeline.render();
+            }
+            assert!((s.arrangement_size.get().height - 826.).abs() <= 1.);
+            assert_eq!(s.mixer_fraction.get(), split);
+            s.mixer_visible.set(true);
+            for _ in 0..8 {
+                let _ = pipeline.render();
+            }
+            assert!((s.mixer_fraction.get() - split).abs() < 0.002);
+            assert!((s.arrangement_size.get().height - 822. * split).abs() <= 1.);
+            assert_eq!(s.view_start.get(), 0.25);
+            pipeline.teardown();
+        }
+    }
 }
 
 #[test]

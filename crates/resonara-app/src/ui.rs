@@ -142,6 +142,25 @@ struct ShortcutBoundaryElement {
     suppress: bool,
     horizontal: Option<std::rc::Rc<dyn Fn(i32)>>,
 }
+fn command_in_text_field(
+    element: &mut dyn scarlet_ui::Element,
+    event: &scarlet_ui::event::Event,
+) -> bool {
+    // The pinned framework's text editor uses Control as its primary modifier.
+    // Translate Command only at the focused editor, leaving DAW shortcuts and
+    // platform-global modifier semantics unchanged.
+    if element.text_input_state().is_some()
+        && element
+            .render_object()
+            .is_some_and(|r| r.as_any().is::<scarlet_ui::views::TextFieldRenderObject>())
+    {
+        return element.handle_event(event, scarlet_ui::event::Phase::Target);
+    }
+    element
+        .children_mut()
+        .iter_mut()
+        .any(|child| command_in_text_field(child.as_mut(), event))
+}
 impl scarlet_ui::Element for ShortcutBoundaryElement {
     fn id(&self) -> scarlet_ui::ElementId {
         self.inner.id()
@@ -245,8 +264,21 @@ impl scarlet_ui::Element for ShortcutBoundaryElement {
                 return false;
             }
             match e {
-                Event::Keyboard(KeyEvent::Pressed { modifiers, .. }) => {
+                Event::Keyboard(KeyEvent::Pressed { keycode, modifiers }) => {
                     self.suppress = (modifiers.control && !modifiers.alt) || modifiers.super_key;
+                    if modifiers.super_key && !modifiers.alt {
+                        let mut translated = *modifiers;
+                        translated.control = true;
+                        if command_in_text_field(
+                            self.inner.as_mut(),
+                            &Event::Keyboard(KeyEvent::Pressed {
+                                keycode: *keycode,
+                                modifiers: translated,
+                            }),
+                        ) {
+                            return true;
+                        }
+                    }
                 }
                 Event::Keyboard(KeyEvent::Char { .. }) if self.suppress => {
                     self.suppress = false;

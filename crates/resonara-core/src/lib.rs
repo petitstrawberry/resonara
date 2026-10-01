@@ -36,6 +36,11 @@ pub struct Project {
     pub sample_rate: u32,
     pub tracks: Vec<Track>,
     pub master: f32,
+    #[serde(default = "default_tempo")]
+    pub tempo: f64,
+}
+fn default_tempo() -> f64 {
+    120.
 }
 impl Default for Project {
     fn default() -> Self {
@@ -44,6 +49,7 @@ impl Default for Project {
             sample_rate: 48000,
             tracks: vec![],
             master: 0.8,
+            tempo: default_tempo(),
         }
     }
 }
@@ -53,6 +59,8 @@ impl Project {
             || !(8000..=192000).contains(&self.sample_rate)
             || !self.master.is_finite()
             || !(0.0..=2.0).contains(&self.master)
+            || !self.tempo.is_finite()
+            || !(20.0..=400.0).contains(&self.tempo)
         {
             return Err("Invalid project header".into());
         }

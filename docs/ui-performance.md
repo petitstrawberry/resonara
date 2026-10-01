@@ -103,3 +103,25 @@ the licensed WAV described in [audio-fixture.md](audio-fixture.md). The app impo
 it once, clones eight shared-source tracks and initializes each to −18 dB. This
 optional setup is used only when profiling is enabled; it does not replace the
 normal project-opening path.
+
+## Mac handoff observations
+
+The Mac's existing Nix development shell built both profiles successfully.
+Native diagnostics selected Apple M3 Pro / Metal. The user confirmed audible
+CoreAudio output and described scrolling as heavy, with some improvement after
+switching from debug to release. This is qualitative feedback; it does not
+isolate ScrollView, layout, paint, encoder or presentation cost.
+
+The mounted playback/resize regressions pass on Mac, as do the new full-height
+mixer-hidden layout and Master pointer-state regressions. The final release's
+initial native screen displays the bars/beats counter and adjacent BPM field
+with the complete arrangement and mixer. No F9 report was generated and agent
+GUI input was deferred while the user operated the session. The 30/20 Hz targets
+and final native resize/scroll/stop-restart acceptance remain unmeasured.
+
+One intermediate launch logged `Error: "UI: RenderError"`, without the backend's
+detailed SGFX render/present error output. The next final-release startup was
+observed without that error, but no reproduction or fix is established. Keep
+`artifacts/mac-latest-native.log`, `artifacts/mac-final-native.log` and
+`artifacts/mac-final-verify.log` separate from cloud timing comparisons. Framework
+pins and dependency implementation files were left unchanged.

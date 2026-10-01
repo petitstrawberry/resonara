@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# The ALSA file sink is Linux-only. On macOS --smoke opens the real default
+# CoreAudio device; do not turn a routine verify run into audible playback.
+if [ "$(uname -s)" != Linux ]; then
+  printf 'SKIP: ALSA file-output smoke requires Linux. Validate CoreAudio separately on macOS.\n'
+  exit 0
+fi
 mkdir -p artifacts
 cat > artifacts/alsa-test.conf <<CONFIG
 pcm.!default {

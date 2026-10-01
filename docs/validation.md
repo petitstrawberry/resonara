@@ -2,9 +2,79 @@
 
 Date: 2026-10-01. Base commit:
 `15b0ced5d49714790c879319034584ceb60d55f7`.
-This records the cloud validation before the user-requested commit/push and
-Mac handoff. Publication uses a dedicated branch; no pull request or merge is
-part of this work.
+This records the cloud validation and subsequent user-requested Mac handoff.
+Publication uses a dedicated branch; no pull request or merge is part of this
+work. The cloud sections below retain their original environment and counts.
+
+## Mac handoff and transport corrections
+
+The independent Mac clone checked both remote and checkout commit
+`686e4d3fca7883fe2eb65dd81bb2503d6ae17a47`, tree
+`38903593101d016fbede1546f1d64f42816d5e11`, on branch
+`feat/native-daw-workbench-2026-10-01`. Existing user checkouts and sessions were
+preserved. No ScarletUI/SGFX source, revision or lockfile was changed.
+
+- Apple M3 Pro, arm64, macOS 26.6.2; the existing Nix installation successfully
+  entered the pinned development shell. Debug and release builds passed.
+- `scripts/verify` passed 114 tests: 64 app and 50 core integration, zero failed;
+  one optional stress test remained excluded. Formatting, dependency identity
+  and shell syntax checks passed. Log: `artifacts/mac-final-verify.log`.
+- Native renderer diagnostics selected **Apple M3 Pro / Metal**, rather than
+  software Vulkan. Logs: `artifacts/mac-release-native.log` and
+  `artifacts/mac-latest-native.log`. The final release was separately relaunched
+  and its complete arrangement/mixer and adjacent musical counter/BPM controls
+  were observed in the real application. Log: `artifacts/mac-final-native.log`.
+- The user operated playback and confirmed audible output. The reported default
+  output was MacBook Pro speakers, 48 kHz stereo. No OS volume/device setting was
+  changed and no input recording was started. This is audible-output acceptance,
+  not a latency, dropout or sound-quality measurement.
+- Linux-only ALSA and Xvfb scripts now have platform guards. Mac `verify` reports
+  the ALSA file-output check as **SKIP**; it does not silently turn that test into
+  real-speaker playback or count it as a CoreAudio pass.
+
+User feedback produced these application changes:
+
+- Hiding the mixer gives the arrangement the full available workspace height.
+  Mounted layout tests cover hidden/shown transitions, resize, both inspector
+  states, empty and populated projects, and restoration of the split ratio.
+- Master gain now publishes its control state during pointer movement. A real
+  ElementTree event-dispatch regression verifies successive thumb-state changes
+  and one grouped drag history entry, including undo/redo.
+- Counter, ruler and waveform grid default to bars/beats/ticks at fixed 4/4,
+  960 ticks per quarter note. Adjacent BPM entry accepts 20–400 including
+  fractional values. Time and sample-position displays remain selectable.
+  Persistence defaults legacy projects to 120 BPM; validation rejects invalid
+  tempos. Tests cover beat/bar carry, grid density, input, history, save/load and
+  byte-identical WAV export across a tempo change. Tempo edits stop playback;
+  they change display conversion, not sample positions or audio stretching.
+- The pinned ScarletUI `KeyModifiers::primary()` only checks Control. The app
+  translates Command for the focused TextField through its existing input
+  boundary. An event-dispatch test covers Command+A, fractional BPM entry and
+  Enter without triggering global DAW shortcuts. This is an application
+  workaround, not a framework fix. Framework pins remain intact.
+
+The final transport grouping was informed by the official
+[Logic Pro LCD guide](https://support.apple.com/en-euro/guide/logicpro/lgcp127f51bc/mac)
+and [Cubase transport sections](https://www.steinberg.help/r/cubase-pro/15.0/en/cubase_nuendo/topics/playback/playback_transport_panel_sections_r.html?contentId=abquVlhKSd8RxOz1CvpAGw).
+Region drag, edge trim, Split tool and S behavior were not redesigned. Snap and
+the precise locator/inspector fields still explicitly use seconds/milliseconds.
+There is no editable meter, tempo map or beat-based audio stretching.
+
+### Mac limitations still open
+
+The user reported heavy scrolling, with some improvement in release. No F9
+report was generated, so no native submission rate or ScrollView cost is claimed.
+The user was actively operating the windows; control ownership remained
+unconfirmed and further agent GUI input was deferred. The new behavior has
+automated coverage and final native startup/display acceptance, but its full
+native hide/drag/resize/save/stop-restart interaction pass remains incomplete.
+
+An intermediate launch ended with `Error: "UI: RenderError"` after an IMK mach
+port diagnostic (`artifacts/mac-latest-native.log`). There was no detailed SGFX
+encode/present failure message. The generic error is insufficient to identify
+an encoder, damage-region, scale-factor or surface failure. The subsequent final
+release launch displayed normally without this error during the observed idle
+startup interval; this does **not** establish that the failure is fixed.
 
 ## Build and dependencies
 
@@ -158,9 +228,10 @@ license, hashes, exact workload, timings and pre-/post-fix restart evidence.
 
 ## Limits and remaining scope
 
-No physical audio-device latency or dropout measurements, macOS execution, GPU
-hardware measurements, GPU FPS measurements, or production-scale stability claim
-is made. The UI-model benchmark measures CPU work, not presentation timing.
+No physical audio-device latency or dropout measurements, GPU timing/FPS
+measurements, or production-scale stability claim is made. Mac startup and user
+audible-output acceptance are recorded above. The UI-model benchmark measures
+CPU work, not presentation timing.
 
 The pinned renderer retains at most 32 canvas/size combinations per window; the
 bounded resize pass did not reproduce exhaustion. Larger projects, repeated

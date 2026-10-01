@@ -5,6 +5,7 @@ mod meter;
 mod profiling;
 #[cfg(test)]
 mod tests;
+mod timeline;
 mod ui;
 mod wave;
 
@@ -121,6 +122,8 @@ struct Daw {
     arrangement_size: State<Size>,
     status: State<String>,
     clock: State<String>,
+    time_format: State<timeline::Format>,
+    tempo_input: State<String>,
     cursor: State<String>,
     range_end: State<String>,
     track_name: State<String>,
@@ -184,6 +187,8 @@ impl Daw {
                 "Ready · select a region, drag to move, or drag an edge to trim".into(),
             ),
             clock: state(5, "00:00.000".into()),
+            time_format: state(30, timeline::Format::Bars),
+            tempo_input: state(31, String::new()),
             cursor: state(6, "0.000".into()),
             range_end: state(7, "1.000".into()),
             track_name: state(8, String::new()),
@@ -266,8 +271,40 @@ impl Daw {
         }
         Ok((v * self.model.borrow().project.sample_rate as f64).round() as u64)
     }
+    fn submit_tempo(&self) {
+        let parsed = self
+            .tempo_input
+            .get()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && (20.0..=400.0).contains(v));
+        let Some(tempo) = parsed else {
+            self.status.set("Enter a BPM between 20 and 400".into());
+            self.tempo_input
+                .set(format!("{}", self.model.borrow().project.tempo));
+            return;
+        };
+        if self.model.borrow().project.tempo != tempo {
+            self.edit("Set tempo", |m| {
+                m.project.tempo = tempo;
+                Ok(())
+            });
+        } else {
+            self.tempo_input.set(format!("{tempo}"));
+        }
+    }
+    fn cycle_time_format(&self) {
+        self.time_format.set(self.time_format.get().next());
+        self.refresh(true);
+    }
     fn refresh(&self, waveforms: bool) {
         let mut m = self.model.borrow_mut();
+        self.tempo_input.set(format!("{}", m.project.tempo));
+        self.clock.set(self.time_format.get().position(
+            self.playhead.get(),
+            m.project.tempo,
+            m.project.sample_rate,
+        ));
         m.selected = m.selected.min(m.project.tracks.len().saturating_sub(1));
         if let Some(t) = m.project.tracks.get(m.selected) {
             self.track_name.set(t.name.clone());
@@ -328,6 +365,9 @@ impl Daw {
                     ROW,
                     start,
                     span,
+                    self.time_format
+                        .get()
+                        .step(span, project.tempo, project.sample_rate),
                     project.sample_rate,
                     peaks,
                     channels[i].mesh.handle(),
@@ -343,7 +383,11 @@ impl Daw {
         if self.playhead.get() != position {
             self.playhead.set(position);
         }
-        let clock = ui::time(position);
+        let m = self.model.borrow();
+        let clock =
+            self.time_format
+                .get()
+                .position(position, m.project.tempo, m.project.sample_rate);
         if self.clock.get() != clock {
             self.clock.set(clock);
         }
@@ -509,6 +553,7 @@ impl Daw {
             a.controls.master.store(value.to_bits(), Ordering::Relaxed);
         }
         drop(m);
+        self.master.set(value);
         self.changed();
     }
     fn play(&self) {
@@ -545,7 +590,11 @@ impl Daw {
                 a.controls.position.load(Ordering::Relaxed) as f64 / m.project.sample_rate as f64;
             self.playhead.set(pos);
             self.cursor.set(format!("{pos:.3}"));
-            self.clock.set(ui::time(pos));
+            self.clock.set(self.time_format.get().position(
+                pos,
+                m.project.tempo,
+                m.project.sample_rate,
+            ));
         }
         if message {
             self.status.set("Stopped".into());
@@ -609,7 +658,7 @@ impl Daw {
         let seconds = seconds.max(0.);
         self.playhead.set(seconds);
         self.cursor.set(format!("{seconds:.3}"));
-        self.clock.set(ui::time(seconds));
+        self.animate_playhead(seconds);
         self.update_frames();
         if was_playing {
             self.play();
@@ -1331,16 +1380,19 @@ impl Daw {
         let width = (self.arrangement_size.get().width - HEADER).max(200.);
         let start = self.view_start.get();
         let span = self.view_span.get();
-        let step = wave::tick_step(span);
+        let m = self.model.borrow();
+        let format = self.time_format.get();
+        let step = format.step(span, m.project.tempo, m.project.sample_rate);
         let first = (start / step).floor() as i64;
         let mut labels: Vec<Box<dyn View>> = vec![];
         for i in first..=first + 12 {
             let seconds = i as f64 * step;
             let x = ((seconds - start) / span) as f32 * width;
-            if x >= 0. && x < width - 30. {
+            if x >= 0. && x < width - 85. {
                 labels.push(Box::new(
-                    caption(format!("{seconds:.2}s"))
-                        .frame(62., 26.)
+                    caption(format.tick(seconds, m.project.tempo, m.project.sample_rate))
+                        .font_size(10.)
+                        .frame(90., 26.)
                         .padding_insets(EdgeInsets::new(x + 5., 0., 0., 0.)),
                 ));
             }
@@ -1522,23 +1574,22 @@ impl Daw {
     fn transport(&self) -> AnyView {
         let m = self.model.borrow();
         let playing = m.audio.is_some();
-        let undo = m
-            .undo
-            .last()
-            .map(|h| h.label.as_str())
-            .unwrap_or("No edits");
         let duration = m.project.duration() as f64 / m.project.sample_rate as f64;
         let seek = self.clone();
+        let tempo = self.clone();
+        let format = self.time_format.get();
         AnyView::new(row!{
-            self.icon(Icon::ArrowBackUp,"Undo · Ctrl/Cmd+Z",false,|s|s.undo(false)),self.icon(Icon::ArrowForwardUp,"Redo · Ctrl/Cmd+Shift+Z",false,|s|s.undo(true)),
-            Rectangle::new().fill(LINE).frame(1.,30.),self.icon(Icon::ChevronLeft,"Return to start · Home",false,|s|s.seek(0.)),self.icon(if playing{Icon::PlayerPause}else{Icon::PlayerPlay},"Play / stop · Space",playing,|s|s.play()),self.button("Stop","Stop playback",|s|s.stop_audio(true)),
-            vstack!{caption("PLAYHEAD"),animation::Readout::new(self.clock.clone(),27.,ACCENT,Size::new(184.,32.))}.spacing(1.).frame(184.,48.).background(BG).border(LINE,1.),
+            self.icon(Icon::ChevronLeft,"Return to start · Home",false,|s|s.seek(0.)),self.icon(if playing{Icon::PlayerPause}else{Icon::PlayerPlay},"Play / stop · Space",playing,|s|s.play()),self.button("Stop","Stop playback",|s|s.stop_audio(true)),
+            vstack!{caption(format.caption()),animation::Readout::new(self.clock.clone(),25.,ACCENT,Size::new(172.,32.))}.spacing(1.).frame(172.,48.).background(BG).border(LINE,1.),
+            vstack!{caption("BPM · 4/4"),ui::field(self.tempo_input.clone()).on_submit(move||tempo.submit_tempo()).blur_on_submit(true).frame(68.,26.).input_guard()}.spacing(2.),
+            self.button(format.name(),"Switch musical, elapsed-time and sample-position displays",|s|s.cycle_time_format()).frame_width(92.),
             vstack!{caption("GO TO · SECONDS"),ui::field(self.cursor.clone()).on_submit(move||{if let Ok(at)=seek.seconds(&seek.cursor.get()){let rate=seek.model.borrow().project.sample_rate;seek.seek(at as f64/rate as f64);}}).blur_on_submit(true).frame(88.,26.).input_guard()}.spacing(2.),
-            vstack!{caption("PROJECT LENGTH"),label(ui::time(duration)).font_size(16.)}.spacing(5.),Spacer::new(),caption(format!("Undo: {undo}")),caption(format!("{} Hz  /  STEREO",m.project.sample_rate))
+            vstack!{caption("PROJECT LENGTH"),label(format.duration(duration,m.project.tempo,m.project.sample_rate)).font_size(16.)}.spacing(5.),Spacer::new(),caption(format!("{} Hz  /  STEREO",m.project.sample_rate))
         }.spacing(10.).padding_insets(EdgeInsets::new(14.,7.,14.,7.)).frame_height(66.).background(RAISED))
     }
     fn editbar(&self) -> AnyView {
         AnyView::new(row!{
+            self.icon(Icon::ArrowBackUp,"Undo · Ctrl/Cmd+Z",false,|s|s.undo(false)),self.icon(Icon::ArrowForwardUp,"Redo · Ctrl/Cmd+Shift+Z",false,|s|s.undo(true)),Rectangle::new().fill(LINE).frame(1.,20.),
             self.button(if self.tool.get()==0{"• Pointer  1"}else{"Pointer  1"},"Pointer: select, move, trim edges · 1",|s|s.tool.set(0)),self.button(if self.tool.get()==1{"• Split  2"}else{"Split  2"},"Scissors: click a region to split · 2",|s|s.tool.set(1)),
             self.button(if self.snap.get(){"Snap: 100 ms"}else{"Snap: off"},"Toggle absolute 100 ms grid snapping",|s|s.snap.set(!s.snap.get())),Spacer::new(),
             self.icon(Icon::ZoomOut,"Zoom out · −",false,|s|s.zoom(2.)),self.icon(Icon::ZoomIn,"Zoom in · +",false,|s|s.zoom(0.5)),self.button("Fit","Fit project to timeline · F",|s|s.fit()),Rectangle::new().fill(LINE).frame(1.,20.),
@@ -1574,9 +1625,10 @@ impl Daw {
                     .frame(size.width, height),
             )
         } else {
-            arrangement
+            AnyView::new(arrangement.frame(size.width, height))
         };
-        // The outer split owns the workspace height; child geometry supplies waveform width.
+        // Both split and mixer-hidden modes own the workspace height; child
+        // geometry supplies the waveform viewport after either transition.
         AnyView::new(vstack!{self.toolbar(),self.transport(),self.editbar(),content,Text::from_state(self.status.clone()).font_size(11.).color(MUTED).padding_insets(EdgeInsets::new(12.,5.,12.,5.)).frame(size.width,28.).alignment(Alignment::TopLeading).background(PANEL)}.spacing(0.).frame(size.width,size.height).background(BG))
     }
     fn dialog_view(&self) -> AnyView {
@@ -1780,6 +1832,7 @@ impl View for Daw {
             &self.view_start,
             &self.view_span,
             &self.dialog_error,
+            &self.time_format,
         ]
     }
     fn as_any(&self) -> &dyn std::any::Any {

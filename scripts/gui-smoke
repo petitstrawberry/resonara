@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "$(uname -s)" != Linux ]; then
+  printf 'GUI smoke requires Linux/X11. Validate the native macOS window directly.\n' >&2
+  exit 1
+fi
 mkdir -p artifacts
 run_dir=$(mktemp -d "$PWD/artifacts/gui-smoke.XXXXXX")
 cat > "$run_dir/alsa-test.conf" <<CONFIG

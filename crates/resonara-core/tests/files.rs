@@ -25,6 +25,31 @@ impl Drop for Temp {
     }
 }
 #[test]
+fn tempo_defaults_for_legacy_projects_and_preserves_audio_when_saved() {
+    let d = Temp::new();
+    let mut p = Project::demo();
+    let mut legacy = serde_json::to_value(&p).unwrap();
+    legacy.as_object_mut().unwrap().remove("tempo");
+    let legacy: Project = serde_json::from_value(legacy).unwrap();
+    legacy.validate().unwrap();
+    assert_eq!(legacy.tempo, 120.);
+    p.export_wav(&d.0.join("before.wav")).unwrap();
+    p.tempo = 96.5;
+    p.save(&d.0.join("tempo.json")).unwrap();
+    let saved = Project::load(&d.0.join("tempo.json")).unwrap();
+    assert_eq!(saved.tempo, 96.5);
+    saved.export_wav(&d.0.join("after.wav")).unwrap();
+    assert_eq!(
+        std::fs::read(d.0.join("before.wav")).unwrap(),
+        std::fs::read(d.0.join("after.wav")).unwrap()
+    );
+    for tempo in [0., 19.9, 400.1, f64::INFINITY, f64::NAN] {
+        p.tempo = tempo;
+        assert!(p.validate().is_err());
+    }
+}
+
+#[test]
 fn save_load_and_export_preserve_edited_mix() {
     let d = Temp::new();
     let mut p = Project::demo();

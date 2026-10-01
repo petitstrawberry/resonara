@@ -238,6 +238,7 @@ pub fn base(
     height: f32,
     offset: f64,
     span: f64,
+    grid_step: f64,
     rate: u32,
     peaks: &mut Peaks,
     handle: SgfxMeshHandle,
@@ -247,7 +248,7 @@ pub fn base(
         handle,
         revision,
         vertices(
-            track, index, selected, width, height, offset, span, rate, peaks,
+            track, index, selected, width, height, offset, span, grid_step, rate, peaks,
         ),
     )
 }
@@ -259,13 +260,14 @@ pub(crate) fn vertices(
     height: f32,
     offset: f64,
     span: f64,
+    grid_step: f64,
     rate: u32,
     peaks: &mut Peaks,
 ) -> Vec<SgfxCanvasVertex> {
     let mut v = Vec::new();
     let h = height;
     let mut rect = |x, y, w, hh, c| rectangle(&mut v, x, y, w, hh, c, width, h);
-    let step = tick_step(span);
+    let step = grid_step;
     let first = (offset / step).floor() as i64;
     for i in first..=first + 12 {
         let x = ((i as f64 * step - offset) / span) as f32 * width;
