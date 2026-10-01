@@ -35,6 +35,12 @@ fn save_load_and_export_preserve_edited_mix() {
     let q = Project::load(&d.0.join("session.json")).unwrap();
     assert_eq!(q.tracks.len(), 3);
     assert_eq!(q.tracks[0].clips.len(), 2);
+    assert!(
+        q.tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .all(|clip| clip.source_channels == 1)
+    );
     q.export_wav(&d.0.join("mix.wav")).unwrap();
     let mut wav = hound::WavReader::open(d.0.join("mix.wav")).unwrap();
     assert_eq!(wav.spec().channels, 2);
@@ -71,6 +77,7 @@ fn imports_mono_pcm_and_resamples() {
         let mut p = Project::default();
         p.import_wav(&path).unwrap();
         let c = &p.tracks[0].clips[0];
+        assert_eq!(c.source_channels, 1);
         assert_eq!(c.frames, 8);
         assert_eq!(c.samples[0], [0.5, 0.5]);
     }
@@ -98,4 +105,98 @@ fn rejects_surround_and_nonfinite_wav_and_corrupt_project() {
     }
     std::fs::write(d.0.join("bad.json"), "{}").unwrap();
     assert!(Project::load(&d.0.join("bad.json")).is_err());
+}
+
+#[test]
+fn imported_channel_metadata_preserves_true_stereo_even_when_channels_match() {
+    let d = Temp::new();
+    for (name, samples) in [
+        ("unequal", vec![[0.25f32, -0.5], [0.5, 0.125]]),
+        ("dual-mono", vec![[0.25; 2], [0.5; 2]]),
+    ] {
+        let path = d.0.join(format!("{name}.wav"));
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: 48000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        for sample in samples.iter().flatten() {
+            writer.write_sample(*sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        let mut p = Project::default();
+        p.import_wav(&path).unwrap();
+        assert_eq!(p.tracks[0].clips[0].source_channels, 2);
+        assert_eq!(p.tracks[0].clips[0].samples.as_ref(), &samples);
+        p.split(0, 1).unwrap();
+        p.save(&d.0.join(format!("{name}.json"))).unwrap();
+        let loaded = Project::load(&d.0.join(format!("{name}.json"))).unwrap();
+        assert!(
+            loaded.tracks[0]
+                .clips
+                .iter()
+                .all(|clip| clip.source_channels == 2)
+        );
+    }
+}
+
+#[test]
+fn legacy_projects_default_to_stereo_without_guessing_from_equal_samples() {
+    let d = Temp::new();
+    let p = Project {
+        tracks: vec![Track {
+            name: "known mono".into(),
+            clips: vec![Clip {
+                source_channels: 1,
+                start: 0,
+                source_offset: 0,
+                frames: 3,
+                samples: Arc::new(vec![[0.25; 2], [-0.5; 2], [0.125; 2]]),
+            }],
+            gain: 1.0,
+            pan: 0.0,
+            mute: false,
+            solo: false,
+        }],
+        master: 1.0,
+        ..Project::default()
+    };
+    let mut legacy = serde_json::to_value(&p).unwrap();
+    legacy["tracks"][0]["clips"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("source_channels");
+    let path = d.0.join("legacy.json");
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let loaded = Project::load(&path).unwrap();
+    assert_eq!(loaded.tracks[0].clips[0].source_channels, 2);
+    assert_eq!(
+        loaded.tracks[0].clips[0].samples,
+        p.tracks[0].clips[0].samples
+    );
+    let mut old_audio = [0.0; 6];
+    let mut new_audio = [0.0; 6];
+    Engine::new(&p, Arc::new(Controls::new(&p)), 48000, 0).render(&mut old_audio, 2);
+    Engine::new(&loaded, Arc::new(Controls::new(&loaded)), 48000, 0).render(&mut new_audio, 2);
+    assert_eq!(old_audio, new_audio);
+}
+
+#[test]
+fn validation_rejects_invalid_channels_and_mono_metadata_that_hides_stereo_audio() {
+    let mut p = Project::demo();
+    for channels in [0, 3, u16::MAX] {
+        p.tracks[0].clips[0].source_channels = channels;
+        assert!(p.validate().is_err());
+    }
+    let clip = &mut p.tracks[0].clips[0];
+    clip.source_channels = 1;
+    Arc::make_mut(&mut clip.samples)[0] = [0.25, 0.5];
+    assert!(p.validate().is_err());
+    p.tracks[0].clips[0].source_channels = 2;
+    p.validate().unwrap();
 }

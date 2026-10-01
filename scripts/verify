@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 mkdir -p artifacts
-cargo-fmt fmt --all
+bash scripts/check-dependencies 2>&1 | tee artifacts/dependencies.log
+cargo-fmt fmt --all -- --check
 cargo test --locked --workspace 2>&1 | tee artifacts/tests.log
 cargo build --locked -p resonara 2>&1 | tee artifacts/build.log
 bash scripts/audio-smoke 2>&1 | tee artifacts/audio-smoke.log

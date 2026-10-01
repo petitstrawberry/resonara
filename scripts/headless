@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 mkdir -p artifacts
+# Fail clearly in restricted containers instead of making Xvfb probe thousands
+# of display numbers when the kernel denies every Unix-domain socket.
+python3 - <<'PY'
+import socket
+import sys
+try:
+    with socket.socket(socket.AF_UNIX):
+        pass
+except OSError as error:
+    print(f'Headless display unavailable: local display sockets are blocked ({error}).', file=sys.stderr)
+    print('Run GUI verification on an existing authorized desktop display instead.', file=sys.stderr)
+    sys.exit(1)
+PY
 info=$(mktemp)
 Xvfb -displayfd 3 -screen 0 1280x1000x24 -nolisten tcp 3> "$info" > artifacts/xvfb.log 2>&1 &
 xvfb_pid=$!

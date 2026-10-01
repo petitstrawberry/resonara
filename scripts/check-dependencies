@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+python3 - <<'PY'
+from pathlib import Path
+import tomllib
+
+root = Path.cwd()
+app = tomllib.loads((root / 'crates/resonara-app/Cargo.toml').read_text())
+dependency = app['dependencies']['scarlet-ui']
+revision = '91238ed12c3379c0aea7e7ba86e73139cfb1f550'
+repository = 'https://github.com/petitstrawberry/scarlet-ui'
+assert dependency.get('git') == repository, 'ScarletUI must use its Git source'
+assert dependency.get('rev') == revision, 'Review and update the ScarletUI pin explicitly'
+assert 'path' not in dependency, 'Committed ScarletUI dependency must not require a local checkout'
+
+packages = tomllib.loads((root / 'Cargo.lock').read_text())['package']
+ui = [p for p in packages if p['name'].startswith('scarlet-ui') or p['name'] == 'scarlet-scroll-motion']
+expected = f'git+{repository}?rev={revision}#{revision}'
+assert ui and all(p.get('source') == expected for p in ui), 'ScarletUI crates must share one pinned source'
+assert len(ui) == len({p['name'] for p in ui}), 'Duplicate ScarletUI crate identities'
+core = [p for p in packages if p['name'] == 'sgfx-core']
+assert len(core) == 1, 'SGFX core must resolve to one crate identity'
+assert core[0].get('source', '').startswith('git+https://github.com/petitstrawberry/sgfx?rev='), 'SGFX core must be Git-pinned'
+print(f'Dependency pins verified: {len(ui)} ScarletUI crates, one SGFX core identity')
+PY
