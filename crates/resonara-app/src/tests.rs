@@ -4504,3 +4504,184 @@ fn meter_field_enter_updates_counter_ruler_and_history_without_retiming_audio() 
     text_layouts(tree.root().unwrap(), Point::ZERO, &mut labels);
     assert!(labels.iter().any(|(text, _, _)| text.starts_with("002.")));
 }
+
+#[test]
+fn native_picker_cancel_preserves_dirty_session_and_clears_save_continuations() {
+    for action in [
+        FileAction::Open,
+        FileAction::Save,
+        FileAction::Import,
+        FileAction::Export,
+    ] {
+        let s = Daw::new(project());
+        s.mix(0, Some(0.6), None, None);
+        s.finish_mix();
+        let before = Daw::snapshot(&s.model.borrow());
+        let view = set_detail_view(&s);
+        s.open_after_save.set(true);
+        s.close_after_save.set(true);
+        s.dialog.set(Dialog::Native(action));
+        s.apply_picker_result(action, Ok(FileDialogOutcome::Cancelled));
+        assert_snapshot(&s.model.borrow(), &before);
+        assert_detail_view(&s, &view);
+        assert!(s.dirty());
+        assert!(s.dialog.get() == Dialog::None);
+        assert!(s.focus.get());
+        assert!(!s.open_after_save.get() && !s.close_after_save.get());
+        assert!(s.model.borrow().io.is_none());
+    }
+}
+
+#[test]
+fn native_picker_invalid_path_error_and_retry_preserve_association() {
+    let temp = Temp::new();
+    let s = Daw::new(project());
+    s.mix(0, Some(0.6), None, None);
+    s.finish_mix();
+    s.model.borrow_mut().current_path = Some(temp.0.join("old.json"));
+    let before = Daw::snapshot(&s.model.borrow());
+    for result in [
+        Ok(FileDialogOutcome::Selected(vec![])),
+        Ok(FileDialogOutcome::Selected(vec![
+            PathBuf::from("relative.json").into(),
+        ])),
+        Ok(FileDialogOutcome::Selected(vec![
+            temp.0.join("wrong.wav").into(),
+        ])),
+        Ok(FileDialogOutcome::Selected(vec![temp.0.clone().into()])),
+        Ok(FileDialogOutcome::Selected(vec![
+            temp.0.join("one.json").into(),
+            temp.0.join("two.json").into(),
+        ])),
+        Err(FileDialogError::Platform("IPC disconnected".into())),
+        Err(FileDialogError::OwnerClosed),
+        Err(FileDialogError::Busy),
+    ] {
+        s.close_after_save.set(true);
+        s.open_after_save.set(true);
+        s.apply_picker_result(FileAction::Save, result);
+        assert_snapshot(&s.model.borrow(), &before);
+        assert!(s.model.borrow().io.is_none());
+        assert!(!s.close_after_save.get() && !s.open_after_save.get());
+        assert!(!s.dialog_error.get().is_empty());
+    }
+    let saved = temp.0.join("retry.json");
+    s.apply_picker_result(
+        FileAction::Save,
+        Ok(FileDialogOutcome::Selected(vec![saved.clone().into()])),
+    );
+    finish_io(&s);
+    assert_project(&Project::load(&saved).unwrap(), &before.project);
+    assert_eq!(s.model.borrow().current_path.as_ref(), Some(&saved));
+    assert!(!s.dirty());
+}
+
+#[test]
+fn native_selection_routes_all_four_actions_through_transactional_io() {
+    let temp = Temp::new();
+    let json = temp.0.join("session.json");
+    let wav = temp.0.join("audio.wav");
+    let s = Daw::new(project());
+    let before = s.model.borrow().project.clone();
+    for (action, path) in [(FileAction::Save, &json), (FileAction::Export, &wav)] {
+        let view = set_detail_view(&s);
+        s.apply_picker_result(
+            action,
+            Ok(FileDialogOutcome::Selected(vec![path.clone().into()])),
+        );
+        finish_io(&s);
+        assert!(path.is_file());
+        assert_detail_view(&s, &view);
+    }
+    s.apply_picker_result(
+        FileAction::Import,
+        Ok(FileDialogOutcome::Selected(vec![wav.into()])),
+    );
+    finish_io(&s);
+    assert_eq!(
+        s.model.borrow().project.tracks.len(),
+        before.tracks.len() + 1
+    );
+    s.apply_picker_result(
+        FileAction::Open,
+        Ok(FileDialogOutcome::Selected(vec![json.into()])),
+    );
+    finish_io(&s);
+    assert_project(&s.model.borrow().project, &before);
+    assert!(!s.dirty());
+}
+
+#[test]
+fn native_selected_io_failure_keeps_dirty_session_and_allows_retry() {
+    let temp = Temp::new();
+    let s = Daw::new(project());
+    s.mix(0, Some(0.6), None, None);
+    s.finish_mix();
+    let before = Daw::snapshot(&s.model.borrow());
+    s.close_after_save.set(true);
+    let bad = temp.0.join("missing/session.json");
+    s.apply_picker_result(
+        FileAction::Save,
+        Ok(FileDialogOutcome::Selected(vec![bad.into()])),
+    );
+    finish_io(&s);
+    assert_snapshot(&s.model.borrow(), &before);
+    assert!(s.dirty());
+    assert!(!s.close_after_save.get());
+    s.apply_picker_result(
+        FileAction::Save,
+        Ok(FileDialogOutcome::Selected(vec![
+            temp.0.join("retry.json").into(),
+        ])),
+    );
+    finish_io(&s);
+    assert!(!s.dirty());
+}
+
+#[test]
+fn unsupported_native_picker_keeps_existing_browser_and_save_continuation() {
+    let temp = Temp::new();
+    let s = Daw::new(project());
+    s.path.set(temp.0.to_string_lossy().into());
+    s.filename.set("session.json".into());
+    s.close_after_save.set(true);
+    s.apply_picker_result(
+        FileAction::Save,
+        Err(FileDialogError::Unsupported(
+            "backend filter capability".into(),
+        )),
+    );
+    assert!(s.dialog.get() == Dialog::File(FileAction::Save));
+    assert!(s.close_after_save.get());
+    assert!(s.model.borrow().io.is_none());
+}
+
+#[test]
+fn pending_native_picker_blocks_edits_io_and_close_without_replacing_receipt() {
+    let mut s = Daw::new(project());
+    s.window_id.set(Some(WindowId::generate()));
+    s.open_dialog(FileAction::Save);
+    let before = Daw::snapshot(&s.model.borrow());
+    let called = Cell::new(false);
+    s.edit("Blocked", |m| {
+        called.set(true);
+        m.project.tracks.clear();
+        Ok(())
+    });
+    s.undo(false);
+    s.mix(0, Some(0.2), None, None);
+    s.master_change(0.1);
+    s.open_dialog(FileAction::Import);
+    s.start_io(
+        FileAction::Export,
+        PathBuf::from("/tmp/should-not-exist.wav"),
+    );
+    s.request_open();
+    assert!(!s.on_window_close_requested(&window()));
+    assert!(!called.get());
+    assert_snapshot(&s.model.borrow(), &before);
+    assert!(s.model.borrow().io.is_none());
+    assert!(s.dialog.get() == Dialog::Native(FileAction::Save));
+    s.cancel_picker();
+    assert!(s.model.borrow().picker.is_some());
+}

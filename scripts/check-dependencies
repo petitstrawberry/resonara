@@ -8,11 +8,14 @@ import tomllib
 root = Path.cwd()
 app = tomllib.loads((root / 'crates/resonara-app/Cargo.toml').read_text())
 dependency = app['dependencies']['scarlet-ui']
-revision = '91238ed12c3379c0aea7e7ba86e73139cfb1f550'
+revision = 'cdd852eb22678b7b0d1c7e035c1f2b2ba4d057a7'
 repository = 'https://github.com/petitstrawberry/scarlet-ui'
 assert dependency.get('git') == repository, 'ScarletUI must use its Git source'
 assert dependency.get('rev') == revision, 'Review and update the ScarletUI pin explicitly'
 assert 'path' not in dependency, 'Committed ScarletUI dependency must not require a local checkout'
+
+vendor = tomllib.loads((root / 'vendor/scarlet-ui-renderer-sgfx/Cargo.toml').read_text())
+assert vendor['dependencies']['scarlet-ui-core'].get('rev') == revision, 'Vendored renderer must share the ScarletUI core pin'
 
 packages = tomllib.loads((root / 'Cargo.lock').read_text())['package']
 ui = [p for p in packages if p['name'].startswith('scarlet-ui') or p['name'] == 'scarlet-scroll-motion']
