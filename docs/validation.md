@@ -85,7 +85,8 @@ The final transport grouping was informed by the official
 [Logic Pro LCD guide](https://support.apple.com/en-euro/guide/logicpro/lgcp127f51bc/mac)
 and [Cubase transport sections](https://www.steinberg.help/r/cubase-pro/15.0/en/cubase_nuendo/topics/playback/playback_transport_panel_sections_r.html?contentId=abquVlhKSd8RxOz1CvpAGw).
 Region drag, edge trim, Split tool and S behavior were not redesigned. Snap and
-the precise locator/inspector fields still explicitly use seconds/milliseconds.
+the inspector fields still explicitly use seconds/milliseconds. The redundant
+GO TO seconds entry was removed from the transport; ruler click/drag seeks remain.
 There is one editable project meter; tempo/meter maps and beat-based audio
 stretching remain unimplemented.
 

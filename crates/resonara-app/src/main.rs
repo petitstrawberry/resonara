@@ -1644,7 +1644,6 @@ impl Daw {
         let m = self.model.borrow();
         let playing = m.audio.is_some();
         let duration = m.project.duration() as f64 / m.project.sample_rate as f64;
-        let seek = self.clone();
         let tempo = self.clone();
         let signature = self.clone();
         let format = self.time_format.get();
@@ -1660,7 +1659,6 @@ impl Daw {
                 ui::lcd_group("METER",ui::lcd_field(self.signature_input.clone()).on_submit(move||signature.submit_signature()).blur_on_submit(true).input_guard(),52.)
             }.spacing(CONTROL_GAP).padding_insets(EdgeInsets::new(CONTROL_GAP,4.,CONTROL_GAP,4.))).fill(BG).border_color(LINE).corner_radius(8.),
             ui::transport_group("DISPLAY",self.header_button(format.name(),"Switch musical, elapsed-time and sample-position displays",|s|s.cycle_time_format()),88.),
-            ui::transport_group("GO TO · SECONDS",ui::compact_field(self.cursor.clone()).on_submit(move||{if let Ok(at)=seek.seconds(&seek.cursor.get()){let rate=seek.model.borrow().project.sample_rate;seek.seek(at as f64/rate as f64);}}).blur_on_submit(true).input_guard(),88.),
             ui::transport_group("PROJECT LENGTH",label(format.duration(duration,m.project.tempo,m.project.sample_rate,m.project.time_signature)).font_size(14.),110.),
             Spacer::new(),ui::transport_group("OUTPUT",caption(format!("{} Hz / STEREO",m.project.sample_rate)).font_size(CONTROL_FONT),116.)
         }.spacing(CONTROL_GAP).padding_insets(EdgeInsets::new(14.,9.,14.,9.)).frame_height(66.).background(RAISED))
