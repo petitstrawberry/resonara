@@ -3,3 +3,4 @@
 *.resonara.json
 
 /*.log
+.direnv
