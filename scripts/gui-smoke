@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p artifacts
+export ALSA_CONFIG_PATH="$PWD/artifacts/alsa-test.conf"
+target/debug/resonara > artifacts/gui.log 2>&1 &
+app_pid=$!
+trap 'kill "$app_pid" 2>/dev/null || true' EXIT
+window=""
+for attempt in $(seq 1 100); do
+  if ! kill -0 "$app_pid" 2>/dev/null; then cat artifacts/gui.log >&2; exit 1; fi
+  window=$(xdotool search --onlyvisible --name '^Resonara$' 2>/dev/null | head -1 || true)
+  if [ -n "$window" ]; then break; fi
+  sleep 0.1
+done
+[ -n "$window" ]
+xdotool windowfocus --sync "$window"
+sleep 3
+import -window "$window" artifacts/resonara.png
+printf 'Native SGFX window rendered: %s\n' "$window"
+input() {
+  xdotool mousemove --window "$window" "$1" "$2" click 1
+  xdotool key End
+  xdotool key --repeat 120 --delay 2 BackSpace
+  xdotool type --clearmodifiers --delay 2 "$3"
+}
+click() {
+  xdotool mousemove --window "$window" "$1" "$2" click 1
+  sleep 0.3
+}
+input 300 550 "0.5"
+click 517 550
+click 425 589
+click 590 489
+input 400 135 "$PWD/artifacts/smoke.wav"
+click 790 135
+input 350 625 "$PWD/artifacts/gui-session.resonara.json"
+click 690 625
+for attempt in $(seq 1 100); do
+  if [ -f artifacts/gui-session.resonara.json ]; then break; fi
+  sleep 0.1
+done
+input 400 666 "$PWD/artifacts/gui-mix.wav"
+click 755 666
+for attempt in $(seq 1 100); do
+  if [ -f artifacts/gui-mix.wav ]; then break; fi
+  sleep 0.1
+done
+sleep 1
+click 375 97
+sleep 0.5
+click 428 97
+import -window "$window" artifacts/resonara-edited.png
+python3 - <<'PYTEST'
+import json, struct
+from pathlib import Path
+p=json.loads(Path('artifacts/gui-session.resonara.json').read_text())
+assert len(p['tracks'])==5, f"Expected import+duplicate: {len(p['tracks'])} tracks"
+assert len(p['tracks'][0]['clips'])==2, 'Split did not execute'
+assert p['tracks'][3]['mute'], 'Mute did not execute'
+assert p['tracks'][4]['name']=='smoke', 'WAV import did not execute'
+b=Path('artifacts/gui-mix.wav').read_bytes()
+assert b[:4]==b'RIFF' and len(b)>1000, 'No exported WAV'
+print('GUI actions verified: split, duplicate, mute, WAV import, project save, WAV export, play/stop')
+PYTEST
+if ! kill -0 "$app_pid" 2>/dev/null; then cat artifacts/gui.log >&2; exit 1; fi
+kill "$app_pid"
+wait "$app_pid" || true

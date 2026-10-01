@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p artifacts
+cat > artifacts/alsa-test.conf <<CONFIG
+pcm.!default {
+  type plug
+  slave.pcm {
+    type file
+    slave.pcm { type null }
+    file "$PWD/artifacts/playback.raw"
+    format "raw"
+  }
+}
+CONFIG
+export ALSA_CONFIG_PATH="$PWD/artifacts/alsa-test.conf"
+cargo run --locked -p resonara -- --smoke
+python3 - <<'PY'
+from pathlib import Path
+p=Path('artifacts/playback.raw')
+assert p.stat().st_size > 0, 'No output samples'
+assert any(p.read_bytes()), 'Playback output was silent'
+print(f'ALSA file output verified: {p.stat().st_size} bytes, nonzero samples')
+PY

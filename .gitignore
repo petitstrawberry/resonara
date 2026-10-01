@@ -1,0 +1,5 @@
+/target/
+/artifacts/
+*.resonara.json
+
+/*.log

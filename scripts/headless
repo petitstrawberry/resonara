@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p artifacts
+info=$(mktemp)
+Xvfb -displayfd 3 -screen 0 1280x1000x24 -nolisten tcp 3> "$info" > artifacts/xvfb.log 2>&1 &
+xvfb_pid=$!
+trap 'kill "$xvfb_pid" 2>/dev/null || true; rm -f "$info"' EXIT
+for attempt in $(seq 1 50); do
+  if [ -s "$info" ]; then break; fi
+  if ! kill -0 "$xvfb_pid" 2>/dev/null; then cat artifacts/xvfb.log >&2; exit 1; fi
+  sleep 0.1
+done
+[ -s "$info" ]
+export DISPLAY=":$(cat "$info")"
+export LIBGL_ALWAYS_SOFTWARE=1
+for attempt in $(seq 1 50); do
+  if xdotool getdisplaygeometry >/dev/null 2>&1; then "$@"; exit $?; fi
+  sleep 0.1
+done
+exit 1

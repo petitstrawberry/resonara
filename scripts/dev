@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+if [ -d /workspace/.cargo ]; then export CARGO_HOME="${CARGO_HOME:-/workspace/.cargo}"; fi
+export CARGO_TARGET_DIR="$PWD/target"
+if [ "$#" -eq 0 ]; then set -- bash; fi
+if command -v nix >/dev/null; then runner=nix; else runner=/workspace/cloud-setup/bin/nix; fi
+exec "$runner" develop --accept-flake-config --no-write-lock-file -c "$@"

@@ -1,0 +1,8 @@
+[package]
+name = "resonara"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+resonara-core = { path = "../resonara-core" }
+resonara-platform = { path = "../resonara-platform" }
+scarlet-ui = { path = "../../../scarlet-ui/crates/scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
