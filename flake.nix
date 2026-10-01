@@ -28,6 +28,10 @@
       GIT_SSL_CAINFO = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
       shellHook = ''
         export PATH="${rust}/bin:${pkgs.rustfmt}/bin:$PATH"
+        # Honor a host-provided certificate bundle (for example on managed networks).
+        # TLS verification stays enabled for Nix, Cargo, and Git.
+        export SSL_CERT_FILE="''${NIX_SSL_CERT_FILE:-$SSL_CERT_FILE}"
+        export GIT_SSL_CAINFO="$SSL_CERT_FILE"
         export TMPDIR=/tmp/resonara-dev
         mkdir -p "$TMPDIR"
         export XDG_RUNTIME_DIR=/tmp/resonara-runtime

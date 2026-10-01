@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-if [ -d /workspace/.cargo ]; then export CARGO_HOME="${CARGO_HOME:-/workspace/.cargo}"; fi
-export CARGO_TARGET_DIR="$PWD/target"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
 if [ "$#" -eq 0 ]; then set -- bash; fi
-if command -v nix >/dev/null; then runner=nix; else runner=/workspace/cloud-setup/bin/nix; fi
-exec "$runner" develop --accept-flake-config --no-write-lock-file -c "$@"
+runner="${RESONARA_NIX:-nix}"
+if ! command -v "$runner" >/dev/null; then
+  printf 'Nix was not found. Install Nix, or set RESONARA_NIX to a Nix executable/wrapper.\n' >&2
+  exit 127
+fi
+exec "$runner" --extra-experimental-features 'nix-command flakes' develop --accept-flake-config --no-write-lock-file -c "$@"

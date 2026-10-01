@@ -3,6 +3,7 @@ name = "resonara"
 version = "0.1.0"
 edition = "2024"
 [dependencies]
+log = "=0.4.34"
 resonara-core = { path = "../resonara-core" }
 resonara-platform = { path = "../resonara-platform" }
-scarlet-ui = { path = "../../../scarlet-ui/crates/scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "91238ed12c3379c0aea7e7ba86e73139cfb1f550", default-features = false, features = ["std", "platform-winit"] }
