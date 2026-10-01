@@ -111,7 +111,7 @@ impl Daw {
         });
     }
     pub(super) fn open_track_menu(&self, target: Option<usize>, anchor: Point) {
-        if self.model.borrow().io.is_some() || self.dialog.get() != Dialog::None {
+        if self.busy() || self.dialog.get() != Dialog::None {
             return;
         }
         if let Some(i) = target {
@@ -269,7 +269,7 @@ impl Daw {
                 x,
                 ..
             }) => {
-                if self.model.borrow().io.is_some() {
+                if self.busy() {
                     return false;
                 }
                 let resume = self.model.borrow().audio.is_some();

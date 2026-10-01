@@ -16,8 +16,12 @@ use resonara_core::{Clip, Project, Result};
 #[cfg(not(test))]
 use resonara_platform::Audio;
 use scarlet_ui::{
-    WindowContext,
+    WindowContext, WindowId,
     event::{Event, KeyCode, KeyEvent, MouseButton, MouseEvent},
+    file_dialog::{
+        FileDialog, FileDialogError, FileDialogFilter, FileDialogHandle, FileDialogMode,
+        FileDialogOutcome, FileDialogResult,
+    },
     prelude::*,
     vstack,
 };
@@ -57,6 +61,7 @@ enum FileAction {
 enum Dialog {
     None,
     File(FileAction),
+    Native(FileAction),
     ConfirmOpen,
     ConfirmClose,
     Help,
@@ -118,6 +123,7 @@ struct Model {
     peaks: wave::Peaks,
     channels: Vec<Channel>,
     io: Option<mpsc::Receiver<IoResult>>,
+    picker: Option<(FileAction, FileDialogHandle)>,
     current_path: Option<PathBuf>,
 }
 #[derive(Clone)]
@@ -159,6 +165,7 @@ struct Daw {
     view_start: State<f64>,
     view_span: State<f64>,
     focus: State<bool>,
+    window_id: Rc<Cell<Option<WindowId>>>,
     close_after_save: Rc<Cell<bool>>,
     open_after_save: Rc<Cell<bool>>,
     last_meter: Rc<Cell<Instant>>,
@@ -189,6 +196,7 @@ impl Daw {
                 peaks: wave::Peaks::default(),
                 channels: vec![],
                 io: None,
+                picker: None,
                 current_path: None,
             })),
             revision: state(1, 0),
@@ -230,6 +238,7 @@ impl Daw {
             view_start: state(21, 0.),
             view_span: state(22, span),
             focus: state(23, false),
+            window_id: Rc::new(Cell::new(None)),
             close_after_save: Rc::new(Cell::new(false)),
             open_after_save: Rc::new(Cell::new(false)),
             last_meter: Rc::new(Cell::new(Instant::now())),
@@ -495,7 +504,7 @@ impl Daw {
     }
     fn edit(&self, label: &str, f: impl FnOnce(&mut Model) -> Result<()>) {
         self.track_menu.set(None);
-        if self.model.borrow().io.is_some() {
+        if self.busy() {
             return;
         }
         self.finish_mix();
@@ -516,7 +525,7 @@ impl Daw {
         self.refresh(true);
     }
     fn undo(&self, redo: bool) {
-        if self.model.borrow().io.is_some() {
+        if self.busy() {
             return;
         }
         self.finish_mix();
@@ -570,7 +579,7 @@ impl Daw {
     }
     fn mix(&self, index: usize, gain: Option<f32>, pan: Option<f32>, toggle: Option<bool>) {
         let mut m = self.model.borrow_mut();
-        if m.io.is_some() || index >= m.project.tracks.len() {
+        if (m.io.is_some() || m.picker.is_some()) || index >= m.project.tracks.len() {
             return;
         }
         if m.mixer_before.is_none() {
@@ -603,7 +612,7 @@ impl Daw {
     }
     fn master_change(&self, value: f32) {
         let mut m = self.model.borrow_mut();
-        if m.io.is_some() {
+        if m.io.is_some() || m.picker.is_some() {
             return;
         }
         if m.mixer_before.is_none() {
@@ -844,7 +853,7 @@ impl Daw {
         self.refresh(true);
     }
     fn timeline_event(&self, index: usize, e: &Event) -> bool {
-        if self.model.borrow().io.is_some() {
+        if self.busy() {
             return true;
         }
         let width = (self.arrangement_size.get().width - HEADER).max(200.);
@@ -1020,7 +1029,15 @@ impl Daw {
         drop(m);
         self.refresh(true);
     }
+    fn busy(&self) -> bool {
+        let m = self.model.borrow();
+        m.io.is_some() || m.picker.is_some()
+    }
     fn open_dialog(&self, action: FileAction) {
+        if self.busy() {
+            return;
+        }
+
         self.finish_mix();
         self.dialog_error.set(String::new());
         self.file_selected.set(None);
@@ -1054,9 +1071,104 @@ impl Daw {
             )
         };
         self.path.set(folder.to_string_lossy().into());
-        self.filename.set(name);
+        self.filename.set(name.clone());
+        if let Some(owner) = self.window_id.get() {
+            let mut options =
+                FileDialog::new(if matches!(action, FileAction::Save | FileAction::Export) {
+                    FileDialogMode::Save
+                } else {
+                    FileDialogMode::Open
+                });
+            options.title = match action {
+                FileAction::Open => "Open Resonara project",
+                FileAction::Save => "Save Resonara project",
+                FileAction::Import => "Import WAV",
+                FileAction::Export => "Export stereo WAV",
+            }
+            .into();
+            options.initial_directory = folder.is_absolute().then(|| folder.into());
+            options.default_name = (!name.is_empty()).then_some(name);
+            options.filters = vec![FileDialogFilter {
+                name: if matches!(action, FileAction::Import | FileAction::Export) {
+                    "WAV audio"
+                } else {
+                    "Resonara project"
+                }
+                .into(),
+                extensions: vec![
+                    if matches!(action, FileAction::Import | FileAction::Export) {
+                        "wav"
+                    } else {
+                        "json"
+                    }
+                    .into(),
+                ],
+            }];
+            self.model.borrow_mut().picker = Some((action, options.show(owner)));
+            self.dialog.set(Dialog::Native(action));
+            self.track_menu.set(None);
+            return;
+        }
+        self.open_fallback(action);
+    }
+    fn open_fallback(&self, action: FileAction) {
         self.dialog.set(Dialog::File(action));
         self.read_directory();
+    }
+    fn cancel_picker(&self) {
+        if let Some((_, handle)) = &self.model.borrow().picker {
+            handle.cancel();
+        }
+    }
+    fn poll_picker(&self) {
+        let outcome = {
+            let m = self.model.borrow();
+            m.picker
+                .as_ref()
+                .and_then(|(action, handle)| handle.take_result().map(|result| (*action, result)))
+        };
+        if let Some((action, result)) = outcome {
+            self.model.borrow_mut().picker = None;
+            self.apply_picker_result(action, result);
+        }
+    }
+    fn apply_picker_result(&self, action: FileAction, result: FileDialogResult) {
+        self.dialog.set(Dialog::None);
+        self.focus.set(true);
+        match result {
+            Ok(FileDialogOutcome::Selected(paths)) if paths.len() == 1 => {
+                let path: PathBuf = paths.into_iter().next().unwrap().into();
+                let expected = if matches!(action, FileAction::Import | FileAction::Export) {
+                    "wav"
+                } else {
+                    "json"
+                };
+                if !path.is_absolute()
+                    || path.is_dir()
+                    || !path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case(expected))
+                {
+                    self.picker_failed(format!("Choose an absolute .{expected} file path"));
+                } else {
+                    self.start_io(action, path);
+                }
+            }
+            Ok(FileDialogOutcome::Cancelled) => {
+                self.close_after_save.set(false);
+                self.open_after_save.set(false);
+                self.status.set("File selection cancelled".into());
+            }
+            Err(FileDialogError::Unsupported(_)) => self.open_fallback(action),
+            Err(error) => self.picker_failed(format!("File selection failed: {error}")),
+            _ => self.picker_failed("File picker returned an invalid selection".into()),
+        }
+    }
+    fn picker_failed(&self, message: String) {
+        self.close_after_save.set(false);
+        self.open_after_save.set(false);
+        self.dialog_error.set(message.clone());
+        self.status.set(message);
     }
     fn read_directory(&self) {
         let folder = PathBuf::from(self.path.get());
@@ -1132,10 +1244,13 @@ impl Daw {
         self.start_io(action, path);
     }
     fn start_io(&self, action: FileAction, path: PathBuf) {
+        if self.busy() {
+            return;
+        }
         self.finish_mix();
         self.stop_audio(false);
         let mut m = self.model.borrow_mut();
-        if m.io.is_some() {
+        if m.io.is_some() || m.picker.is_some() {
             return;
         }
         let project = m.project.clone();
@@ -1268,6 +1383,9 @@ impl Daw {
         }
     }
     fn request_open(&self) {
+        if self.busy() {
+            return;
+        }
         self.finish_mix();
         if self.dirty() {
             self.dialog.set(Dialog::ConfirmOpen);
@@ -1276,7 +1394,20 @@ impl Daw {
         }
     }
     fn handle_key(&self, e: KeyEvent) -> bool {
-        if self.model.borrow().io.is_some() {
+        if self.model.borrow().picker.is_some() {
+            if matches!(
+                e,
+                KeyEvent::Pressed {
+                    keycode: KeyCode::Escape,
+                    ..
+                }
+            ) {
+                self.cancel_picker();
+            }
+            return true;
+        }
+
+        if self.busy() {
             return true;
         }
         let KeyEvent::Pressed { keycode, modifiers } = e else {
@@ -1669,7 +1800,7 @@ impl Daw {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Untitled session".into());
         let dirty = m.version != m.saved_version;
-        let busy = m.io.is_some();
+        let busy = m.io.is_some() || m.picker.is_some();
         AnyView::new(row!{Text::new("resonara").font_size(19.).color(TEXT),caption("AUDIO WORKSTATION"),Spacer::new(),label(format!("{}{}",ui::elide(&name,29),if dirty{"  •"}else{""})),Spacer::new(),self.header_button("Open…","Open a Resonara project · Ctrl/Cmd+O",|s|s.request_open()),self.header_icon(Icon::DeviceFloppy,"Save project · Ctrl/Cmd+S",false,|s|s.save()),self.header_button("Import WAV…","Import mono or stereo WAV · Ctrl/Cmd+I",|s|s.open_dialog(FileAction::Import)),self.header_button("Export…","Export stereo WAV · Ctrl/Cmd+E",|s|s.open_dialog(FileAction::Export)),self.header_icon(Icon::HelpCircle,"Keyboard shortcuts and editing help",false,|s|s.dialog.set(Dialog::Help)),caption(if busy{"Working…"}else{""})}.spacing(10.).padding_insets(EdgeInsets::new(14.,6.,12.,6.)).frame_height(44.).background(PANEL))
     }
     fn transport(&self) -> AnyView {
@@ -1744,6 +1875,18 @@ impl Daw {
         let size = self.size.get();
         let mut rows: Vec<Box<dyn View>> = vec![];
         match kind {
+            Dialog::Native(_) => {
+                rows.push(Box::new(
+                    Text::new("Choose a file in the system dialog")
+                        .font_size(22.)
+                        .color(TEXT),
+                ));
+                rows.push(Box::new(self.button(
+                    "Cancel",
+                    "Cancel file selection",
+                    |s| s.cancel_picker(),
+                )));
+            }
             Dialog::File(action) => {
                 let (title, submit, description) = match action {
                     FileAction::Import => (
@@ -1999,12 +2142,19 @@ impl Application for Daw {
     fn scene_listenables(&self, _: &scarlet_ui::SceneWindowKey) -> Option<Vec<&dyn Listenable>> {
         Some(vec![])
     }
+    fn on_window_created(
+        &mut self,
+        context: &WindowContext,
+        _: &mut dyn scarlet_ui::PlatformWindow,
+    ) {
+        self.window_id.set(Some(context.window_id));
+    }
     fn on_window_resize(&mut self, _: &WindowContext, _: u32, _: u32) {
         // Native resize events may be queued echoes. Publish the final actual
         // window size once in on_window_sync, after the event batch is drained.
     }
     fn on_window_close_requested(&mut self, _: &WindowContext) -> bool {
-        if self.model.borrow().io.is_some() {
+        if self.busy() {
             return false;
         }
         self.finish_mix();
@@ -2033,6 +2183,7 @@ impl Application for Daw {
         if self.profiler.borrow().expired() {
             self.finish_profile();
         }
+        self.poll_picker();
         self.poll_io();
         let dragging = {
             let m = self.model.borrow();
