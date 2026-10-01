@@ -7,7 +7,7 @@ use scarlet_ui::{
 };
 use std::{any::Any, cell::RefCell, sync::Arc, time::Duration};
 pub(crate) const PLAYHEAD_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
-pub(crate) const METER_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const METER_INTERVAL: Duration = PLAYHEAD_INTERVAL;
 #[derive(Clone)]
 pub(crate) struct PaintState<T: 'static>(pub State<T>);
 impl<T: 'static> Listenable for PaintState<T> {

@@ -3427,8 +3427,8 @@ fn frame_profile_quantiles_and_separate_animation_budgets_are_explicit() {
         animation::PLAYHEAD_INTERVAL,
         Duration::from_nanos(33_333_333)
     );
-    assert_eq!(animation::METER_INTERVAL, Duration::from_millis(50));
-    assert!(animation::PLAYHEAD_INTERVAL < animation::METER_INTERVAL);
+    assert_eq!(animation::METER_INTERVAL, Duration::from_nanos(33_333_333));
+    assert_eq!(animation::PLAYHEAD_INTERVAL, animation::METER_INTERVAL);
 }
 
 #[test]

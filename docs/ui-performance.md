@@ -22,7 +22,7 @@ these results describe accepted native submissions, not measured display FPS.
 The independent model/layout benchmark in [audio-fixture.md](audio-fixture.md)
 does not measure this native pipeline.
 
-The intended current cadence is a 30 Hz playhead and 20 Hz meters, using retained
+The intended current cadence is a 30 Hz playhead and 30 Hz meters, using retained
 paint-only leaves. These are update targets, not a claim that a particular
 machine sustains them. Static waveform geometry and frame state must remain
 unchanged during playback-only updates; scrolling/zooming appropriately refresh

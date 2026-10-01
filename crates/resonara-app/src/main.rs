@@ -2025,7 +2025,7 @@ impl Daw {
     fn finish_profile(&self) {
         let size = self.size.get();
         let result = self.profiler.borrow_mut().finish(
-            "paint-only-playhead-30hz-meters-20hz",
+            "paint-only-playhead-30hz-meters-30hz",
             self.model.borrow().project.tracks.len(),
             size.width,
             size.height,
