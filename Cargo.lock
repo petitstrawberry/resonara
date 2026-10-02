@@ -2003,6 +2003,7 @@ dependencies = [
  "cpal",
  "resonara-core",
  "sas-client",
+ "scarlet-os",
 ]
 
 [[package]]

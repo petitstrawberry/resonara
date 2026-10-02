@@ -20,12 +20,21 @@
 - AArch64 Gain も build と ELF 監査に合格。native app は `target/aarch64-unknown-scarlet/release/resonara`、Gain は `artifacts/sws-update-gain-aarch64/staging/system/plugins/resonara-gain.clap`。検証ログは `artifacts/sws-update-native-verify.log`、`artifacts/sws-update-final-tests.log`、`artifacts/sws-update-renderer-tests.log`、`artifacts/sws-update-coreaudio-smoke.log`。
 - ゲストの既存 image と起動中 VM は変更していない。更新した binary での表示確認は別途必要。
 
+## Scarlet オーディオ deadline の試験導入（同日）
+
+- ユーザーが protocol 更新後の GPU 描画と負荷改善を確認。音声 producer の遅れが疑われるため scheduler API を調査した。
+- Scarlet の `scarlet_os::scheduler` は current-task の Deadline 予約を提供し、SAS 自身も output period ごとに25%の runtime を予約している。
+- Resonara の SAS producer のみ、256 frames / 48 kHz に合わせて period = deadline = 5,333,333 ns、runtime = 2,666,666 ns（50%）を予約。実行中 CPU に固定する。UI thread は変更しない。
+- 予約失敗時は元の policy で継続しログ出力。`RESONARA_SCARLET_DEADLINE=0` で無効化して比較できる。終了時に kernel の miss / overrun を一度だけログし、元の policy を復元。自然 EOF 後の idle SAS connection は reservation を保持しない。
+- ログは `[Resonara audio] deadline enabled` / `deadline unavailable` / `deadline stats`。kernel の miss / overrun は SAS underrun 回数ではない。今回のコードでのゲストの改善効果は未測定。
+- Deadline 版の AArch64 / RISC-V64 release build と ELF 監査、既存 PCM adapter 7テストに成功。ログは `artifacts/deadline-native-verify.log`、`artifacts/deadline-platform-tests.log`。バイナリは各 `target/<target>/release/resonara`。
+
 ## まず結論
 
 - 作業ブランチ: `feat/scarlet-routing`（`main` へのマージ、PR 作成は行わない）
 - ルーティング、コンパクトな Insert/Send UI、最初の CLAP Gain、Scarlet 用 SWS/SAS バックエンドまで実装済み
 - Linux ホストの GUI・音声・実 CLAP の動作は検証済み。最新の M/S 中央配置もホストのビルドと回帰テストは通過
-- **クラウドでは Scarlet ゲスト未起動。手元ではユーザーが GUI 起動と音声を確認。今回の dependency 更新後の表示と CLAP・ファイル操作は未検証**
+- **クラウドでは Scarlet ゲスト未起動。手元ではユーザーが GPU 描画と音声を確認。今回の Deadline 予約の改善効果とゲストでの CLAP・ファイル操作は未検証**
 - クラウド時点の AArch64 / RISC-V64 native ELF は M/S 配置調整前の記録。今回の最新 build の記録は上の手元の検証を参照
 - クラウドでの追加作業は停止。容量確保の承認は得ておらず、キャッシュは削除していない
 

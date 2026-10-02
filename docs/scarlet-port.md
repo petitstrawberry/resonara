@@ -147,6 +147,22 @@ audio, plus up to 255 staged frames and SAS/device/QEMU latency). The engine's
 published playhead reports produced audio; it can lead the audible position
 by the staging and output queues.
 
+The Scarlet producer requests a current-thread, single-CPU Deadline reservation
+before rendering: period and relative deadline are 5,333,333 ns (256 frames at
+48 kHz), with 2,666,666 ns runtime per period. This reserves 50% of one CPU;
+SAS's own output thread requests 25%. The current CPU is selected using
+`scarlet_os::scheduler`, sharing the existing SAS/SGFX runtime dependency pin.
+If admission or scheduler queries fail, playback continues under its original
+policy and logs the failure. This reservation is not a guarantee against heavy
+DSP, SAS/device underruns or QEMU/host scheduling delays.
+
+`[Resonara audio]` logs the accepted CPU and budget once at startup, then the
+kernel's deadline miss/overrun counters at Stop, failure or natural completion.
+These counters are scheduler observations, not SAS underrun counts. The prior
+policy is restored when rendering finishes, before retaining the idle SAS
+connection for its final hardware tail. `RESONARA_SCARLET_DEADLINE=0` disables
+the reservation for an A/B comparison. Queries and logs run outside the PCM loop.
+
 The producer thread owns the engine, socket and mapped ring. CLAP plugin
 ownership guards remain on the creating/UI thread, separate from realtime
 proxies. Audio shutdown drops the CPAL stream or joins the SAS worker before

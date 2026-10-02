@@ -2,6 +2,7 @@
 use crate::pcm::{CHANNELS, PERIOD_FRAMES, Pump, Ring, Step};
 use resonara_core::{Controls, Project, Result, live::Playback};
 use sas_client::{SasClient, SasStream, StreamConfig};
+use scarlet_os::scheduler::{self, ConfiguredScheduler, DeadlineConfig, SchedulerError};
 use std::{
     marker::PhantomData,
     rc::Rc,
@@ -18,6 +19,54 @@ const SAMPLE_RATE: u32 = 48_000;
 const FORMAT_S16LE: u32 = 1;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const STALL_TIMEOUT: Duration = Duration::from_secs(3);
+// Implicit deadline: one 256-frame block every ~5.33 ms, with half a CPU's
+// runtime reserved. SAS itself reserves 25%, so both fit below Scarlet's 90%
+// admission limit even when placed on the same CPU.
+const DEADLINE_PERIOD: Duration =
+    Duration::from_nanos(PERIOD_FRAMES as u64 * 1_000_000_000 / SAMPLE_RATE as u64);
+const DEADLINE_RUNTIME: Duration = Duration::from_nanos(DEADLINE_PERIOD.as_nanos() as u64 / 2);
+
+struct AudioDeadline {
+    restore: ConfiguredScheduler,
+}
+
+impl AudioDeadline {
+    // Current-task APIs must run inside the producer, never on the UI thread.
+    fn reserve() -> std::result::Result<Self, SchedulerError> {
+        let restore = scheduler::configured()?;
+        let cpu = scheduler::runtime_state()?
+            .current_cpu_id()
+            .ok_or(SchedulerError::InvalidDeadlineCpu)?;
+        let deadline = DeadlineConfig::new(DEADLINE_RUNTIME, DEADLINE_PERIOD, cpu)?;
+        let mut configured = restore.clone();
+        configured.activate_deadline(deadline);
+        configured.apply()?;
+        eprintln!(
+            "[Resonara audio] deadline enabled: cpu={cpu} runtime={}ns period={}ns",
+            DEADLINE_RUNTIME.as_nanos(),
+            DEADLINE_PERIOD.as_nanos(),
+        );
+        Ok(Self { restore })
+    }
+}
+
+impl Drop for AudioDeadline {
+    fn drop(&mut self) {
+        // Report after rendering stops, never log or query scheduler state per
+        // block. These are kernel scheduling counters, not SAS underrun counts.
+        match scheduler::runtime_state() {
+            Ok(state) => eprintln!(
+                "[Resonara audio] deadline stats: misses={} overruns={}",
+                state.deadline_miss_count(),
+                state.deadline_overrun_count(),
+            ),
+            Err(error) => eprintln!("[Resonara audio] deadline stats unavailable: {error:?}"),
+        }
+        if let Err(error) = self.restore.apply() {
+            eprintln!("[Resonara audio] could not restore scheduler: {error:?}");
+        }
+    }
+}
 
 pub struct Audio {
     stop: Arc<AtomicBool>,
@@ -78,6 +127,20 @@ impl Audio {
             .name("resonara-sas".into())
             .spawn(move || {
                 let mut pump = Pump::new();
+                let mut deadline = if std::env::var("RESONARA_SCARLET_DEADLINE").as_deref() == Ok("0") {
+                    eprintln!("[Resonara audio] deadline disabled by environment");
+                    None
+                } else {
+                    match AudioDeadline::reserve() {
+                        Ok(reservation) => Some(reservation),
+                        Err(error) => {
+                            eprintln!(
+                                "[Resonara audio] deadline unavailable: {error:?}; retaining current scheduler"
+                            );
+                            None
+                        }
+                    }
+                };
                 let mut progressed = Instant::now();
                 loop {
                     engine.apply_pending();
@@ -87,6 +150,9 @@ impl Audio {
                         worker_stop.load(Ordering::Acquire),
                     ) {
                         Ok(Step::Finished) => {
+                            // Release the reservation before retaining SAS's
+                            // idle connection for its final hardware tail.
+                            drop(deadline.take());
                             worker_finished.store(true, Ordering::Release);
                             // SAS reports client-ring consumption, not hardware
                             // playback. Closing its final client stops the device
@@ -109,6 +175,7 @@ impl Audio {
                         }
                     }
                 }
+                drop(deadline);
                 // Stop/seek drops without a blocking drain/close RPC to SAS.
                 drop(stream);
                 drop(client);
