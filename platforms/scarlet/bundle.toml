@@ -1,0 +1,16 @@
+# Include this bundle, rather than only the Cargo executable layer, so that
+# standard CLAP effects are installed with Resonara on native Scarlet.
+[[layers]]
+kind = "cargo"
+source = "../.."
+package = "resonara"
+bin = "resonara"
+replace = true
+architectures = ["aarch64", "riscv64"]
+to = "/bin/resonara"
+
+[[layers]]
+kind = "script"
+source = "../../scripts/scarlet-plugins-{arch}.sh"
+# No cached output: the builder must inspect the current source on each build.
+to = "/usr/lib/clap"

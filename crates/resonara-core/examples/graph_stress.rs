@@ -38,6 +38,7 @@ fn main() -> Result<()> {
                 name: format!("Track {track}"),
                 clips: (0..4)
                     .map(|part| Clip {
+                        edit: Default::default(),
                         source_channels: 2,
                         start: (part * FRAMES / 4) as u64,
                         source_offset: part * FRAMES / 4,
@@ -49,6 +50,7 @@ fn main() -> Result<()> {
                 pan: (track % 7) as f32 / 6.0 - 0.5,
                 mute: false,
                 solo: false,
+                routing: resonara_core::ChannelRouting::default(),
             });
             let base = track as u64 * 4;
             graph.nodes.extend([

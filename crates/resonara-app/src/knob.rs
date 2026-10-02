@@ -1,4 +1,5 @@
-//! Compact, retained native mixer pan control. Positive values pan right.
+//! Retained native rotary controls for mixer pan and CLAP parameter drafts.
+//! Positive mixer pan values pan right; CLAP dials follow the numeric field.
 //! Drag upward to increase pan; Shift+arrow keys provide fine adjustment.
 use crate::ui;
 use scarlet_ui::{
@@ -20,6 +21,50 @@ pub struct PanKnob {
     pub dragging: State<bool>,
     pub focused: State<bool>,
     pub changed: Rc<dyn Fn(f32)>,
+    parameter: Option<ParameterValue>,
+    reset_value: f32,
+    arc_origin: f32,
+}
+
+#[derive(Clone)]
+struct ParameterValue {
+    text: State<String>,
+    min: f64,
+    max: f64,
+    opened: f64,
+    stepped: bool,
+}
+impl ParameterValue {
+    fn fraction(&self, value: f64) -> f32 {
+        (((value.clamp(self.min, self.max) - self.min) / (self.max - self.min)) * 2. - 1.) as f32
+    }
+    fn dial_value(&self) -> f32 {
+        self.fraction(
+            self.text
+                .get()
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .unwrap_or(self.opened),
+        )
+    }
+    fn set_dial_value(&self, next: f32) {
+        let next = bounded(next);
+        // Merely clicking must preserve the full f64 value and exact typed text.
+        if next == self.dial_value() {
+            return;
+        }
+        let mut value = if next == self.fraction(self.opened) {
+            self.opened
+        } else {
+            self.min + ((next as f64 + 1.) / 2.) * (self.max - self.min)
+        };
+        if self.stepped {
+            value = value.round();
+        }
+        self.text.set(value.clamp(self.min, self.max).to_string());
+    }
 }
 
 impl PanKnob {
@@ -34,6 +79,61 @@ impl PanKnob {
             dragging,
             focused,
             changed: Rc::new(changed),
+            parameter: None,
+            reset_value: 0.,
+            arc_origin: 0.,
+        }
+    }
+
+    /// A CLAP draft dial sharing the exact numeric field as its source of truth.
+    /// Home/double-click restores the value when the editor was opened.
+    pub fn parameter(
+        text: State<String>,
+        min: f64,
+        max: f64,
+        opened: f64,
+        stepped: bool,
+    ) -> Option<Self> {
+        if !opened.is_finite()
+            || !min.is_finite()
+            || !max.is_finite()
+            || max <= min
+            || !(max - min).is_finite()
+        {
+            return None;
+        }
+        let parameter = ParameterValue {
+            text,
+            min,
+            max,
+            opened: opened.clamp(min, max),
+            stepped,
+        };
+        let source = parameter.clone();
+        let mut dial = Self::new(
+            State::new(
+                scarlet_ui::state::generate_state_id(),
+                parameter.dial_value(),
+            ),
+            State::new(scarlet_ui::state::generate_state_id(), false),
+            State::new(scarlet_ui::state::generate_state_id(), false),
+            move |next| source.set_dial_value(next),
+        );
+        dial.reset_value = parameter.fraction(parameter.opened);
+        dial.arc_origin = -1.;
+        dial.parameter = Some(parameter);
+        Some(dial)
+    }
+    fn current_value(&self) -> f32 {
+        self.parameter
+            .as_ref()
+            .map_or_else(|| bounded(self.value.get()), ParameterValue::dial_value)
+    }
+    fn restore_opening_value(&self) {
+        if let Some(parameter) = &self.parameter {
+            parameter.text.set(parameter.opened.to_string());
+        } else {
+            (self.changed)(self.reset_value);
         }
     }
 
@@ -41,11 +141,39 @@ impl PanKnob {
         let KeyEvent::Pressed { keycode, modifiers } = event else {
             return false;
         };
+        if keycode == KeyCode::Home {
+            self.restore_opening_value();
+            return true;
+        }
+        if let Some(parameter) = &self.parameter {
+            if parameter.stepped
+                && matches!(
+                    keycode,
+                    KeyCode::Up | KeyCode::Right | KeyCode::Down | KeyCode::Left
+                )
+            {
+                let value = parameter
+                    .text
+                    .get()
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .unwrap_or(parameter.opened);
+                let delta = if matches!(keycode, KeyCode::Up | KeyCode::Right) {
+                    1.
+                } else {
+                    -1.
+                };
+                let next = (value.round() + delta).clamp(parameter.min, parameter.max);
+                (self.changed)(parameter.fraction(next));
+                return true;
+            }
+        }
         let step = if modifiers.shift { 0.002 } else { 0.02 };
         let next = match keycode {
-            KeyCode::Up | KeyCode::Right => bounded(self.value.get()) + step,
-            KeyCode::Down | KeyCode::Left => bounded(self.value.get()) - step,
-            KeyCode::Home => 0.,
+            KeyCode::Up | KeyCode::Right => self.current_value() + step,
+            KeyCode::Down | KeyCode::Left => self.current_value() - step,
             _ => return false,
         };
         (self.changed)(bounded(next));
@@ -69,7 +197,11 @@ impl View for PanKnob {
     }
 
     fn listenables(&self) -> Vec<&dyn Listenable> {
-        vec![&self.value, &self.dragging, &self.focused]
+        let source: &dyn Listenable = self
+            .parameter
+            .as_ref()
+            .map_or(&self.value as &dyn Listenable, |p| &p.text);
+        vec![source, &self.dragging, &self.focused]
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -88,6 +220,7 @@ impl View for KnobFace {
                 control: s.0.clone(),
                 size: Size::new(DIAMETER, DIAMETER),
                 before: 0.,
+                before_text: None,
                 start_y: 0.,
                 reset: false,
                 raster: RefCell::new(None),
@@ -110,6 +243,7 @@ struct KnobRender {
     control: PanKnob,
     size: Size,
     before: f32,
+    before_text: Option<String>,
     start_y: f32,
     reset: bool,
     raster: RefCell<Option<KnobRaster>>,
@@ -145,6 +279,7 @@ struct RasterKey {
     height: u32,
     scale_milli: u32,
     value: f32,
+    arc_origin: f32,
     dragging: bool,
     focused: bool,
 }
@@ -218,12 +353,12 @@ fn rasterize(buffer: &mut Buffer, key: RasterKey) {
                 ui::LINE,
                 coverage(arc_distance(point, radius, -1., 1.) - 0.75, pixel_width),
             );
-            if key.value.abs() > f32::EPSILON {
+            if (key.value - key.arc_origin).abs() > f32::EPSILON {
                 composite(
                     &mut pixel,
                     ui::ACCENT,
                     coverage(
-                        arc_distance(point, radius, 0., key.value) - 0.75,
+                        arc_distance(point, radius, key.arc_origin, key.value) - 0.75,
                         pixel_width,
                     ),
                 );
@@ -286,7 +421,8 @@ impl KnobRender {
             width: self.size.width.ceil().max(1.) as u32,
             height: self.size.height.ceil().max(1.) as u32,
             scale_milli: scale_milli.max(1),
-            value: bounded(self.control.value.get()),
+            value: self.control.current_value(),
+            arc_origin: self.control.arc_origin,
             dragging: self.control.dragging.get(),
             focused: self.control.focused.get(),
         };
@@ -374,14 +510,15 @@ impl ElementRenderObject for KnobRender {
                 click_count,
                 ..
             }) => {
-                self.before = bounded(self.control.value.get());
+                self.before = self.control.current_value();
+                self.before_text = self.control.parameter.as_ref().map(|p| p.text.get());
                 self.start_y = *y as f32;
                 self.reset = *click_count >= 2;
                 self.control.dragging.set(true);
                 self.control.focused.set(true);
                 // A single press never jumps to an absolute angle or value.
                 if self.reset {
-                    (self.control.changed)(0.);
+                    self.control.restore_opening_value();
                 }
                 true
             }
@@ -406,7 +543,12 @@ impl ElementRenderObject for KnobRender {
                 button: MouseButton::Left,
                 ..
             }) if self.control.dragging.get() => {
-                (self.control.changed)(self.before);
+                if let (Some(parameter), Some(text)) = (&self.control.parameter, &self.before_text)
+                {
+                    parameter.text.set(text.clone());
+                } else {
+                    (self.control.changed)(self.before);
+                }
                 self.control.dragging.set(false);
                 true
             }
@@ -420,6 +562,80 @@ impl ElementRenderObject for KnobRender {
 mod tests {
     use super::*;
     use scarlet_ui::{ElementTree, EventDispatcher, event::KeyModifiers};
+
+    #[test]
+    fn parameter_dial_preserves_exact_text_and_follows_numeric_edits() {
+        let text = State::new(
+            scarlet_ui::state::generate_state_id(),
+            "0.12345678901234567".into(),
+        );
+        let dial = PanKnob::parameter(text.clone(), 0., 1., 0.12345678901234567, false).unwrap();
+        (dial.changed)(dial.current_value());
+        assert_eq!(text.get(), "0.12345678901234567");
+        text.set("0.75".into());
+        assert_eq!(dial.current_value(), 0.5);
+        (dial.changed)(1.);
+        assert_eq!(text.get(), "1");
+        assert!(dial.handle_key(KeyEvent::Pressed {
+            keycode: KeyCode::Home,
+            modifiers: KeyModifiers::empty()
+        }));
+        assert_eq!(text.get().parse::<f64>().unwrap(), 0.12345678901234567);
+        text.set("invalid".into());
+        assert!(dial.current_value().is_finite());
+        assert_eq!(text.get(), "invalid", "Typing is not rewritten by painting");
+    }
+
+    #[test]
+    fn stepped_parameter_keyboard_moves_a_whole_step_and_drag_is_bounded() {
+        let text = State::new(scarlet_ui::state::generate_state_id(), "1".into());
+        let dial = PanKnob::parameter(text.clone(), 0., 3., 1., true).unwrap();
+        assert!(dial.handle_key(KeyEvent::Pressed {
+            keycode: KeyCode::Up,
+            modifiers: KeyModifiers::empty()
+        }));
+        assert_eq!(text.get(), "2");
+        (dial.changed)(0.99);
+        assert_eq!(text.get(), "3");
+        (dial.changed)(-2.);
+        assert_eq!(text.get(), "0");
+        (dial.changed)(2.);
+        assert_eq!(text.get(), "3");
+        assert!(PanKnob::parameter(text, 1., 1., 1., false).is_none());
+    }
+
+    #[test]
+    fn parameter_drag_cancel_restores_exact_numeric_draft() {
+        let text = State::new(
+            scarlet_ui::state::generate_state_id(),
+            "0.8765432109876543".into(),
+        );
+        let dial = PanKnob::parameter(text.clone(), 0., 1., 0.3, false).unwrap();
+        let mut render = render_control(dial);
+        assert!(render.handle_event(
+            &Event::Mouse(MouseEvent::ButtonPressed {
+                button: MouseButton::Left,
+                x: 16,
+                y: 50,
+                click_count: 1,
+            }),
+            Phase::Target
+        ));
+        assert!(render.handle_event(
+            &Event::Mouse(MouseEvent::Moved { x: 16, y: 10 }),
+            Phase::Target
+        ));
+        assert_ne!(text.get(), "0.8765432109876543");
+        assert!(render.handle_event(
+            &Event::Mouse(MouseEvent::ButtonCancelled {
+                button: MouseButton::Left,
+                x: 16,
+                y: 10
+            }),
+            Phase::Target
+        ));
+        assert_eq!(text.get(), "0.8765432109876543");
+    }
 
     fn control() -> (PanKnob, State<f32>, State<bool>, State<bool>) {
         let value = State::new(StateId::new(701), 0.4);
@@ -441,6 +657,7 @@ mod tests {
             control,
             size: Size::new(DIAMETER, DIAMETER),
             before: 0.,
+            before_text: None,
             start_y: 0.,
             reset: false,
             raster: RefCell::new(None),

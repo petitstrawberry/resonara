@@ -68,6 +68,7 @@ fn project(samples: Vec<[f32; 2]>) -> Project {
             name: "graph source".into(),
             clips: vec![Clip {
                 source_channels: 2,
+                edit: Default::default(),
                 start: 0,
                 source_offset: 0,
                 frames: samples.len(),
@@ -77,6 +78,7 @@ fn project(samples: Vec<[f32; 2]>) -> Project {
             pan: 0.,
             mute: false,
             solo: false,
+            routing: resonara_core::ChannelRouting::default(),
         }],
         master: 1.,
         ..Project::default()
@@ -576,6 +578,97 @@ fn first_and_repeated_active_callbacks_neither_allocate_nor_deallocate() {
     // lengths and repeated callbacks while transport is still active.
     for i in 0..300 {
         let frames = [1, 17, 128, 257][i % 4];
+        e.render(&mut out[..frames * 2], 2);
+    }
+    AUDITING.with(|guard| guard.set(false));
+    assert_eq!(ALLOCS.with(Cell::get), 0, "render allocated");
+    assert_eq!(FREES.with(Cell::get), 0, "render deallocated");
+    assert!(e.controls.playing.load(Ordering::Relaxed));
+    assert!(out.iter().any(|sample| *sample != 0.));
+}
+
+#[test]
+fn live_graph_swap_and_retirement_neither_allocate_nor_deallocate_in_callback() {
+    let mut p = constant([0.125, -0.25], 100_000);
+    let (mut playback, mut renderer) = live::Playback::new(&p, p.sample_rate, 0, false).unwrap();
+    let mut output = [0.; 128];
+    for i in 0..20 {
+        p.tracks[0].routing.inserts = vec![Insert {
+            kind: InsertKind::Gain {
+                gain: if i % 2 == 0 { 0.5 } else { 2. },
+            },
+            bypass: false,
+        }];
+        playback.update(&p).unwrap();
+        ALLOCS.with(|count| count.set(0));
+        FREES.with(|count| count.set(0));
+        AUDITING.with(|guard| guard.set(true));
+        renderer.render(&mut output, 2); // Includes adoption and retirement.
+        renderer.render(&mut output, 2); // Retired slot is still occupied.
+        AUDITING.with(|guard| guard.set(false));
+        assert_eq!(ALLOCS.with(Cell::get), 0, "live swap allocated");
+        assert_eq!(FREES.with(Cell::get), 0, "live swap deallocated");
+        assert!(output.iter().all(|sample| *sample != 0.));
+    }
+    drop(renderer);
+}
+
+#[test]
+fn persistent_routing_bus_controls_and_sends_do_not_allocate_in_callbacks() {
+    let mut p = constant([0.125, -0.25], 100_000);
+    let a = p.add_bus("Aux", BusKind::Aux);
+    let b = p.add_bus("Group", BusKind::Group);
+    p.tracks[0].routing.inserts = vec![Insert {
+        kind: InsertKind::OnePole { coefficient: 0.75 },
+        bypass: false,
+    }];
+    p.tracks[0].routing.sends = vec![
+        Send {
+            target: a,
+            gain: 0.5,
+            pre_fader: true,
+            enabled: true,
+        },
+        Send {
+            target: b,
+            gain: 0.25,
+            pre_fader: false,
+            enabled: true,
+        },
+        Send {
+            target: b,
+            gain: 10.,
+            pre_fader: false,
+            enabled: false,
+        },
+    ];
+    p.bus_mut(a).unwrap().routing.inserts = vec![Insert {
+        kind: InsertKind::Delay { frames: 19 },
+        bypass: false,
+    }];
+    p.bus_mut(a).unwrap().routing.output = Destination::Bus(b);
+    p.bus_mut(a).unwrap().routing.sends.push(Send {
+        target: b,
+        gain: 0.25,
+        pre_fader: true,
+        enabled: true,
+    });
+    let mut e = Engine::try_new(&p, Arc::new(Controls::new(&p)), p.sample_rate, 0).unwrap();
+    let mut out = [0.; 514];
+    ALLOCS.with(|count| count.set(0));
+    FREES.with(|count| count.set(0));
+    AUDITING.with(|guard| guard.set(true));
+    for i in 0..300 {
+        let frames = [1, 17, 128, 257][i % 4];
+        e.controls.buses[0]
+            .gain
+            .store((0.1 * (i % 8) as f32).to_bits(), Ordering::Relaxed);
+        for (slot, gain) in e.controls.send_gains.iter().enumerate() {
+            gain.store(
+                (0.05 * ((i + slot) % 8) as f32).to_bits(),
+                Ordering::Relaxed,
+            );
+        }
         e.render(&mut out[..frames * 2], 2);
     }
     AUDITING.with(|guard| guard.set(false));

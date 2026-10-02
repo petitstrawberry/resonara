@@ -3,7 +3,27 @@ use super::*;
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct TrackMenu {
     pub target: Option<usize>,
+    pub bus: Option<BusId>,
     pub anchor: Point,
+}
+impl TrackMenu {
+    fn items(self) -> &'static [(&'static str, TrackAction)] {
+        if self.bus.is_some() {
+            &[("Delete aux", TrackAction::Delete)]
+        } else if self.target.is_some() {
+            &[
+                ("Add audio track", TrackAction::Add),
+                ("Duplicate track", TrackAction::Duplicate),
+                ("Delete track", TrackAction::Delete),
+            ]
+        } else {
+            &[("Add audio track", TrackAction::Add)]
+        }
+    }
+
+    fn height(self) -> f32 {
+        self.items().len() as f32 * 32. + 12.
+    }
 }
 #[derive(Clone, Copy)]
 pub(super) enum TrackAction {
@@ -103,9 +123,11 @@ impl Daw {
                     pan: 0.,
                     mute: false,
                     solo: false,
+                    routing: Default::default(),
                 },
             );
             m.selected = at;
+            m.selected_bus = None;
             m.clip = None;
             Ok(())
         });
@@ -120,22 +142,51 @@ impl Daw {
             }
             self.choose(i, None);
         }
-        let height = if target.is_some() { 108. } else { 44. };
-        let size = self.size.get();
-        self.menu_choice.set(0);
-        self.track_menu.set(Some(TrackMenu {
+        self.show_channel_menu(TrackMenu {
             target,
-            anchor: Point::new(
-                anchor.x.clamp(0., (size.width - MENU_WIDTH).max(0.)),
-                anchor.y.clamp(0., (size.height - height).max(0.)),
-            ),
-        }));
+            bus: None,
+            anchor,
+        });
+    }
+    pub(super) fn open_aux_menu(&self, id: BusId, anchor: Point) {
+        if self.busy() || self.dialog.get() != Dialog::None {
+            return;
+        }
+        if self.model.borrow().project.bus(id).is_none() {
+            return;
+        }
+        self.choose_bus(id);
+        self.show_channel_menu(TrackMenu {
+            target: None,
+            bus: Some(id),
+            anchor,
+        });
+    }
+    fn show_channel_menu(&self, mut menu: TrackMenu) {
+        let size = self.size.get();
+        menu.anchor = Point::new(
+            menu.anchor.x.clamp(0., (size.width - MENU_WIDTH).max(0.)),
+            menu.anchor
+                .y
+                .clamp(0., (size.height - menu.height()).max(0.)),
+        );
+        self.routing_menu.set(None);
+        self.menu_choice.set(0);
+        self.track_menu.set(Some(menu));
     }
     pub(super) fn track_menu_action(&self, action: TrackAction) {
         let Some(menu) = self.track_menu.get() else {
             return;
         };
         self.track_menu.set(None);
+        if let Some(id) = menu.bus {
+            if matches!(action, TrackAction::Delete)
+                && self.model.borrow().project.bus(id).is_some()
+            {
+                self.delete_bus(id);
+            }
+            return;
+        }
         if let Some(i) = menu.target {
             if i >= self.model.borrow().project.tracks.len() {
                 return;
@@ -155,6 +206,16 @@ impl Daw {
         e: &Event,
         control: bool,
     ) -> bool {
+        if self.inspector.get()
+            && self.model.borrow().selected_bus.is_some()
+            && matches!(
+                e,
+                Event::Mouse(MouseEvent::ButtonPressed { .. } | MouseEvent::ButtonReleased { .. })
+                    | Event::Keyboard(KeyEvent::Pressed { .. })
+            )
+        {
+            inspector::update_aux_menu_anchor(root, Point::ZERO);
+        }
         if self.ruler_drag.borrow().is_some() {
             match e {
                 Event::Keyboard(KeyEvent::Pressed {
@@ -171,20 +232,17 @@ impl Daw {
         if let Some(menu) = self.track_menu.get() {
             match e {
                 Event::Keyboard(KeyEvent::Pressed { keycode, .. }) => {
-                    let count = if menu.target.is_some() { 3 } else { 1 };
+                    let items = menu.items();
+                    let count = items.len();
                     match keycode {
                         KeyCode::Escape => self.track_menu.set(None),
                         KeyCode::Down => self.menu_choice.set((self.menu_choice.get() + 1) % count),
                         KeyCode::Up => self
                             .menu_choice
                             .set((self.menu_choice.get() + count - 1) % count),
-                        KeyCode::Enter => self.track_menu_action(
-                            [
-                                TrackAction::Add,
-                                TrackAction::Duplicate,
-                                TrackAction::Delete,
-                            ][self.menu_choice.get()],
-                        ),
+                        KeyCode::Enter => {
+                            self.track_menu_action(items[self.menu_choice.get() % count].1)
+                        }
                         _ => {}
                     }
                     return true;
@@ -196,8 +254,7 @@ impl Daw {
                 }
                 Event::Mouse(MouseEvent::Wheel { .. }) => return true,
                 Event::Mouse(MouseEvent::ButtonPressed { x, y, .. }) => {
-                    let height = if menu.target.is_some() { 108. } else { 44. };
-                    if !Rect::from_xywh(menu.anchor.x, menu.anchor.y, MENU_WIDTH, height)
+                    if !Rect::from_xywh(menu.anchor.x, menu.anchor.y, MENU_WIDTH, menu.height())
                         .contains(Point::new(*x as f32, *y as f32))
                     {
                         self.track_menu.set(None);
@@ -221,17 +278,7 @@ impl Daw {
     }
     pub(super) fn track_menu_view(&self, menu: TrackMenu) -> AnyView {
         let mut rows: Vec<Box<dyn View>> = vec![];
-        for (index, (text, action)) in [
-            ("Add audio track", TrackAction::Add),
-            ("Duplicate track", TrackAction::Duplicate),
-            ("Delete track", TrackAction::Delete),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if index > 0 && menu.target.is_none() {
-                break;
-            }
+        for (index, &(text, action)) in menu.items().iter().enumerate() {
             let s = self.clone();
             rows.push(Box::new(
                 ui::button(text)

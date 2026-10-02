@@ -108,6 +108,41 @@ impl Peaks {
             })
         });
     }
+
+    /// Peak-cache lookup in audible clip order. Edits share the source cache;
+    /// only the tiny visible sample window is read directly at sample zoom.
+    pub(crate) fn clip_envelope(
+        &mut self,
+        clip: &resonara_core::Clip,
+        from: usize,
+        to: usize,
+    ) -> Envelope {
+        let from = from.min(clip.frames);
+        let to = to.min(clip.frames).max(from);
+        if to <= from {
+            return Envelope {
+                min: [0.; 2],
+                max: [0.; 2],
+            };
+        }
+        if to - from <= 4 {
+            let mut result = Envelope::empty();
+            for frame in from..to {
+                result.sample(clip.sample_at(frame as f64));
+            }
+            return result;
+        }
+        let range = clip.source_range(from, to);
+        let mut result = self.source(&clip.samples).envelope(range.start, range.end);
+        // A column spans at most two display pixels. Evaluate the envelope at
+        // its center so gain/fade previews match the audible edited region.
+        let gain = clip.amplitude_at((from as f64 + to as f64 - 1.) * 0.5);
+        for channel in 0..2 {
+            result.min[channel] *= gain;
+            result.max[channel] *= gain;
+        }
+        result
+    }
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Lane {
@@ -146,7 +181,17 @@ pub(crate) struct Projection {
     source_right: f64,
 }
 impl Projection {
+    #[cfg(test)]
     pub(crate) fn source_range(
+        self,
+        clip: &resonara_core::Clip,
+        left: f32,
+        right: f32,
+    ) -> std::ops::Range<usize> {
+        let range = self.relative_range(clip, left, right);
+        clip.source_range(range.start, range.end)
+    }
+    pub(crate) fn relative_range(
         self,
         clip: &resonara_core::Clip,
         left: f32,
@@ -157,7 +202,7 @@ impl Projection {
             .floor() as usize;
         let to = (((right as f64 - self.source_x) / width).clamp(0., 1.) * clip.frames as f64)
             .ceil() as usize;
-        clip.source_offset + from.min(clip.frames)..clip.source_offset + to.min(clip.frames)
+        from.min(clip.frames)..to.min(clip.frames)
     }
 }
 pub(crate) fn project_clip(
@@ -311,7 +356,6 @@ pub(crate) fn vertices(
             rect(a, clip_bottom - 2., b - a, 2., tint);
         }
         let layout = lanes(c.source_channels, h);
-        let data = peaks.source(&c.samples);
         if layout.len() == 2 {
             let separator = (layout[0].bottom + layout[1].top) / 2.;
             rect(
@@ -335,8 +379,8 @@ pub(crate) fn vertices(
         for bin in 0..count {
             let px = a + bin as f32 * 2.;
             let next = (px + 2.).min(b);
-            let range = projection.source_range(c, px, next);
-            let envelope = data.envelope(range.start, range.end);
+            let range = projection.relative_range(c, px, next);
+            let envelope = peaks.clip_envelope(c, range.start, range.end);
             for lane in &layout {
                 let top = lane.center - envelope.max[lane.channel].clamp(-1., 1.) * lane.amplitude;
                 let bottom =

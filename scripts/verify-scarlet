@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Run inside Scarlet's pinned `nix develop` shell.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+if [ "$#" -eq 0 ]; then
+  set -- aarch64-unknown-scarlet riscv64gc-unknown-scarlet
+fi
+mkdir -p artifacts
+bash scripts/check-dependencies
+for target in "$@"; do
+  case "$target" in
+    aarch64-unknown-scarlet|riscv64gc-unknown-scarlet) ;;
+    *) printf 'Unsupported Scarlet target: %s\n' "$target" >&2; exit 2 ;;
+  esac
+  cargo build --locked --release -p resonara --target "$target" 2>&1 |
+    tee "artifacts/build-$target.log"
+  case "$target" in
+    aarch64-unknown-scarlet) architecture=aarch64 ;;
+    riscv64gc-unknown-scarlet) architecture=riscv64 ;;
+  esac
+  python3 crates/resonara-clap/scripts/audit-scarlet-host.py \
+    "${CARGO_TARGET_DIR:-$PWD/target}/$target/release/resonara" \
+    --arch "$architecture" --json "artifacts/audit-$target.json"
+done
+printf 'Scarlet cross-build complete. This does not verify SWS/SAS runtime or audible output.\n'

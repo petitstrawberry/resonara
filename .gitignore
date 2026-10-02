@@ -4,3 +4,4 @@
 
 /*.log
 .direnv
+__pycache__/

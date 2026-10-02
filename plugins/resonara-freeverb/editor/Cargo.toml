@@ -1,0 +1,24 @@
+[package]
+name = "resonara-freeverb-editor"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+publish = false
+repository = "https://github.com/petitstrawberry/resonara"
+[workspace]
+[features]
+default = ["std"]
+std = ["scarlet-ui/std"]
+scarlet = ["scarlet-ui/legacy-scarlet-std", "dep:scarlet-std"]
+[dependencies]
+scarlet-clap-gui = { path = "../../../crates/scarlet-clap-gui" }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "8468af9bcc977153259a82203962b84f9b78700a", default-features = false }
+
+libm = "0.2"
+core_maths = "0.1"
+[target.'cfg(target_os = "scarlet")'.dependencies]
+scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", optional = true }
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.4"
+objc2-foundation = { version = "=0.3.2", features = ["NSString", "NSThread"] }
+objc2-app-kit = { version = "=0.3.2", features = ["NSView", "NSResponder", "NSEvent", "NSGraphics", "NSBitmapImageRep", "NSImage", "NSImageRep"] }

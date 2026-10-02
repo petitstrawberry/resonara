@@ -5,27 +5,76 @@ use std::{sync::atomic::AtomicU64, time::Duration};
 
 // Exercise the real render engine and transport state without opening a device.
 pub(super) struct TestAudio {
+    // Renderer is destroyed before its control-thread plugin owners.
+    engine: RefCell<resonara_core::live::PlaybackRenderer>,
+    playback: resonara_core::live::Playback,
     pub controls: Arc<resonara_core::Controls>,
     pub device: String,
-    engine: RefCell<resonara_core::Engine>,
+    editor_open: bool,
 }
 impl TestAudio {
+    pub fn update(&mut self, project: &Project) -> Result<()> {
+        self.playback.update(project)?;
+        self.controls = self.playback.controls.clone();
+        Ok(())
+    }
+    pub fn open_editor(&self, slot: usize) -> Result<bool> {
+        self.playback.open_editor(slot)
+    }
+    pub fn has_open_editors(&self) -> bool {
+        self.editor_open
+    }
+    pub fn pause(&self) {
+        self.controls.playing.store(false, Ordering::Release);
+    }
+    pub fn seek(&self, start: u64) -> bool {
+        resonara_core::Engine::request_seek(&self.controls, start);
+        self.controls.position.store(start, Ordering::Relaxed);
+        true
+    }
+    pub fn resume(&self, start: u64, metronome: bool) -> bool {
+        self.controls.metronome.store(metronome, Ordering::Relaxed);
+        resonara_core::Engine::request_resume(&self.controls, start);
+        self.controls.position.store(start, Ordering::Relaxed);
+        true
+    }
+    pub fn start_paused(project: &Project) -> Result<Self> {
+        let audio = Self::start_with_metronome(project, 0, false)?;
+        audio.pause();
+        Ok(audio)
+    }
+    pub fn close_editors(&self) -> Result<()> {
+        self.playback.close_editors()
+    }
+    pub fn poll_plugins(
+        &mut self,
+        force: bool,
+    ) -> Result<Vec<(usize, resonara_core::plugins::ClapInsert)>> {
+        self.playback.poll_plugins(force)
+    }
+    pub fn collect_retired(&mut self) {
+        self.playback.collect_retired();
+    }
+    pub fn is_finished(&self) -> bool {
+        !self.controls.playing.load(Ordering::Relaxed)
+    }
     pub fn start(project: &Project, start: u64) -> Result<Self> {
         Self::start_with_metronome(project, start, false)
     }
     pub fn start_with_metronome(project: &Project, start: u64, metronome: bool) -> Result<Self> {
         project.validate()?;
-        let controls = Arc::new(resonara_core::Controls::new(project));
-        controls.metronome.store(metronome, Ordering::Relaxed);
-        let engine =
-            resonara_core::Engine::new(project, controls.clone(), project.sample_rate, start);
+        let (playback, engine) =
+            resonara_core::live::Playback::new(project, project.sample_rate, start, metronome)?;
+        let controls = playback.controls.clone();
         Ok(Self {
+            playback,
             controls,
             device: "Test output".into(),
+            editor_open: false,
             engine: RefCell::new(engine),
         })
     }
-    fn render(&self, frames: usize) {
+    pub(super) fn render(&self, frames: usize) {
         self.engine
             .borrow_mut()
             .render(&mut vec![0f32; frames * 2], 2);
@@ -39,6 +88,7 @@ fn project() -> Project {
             .map(|i| Track {
                 name: format!("Track {i}"),
                 clips: vec![Clip {
+                    edit: Default::default(),
                     source_channels: 2,
                     start: 1600,
                     source_offset: 400,
@@ -49,10 +99,237 @@ fn project() -> Project {
                 pan: 0.,
                 mute: false,
                 solo: false,
+                routing: Default::default(),
             })
             .collect(),
         ..Project::default()
     }
+}
+
+fn assert_playback_advances(s: &Daw, frames: usize) {
+    let m = s.model.borrow();
+    let audio = m.audio.as_ref().expect("edit stopped playback");
+    let before = audio.controls.position.load(Ordering::Relaxed);
+    audio.render(frames);
+    assert_eq!(
+        audio.controls.position.load(Ordering::Relaxed),
+        before + frames as u64
+    );
+    assert!(audio.controls.playing.load(Ordering::Relaxed));
+}
+
+#[test]
+fn playing_channel_rename_and_builtin_bypass_keep_engine_and_undo_live() {
+    let s = Daw::new(project());
+    s.add_insert(
+        RoutingTarget::Track(0),
+        resonara_core::InsertKind::Gain { gain: 0.5 },
+    );
+    s.play();
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    assert_playback_advances(&s, 1700);
+    s.edit("Rename channel", |m| {
+        m.project.tracks[0].name = "Live rename".into();
+        Ok(())
+    });
+    assert_playback_advances(&s, 17);
+    s.toggle_insert(RoutingTarget::Track(0), 0);
+    assert_playback_advances(&s, 17);
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    s.undo(false);
+    assert!(!s.model.borrow().project.tracks[0].routing.inserts[0].bypass);
+    assert_playback_advances(&s, 17);
+    s.undo(false);
+    assert_eq!(s.model.borrow().project.tracks[0].name, "Track 0");
+    s.undo(true);
+    s.undo(true);
+    assert!(s.model.borrow().project.tracks[0].routing.inserts[0].bypass);
+    assert_playback_advances(&s, 17);
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+}
+
+#[test]
+fn playing_structural_edits_inserts_routes_tracks_and_history_keep_transport() {
+    use resonara_core::{Destination, InsertKind};
+    let s = Daw::new(project());
+    s.play();
+    assert_playback_advances(&s, 1700);
+    let transport = s
+        .model
+        .borrow()
+        .audio
+        .as_ref()
+        .unwrap()
+        .controls
+        .position
+        .clone();
+    s.add_bus();
+    let bus = s.model.borrow().selected_bus.unwrap();
+    assert_playback_advances(&s, 31);
+    s.set_output(RoutingTarget::Track(0), Destination::Bus(bus));
+    s.add_send(RoutingTarget::Track(1), bus);
+    s.add_insert(RoutingTarget::Track(0), InsertKind::Gain { gain: 0.5 });
+    assert_playback_advances(&s, 31);
+    s.add_insert(RoutingTarget::Track(0), InsertKind::Delay { frames: 8 });
+    s.move_insert(RoutingTarget::Track(0), 1, -1);
+    s.remove_insert(RoutingTarget::Track(0), 0);
+    s.delete_bus(bus);
+    assert_playback_advances(&s, 31);
+    s.choose(0, None);
+    s.duplicate();
+    assert_playback_advances(&s, 31);
+    s.delete(true);
+    s.add_track(None);
+    assert_playback_advances(&s, 31);
+    s.undo(false);
+    s.undo(true);
+    assert_playback_advances(&s, 31);
+    assert!(Arc::ptr_eq(
+        &transport,
+        &s.model.borrow().audio.as_ref().unwrap().controls.position
+    ));
+}
+
+#[test]
+fn playing_region_drag_commits_or_cancels_without_stopping_or_seeking() {
+    for cancel in [false, true] {
+        let s = Daw::new(project());
+        s.snap.set(false);
+        s.play();
+        assert_playback_advances(&s, 2000);
+        let start = s.model.borrow().project.tracks[0].clips[0].start;
+        s.timeline_event(0, &press(100));
+        assert_eq!(
+            s.model
+                .borrow()
+                .audio
+                .as_ref()
+                .unwrap()
+                .controls
+                .position
+                .load(Ordering::Relaxed),
+            2000
+        );
+        s.timeline_event(0, &Event::Mouse(MouseEvent::Moved { x: 125, y: 40 }));
+        assert_playback_advances(&s, 31);
+        if cancel {
+            s.cancel_drag();
+        } else {
+            s.timeline_event(
+                0,
+                &Event::Mouse(MouseEvent::ButtonReleased {
+                    button: MouseButton::Left,
+                    x: 125,
+                    y: 40,
+                    click_count: 1,
+                }),
+            );
+        }
+        assert_playback_advances(&s, 31);
+        assert_eq!(s.model.borrow().undo.len(), usize::from(!cancel));
+        assert_eq!(
+            s.model.borrow().project.tracks[0].clips[0].start == start,
+            cancel
+        );
+    }
+}
+
+#[test]
+fn playing_save_export_and_import_keep_transport_running_during_io() {
+    let temp = Temp::new();
+    for action in [FileAction::Save, FileAction::Export, FileAction::Import] {
+        let s = Daw::new(project());
+        let path = temp.0.join(match action {
+            FileAction::Save => "live.json",
+            FileAction::Export => "live.wav",
+            _ => "import.wav",
+        });
+        if action == FileAction::Import {
+            project().export_wav(&path).unwrap();
+        }
+        s.play();
+        assert_playback_advances(&s, 1700);
+        s.start_io(action, path.clone());
+        assert_playback_advances(&s, 31);
+        finish_io(&s);
+        assert_playback_advances(&s, 31);
+        assert!(path.is_file());
+        if action == FileAction::Import {
+            assert_eq!(s.model.borrow().project.tracks.len(), 3);
+        }
+    }
+}
+
+#[test]
+fn playing_failed_edits_and_empty_history_leave_audio_untouched() {
+    let s = Daw::new(project());
+    s.play();
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    s.undo(false);
+    s.undo(true);
+    s.edit("Rejected rename", |_| Err("Empty name".into()));
+    s.edit("Rejected graph", |m| {
+        m.project.tracks[0]
+            .routing
+            .inserts
+            .push(resonara_core::Insert {
+                kind: resonara_core::InsertKind::Delay { frames: 0 },
+                bypass: false,
+            });
+        Ok(())
+    });
+    assert!(
+        s.model.borrow().project.tracks[0]
+            .routing
+            .inserts
+            .is_empty()
+    );
+    assert!(s.model.borrow().undo.is_empty());
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    assert_playback_advances(&s, 2000);
+}
+
+#[test]
+fn playing_missing_plugin_edit_warns_and_bypass_keeps_audio_running() {
+    let s = Daw::new(project());
+    s.play();
+    s.add_insert(
+        RoutingTarget::Track(0),
+        resonara_core::InsertKind::Clap {
+            plugin: resonara_core::ClapInsert {
+                library: "missing.clap".into(),
+                plugin_id: "org.example.missing".into(),
+                name: "Missing effect".into(),
+                parameters: vec![],
+                state: vec![],
+            },
+        },
+    );
+    assert!(
+        s.status
+            .get()
+            .contains("1 unavailable CLAP insert(s) bypassed")
+    );
+    assert_playback_advances(&s, 1700);
+    s.toggle_insert(RoutingTarget::Track(0), 0);
+    assert!(!s.status.get().contains("unavailable"));
+    assert_playback_advances(&s, 31);
+    s.undo(false);
+    assert!(
+        s.status
+            .get()
+            .contains("1 unavailable CLAP insert(s) bypassed")
+    );
+    assert_playback_advances(&s, 31);
 }
 
 fn assert_project(actual: &Project, expected: &Project) {
@@ -62,8 +339,10 @@ fn assert_project(actual: &Project, expected: &Project) {
     assert_eq!(actual.tempo, expected.tempo);
     assert_eq!(actual.time_signature, expected.time_signature);
     assert_eq!(actual.tracks.len(), expected.tracks.len());
+    assert_eq!(actual.buses, expected.buses);
     for (a, b) in actual.tracks.iter().zip(&expected.tracks) {
         assert_eq!(a.name, b.name);
+        assert_eq!(a.routing, b.routing);
         assert_eq!(
             (a.gain, a.pan, a.mute, a.solo),
             (b.gain, b.pan, b.mute, b.solo)
@@ -86,6 +365,7 @@ fn assert_snapshot(actual: &Model, expected: &Snapshot) {
     assert_project(&actual.project, &expected.project);
     assert_eq!(actual.selected, expected.selected);
     assert_eq!(actual.clip, expected.clip);
+    assert_eq!(actual.selected_bus, expected.selected_bus);
     assert_eq!(actual.version, expected.version);
     assert_eq!(actual.current_path, expected.path);
 }
@@ -1842,9 +2122,17 @@ fn assert_gain_controls_coherent(s: &Daw) {
         let mut tree = scarlet_ui::ElementTree::new();
         tree.set_root(s.inspector_panel().create_element());
         tree.layout(scarlet_ui::LayoutConstraints::tight(220., 630.));
-        assert!(
-            (gain_slider(&tree).value - expected[s.model.borrow().selected]).abs() < 1e-6,
-            "Inspector does not follow the selected track's Spectrum gain position"
+        let mut faders = Vec::new();
+        control_bounds(
+            tree.root().unwrap(),
+            Point::ZERO,
+            "::fader::FaderRender",
+            &mut faders,
+        );
+        assert_eq!(
+            faders.len(),
+            1,
+            "Inspector has one shared-state selected-channel fader"
         );
     }
 }
@@ -1868,7 +2156,7 @@ fn all_gain_entry_points_synchronize_and_group_each_gesture_for_undo() {
         ));
         let mut dispatcher = scarlet_ui::EventDispatcher::new();
         let mut expected_position = 0.;
-        if entry == "mixer" {
+        if entry != "track header" {
             let mut bounds = Vec::new();
             control_bounds(
                 tree.root().unwrap(),
@@ -2286,6 +2574,7 @@ fn stereo_meter_project() -> Project {
     p.master = 2.;
     for (track, sample) in p.tracks.iter_mut().zip([[0.75, -0.25], [0.25, 0.125]]) {
         track.clips = vec![Clip {
+            edit: Default::default(),
             source_channels: 2,
             start: 0,
             source_offset: 0,
@@ -2650,6 +2939,7 @@ fn expected_wave_rect(
 fn waveform_vertices_draw_true_stereo_lanes_and_one_mono_lane_at_each_height() {
     let mut track = project().tracks.remove(0);
     track.clips = vec![Clip {
+        edit: Default::default(),
         source_channels: 2,
         start: 0,
         source_offset: 0,
@@ -2753,6 +3043,7 @@ fn waveform_vertices_draw_true_stereo_lanes_and_one_mono_lane_at_each_height() {
 #[test]
 fn waveform_projection_clamps_viewport_and_source_trim_without_exposing_neighbor_samples() {
     let clip = Clip {
+        edit: Default::default(),
         source_channels: 2,
         start: 64,
         source_offset: 30,
@@ -3046,6 +3337,7 @@ fn region_native_labels_follow_source_lanes_and_waveform_clicks_preserve_selecti
 fn selected_waveform_draws_trim_handles_only_at_real_visible_clip_endpoints() {
     let mut track = project().tracks.remove(0);
     track.clips = vec![Clip {
+        edit: Default::default(),
         source_channels: 2,
         start: 8000,
         source_offset: 0,
@@ -3187,7 +3479,7 @@ fn playback_only_updates_do_not_notify_root_dependencies_after_layout_settles() 
         .collect::<Vec<_>>();
     assert!(
         counts.iter().all(|count| *count == 0),
-        "playback notified root dependencies [revision,size,arrangement,dialog,inspector,inspector_fraction,mixer_fraction,mixer_visible,snap,tool,view_start,view_span,dialog_error]: {counts:?}"
+        "playback notified root dependencies [revision,size,arrangement,dialog,inspector,inspector_fraction,panel_fraction,panel_visible,snap,tool,view_start,view_span,dialog_error]: {counts:?}"
     );
     tree.clear_root();
 }
@@ -3618,9 +3910,9 @@ fn hiding_mixer_fills_arrangement_and_restores_split_after_resize() {
             for _ in 0..8 {
                 let _ = pipeline.render();
             }
-            let split = s.mixer_fraction.get();
+            let split = s.panel_fraction.get();
             let before = s.arrangement_size.get().height;
-            s.mixer_visible.set(false);
+            s.panel_visible.set(false);
             for _ in 0..8 {
                 let _ = pipeline.render();
             }
@@ -3631,7 +3923,7 @@ fn hiding_mixer_fills_arrangement_and_restores_split_after_resize() {
                 s.arrangement_size.get()
             );
             assert!(s.arrangement_size.get().height > before + 280.);
-            assert_eq!(s.mixer_fraction.get(), split);
+            assert_eq!(s.panel_fraction.get(), split);
 
             s.sync_content_size(Size::new(1280., 1032.));
             pipeline.resize(Size::new(1280., 1032.));
@@ -3639,8 +3931,8 @@ fn hiding_mixer_fills_arrangement_and_restores_split_after_resize() {
                 let _ = pipeline.render();
             }
             assert!((s.arrangement_size.get().height - 826.).abs() <= 1.);
-            assert_eq!(s.mixer_fraction.get(), split);
-            s.mixer_visible.set(true);
+            assert_eq!(s.panel_fraction.get(), split);
+            s.panel_visible.set(true);
             for _ in 0..8 {
                 let _ = pipeline.render();
             }
@@ -3649,7 +3941,7 @@ fn hiding_mixer_fills_arrangement_and_restores_split_after_resize() {
             assert!(mixer_height <= MIXER_MAX_HEIGHT + 1.);
             assert!(mixer_height >= MIXER_MIN_HEIGHT - 1.);
             assert!(
-                (s.mixer_fraction.get() - s.arrangement_size.get().height / available).abs()
+                (s.panel_fraction.get() - s.arrangement_size.get().height / available).abs()
                     < 0.002
             );
             assert_eq!(s.view_start.get(), 0.25);
@@ -3865,7 +4157,7 @@ fn gain_scale_targets_ignore_meter_and_gaps_and_cancel_restores_gain() {
 fn context_tree(s: &Daw) -> scarlet_ui::ElementTree {
     s.size.set(Size::new(1000., 790.));
     s.inspector.set(false);
-    s.mixer_visible.set(false);
+    s.panel_visible.set(false);
     let mut tree = scarlet_ui::ElementTree::new();
     tree.set_root(s.create_element());
     tree.layout(scarlet_ui::LayoutConstraints::tight(1000., 790.));
@@ -4198,7 +4490,7 @@ fn playing_ruler_drag_keeps_stream_alive_and_seeks_once_on_release() {
         false,
     );
     let resumed = s.model.borrow().audio.as_ref().unwrap().controls.clone();
-    assert!(!Arc::ptr_eq(&original, &resumed));
+    assert!(Arc::ptr_eq(&original, &resumed));
     assert!(resumed.playing.load(Ordering::Relaxed));
     assert!((resumed.position.load(Ordering::Relaxed) as f64 / 8000. - preview).abs() < 0.002);
     s.model.borrow().audio.as_ref().unwrap().render(80);
@@ -4311,7 +4603,7 @@ fn mixer_divider_resizes_meter_and_fader_within_the_content_limits() {
     }
     let available = s.size.get().height - 174. - 4.;
     for requested in [0., 1., 0.55, 0.65] {
-        s.mixer_fraction.set(requested);
+        s.panel_fraction.set(requested);
         for _ in 0..8 {
             let _ = pipeline.render();
         }
@@ -4327,7 +4619,8 @@ fn mixer_divider_resizes_meter_and_fader_within_the_content_limits() {
             "::fader::FaderRender",
             &mut faders,
         );
-        assert_eq!(faders.len(), 3);
+        assert_eq!(faders.len(), 4);
+
         for (_, size) in faders {
             assert!((size.height - s.mixer_fader_height()).abs() <= 1.);
             assert!(
@@ -5032,4 +5325,1699 @@ fn native_audio_import_filter_does_not_weaken_project_or_export_filters() {
         assert!(!s.dialog_error.get().is_empty());
         assert_snapshot(&s.model.borrow(), &before);
     }
+}
+
+#[test]
+fn routing_insert_chain_edit_bypass_reorder_remove_and_undo() {
+    use resonara_core::InsertKind;
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    let before = Daw::snapshot(&s.model.borrow());
+    s.add_insert(target, InsertKind::Gain { gain: 0.5 });
+    s.add_insert(target, InsertKind::Delay { frames: 32 });
+    s.move_insert(target, 1, -1);
+    assert!(matches!(
+        s.model.borrow().project.tracks[0].routing.inserts[0].kind,
+        InsertKind::Delay { frames: 32 }
+    ));
+    s.toggle_insert(target, 0);
+    assert!(s.model.borrow().project.tracks[0].routing.inserts[0].bypass);
+    s.remove_insert(target, 1);
+    assert_eq!(s.model.borrow().project.tracks[0].routing.inserts.len(), 1);
+    for _ in 0..5 {
+        s.undo(false);
+    }
+    assert_snapshot(&s.model.borrow(), &before);
+    for _ in 0..5 {
+        s.undo(true);
+    }
+    assert_eq!(s.model.borrow().project.tracks[0].routing.inserts.len(), 1);
+    assert!(s.model.borrow().project.tracks[0].routing.inserts[0].bypass);
+}
+
+#[test]
+fn routing_bus_reference_repair_and_undo_restore_the_full_session() {
+    use resonara_core::Destination;
+    let s = Daw::new(project());
+    s.add_bus();
+    let aux = s.model.borrow().selected_bus.unwrap();
+    s.add_bus();
+    let group = s.model.borrow().selected_bus.unwrap();
+    s.set_output(RoutingTarget::Track(0), Destination::Bus(group));
+    s.set_output(RoutingTarget::Bus(aux), Destination::Bus(group));
+    s.add_send(RoutingTarget::Track(1), aux);
+    s.add_send(RoutingTarget::Bus(group), aux); // This creates a cycle and must be rejected.
+    assert!(s.status.get().to_lowercase().contains("cycle"));
+    assert!(
+        s.model
+            .borrow()
+            .project
+            .bus(group)
+            .unwrap()
+            .routing
+            .sends
+            .is_empty()
+    );
+    s.choose_bus(aux);
+    let before = Daw::snapshot(&s.model.borrow());
+    s.delete_bus(group);
+    let m = s.model.borrow();
+    assert_eq!(m.project.tracks[0].routing.output, Destination::Master);
+    assert_eq!(
+        m.project.bus(aux).unwrap().routing.output,
+        Destination::Master
+    );
+    assert!(m.project.bus(group).is_none());
+    m.project.validate().unwrap();
+    drop(m);
+    s.undo(false);
+    assert_snapshot(&s.model.borrow(), &before);
+    s.delete_bus(aux);
+    assert!(s.model.borrow().project.tracks[1].routing.sends.is_empty());
+    s.undo(false);
+    assert_snapshot(&s.model.borrow(), &before);
+}
+
+#[test]
+fn routing_live_bus_controls_keep_engine_and_coalesce_history() {
+    let s = Daw::new(project());
+    s.add_bus();
+    let id = s.model.borrow().selected_bus.unwrap();
+    s.add_send(RoutingTarget::Track(0), id);
+    s.play();
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    let previous = s.model.borrow().undo.len();
+    s.bus_mix(id, Some(0.6), Some(-0.25), false);
+    s.bus_mix(id, Some(0.4), Some(0.25), false);
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    assert_eq!(
+        f32::from_bits(controls.buses[0].gain.load(Ordering::Relaxed)),
+        0.4
+    );
+    assert_eq!(
+        f32::from_bits(controls.buses[0].pan.load(Ordering::Relaxed)),
+        0.25
+    );
+    s.finish_mix();
+    assert_eq!(s.model.borrow().undo.len(), previous + 1);
+    s.bus_mix(id, None, None, true);
+    assert!(controls.buses[0].mute.load(Ordering::Relaxed));
+    s.undo(false);
+    assert!(!s.model.borrow().project.bus(id).unwrap().mute);
+    s.undo(false);
+    assert_eq!(s.model.borrow().project.bus(id).unwrap().gain, 1.);
+}
+
+#[test]
+fn routing_invalid_and_repeated_edits_do_not_stop_playback_or_add_history() {
+    use resonara_core::Destination;
+    let s = Daw::new(project());
+    s.add_bus();
+    let id = s.model.borrow().selected_bus.unwrap();
+    s.play();
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    let before = Daw::snapshot(&s.model.borrow());
+    let undo = s.model.borrow().undo.len();
+    s.set_output(RoutingTarget::Bus(id), Destination::Bus(id));
+    assert!(s.status.get().to_lowercase().contains("cycle"));
+    assert_snapshot(&s.model.borrow(), &before);
+    s.set_output(RoutingTarget::Track(0), Destination::Master);
+    s.move_insert(RoutingTarget::Track(0), 0, -1);
+    assert_eq!(s.model.borrow().undo.len(), undo);
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+}
+
+#[test]
+fn routing_insert_parameter_rejects_invalid_input_and_cancel_is_clean() {
+    use resonara_core::InsertKind;
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    s.add_insert(target, InsertKind::OnePole { coefficient: 0.5 });
+    let before = Daw::snapshot(&s.model.borrow());
+    s.edit_insert_value(target, 0);
+    s.routing_value.set("NaN".into());
+    s.submit_insert_value(target, 0);
+    assert!(s.dialog.get() == Dialog::InsertValue(target, 0));
+    assert!(!s.dialog_error.get().is_empty());
+    assert_snapshot(&s.model.borrow(), &before);
+    s.handle_key(KeyEvent::Pressed {
+        keycode: KeyCode::Escape,
+        modifiers: KeyModifiers::default(),
+    });
+    assert!(s.dialog.get() == Dialog::None);
+    assert_snapshot(&s.model.borrow(), &before);
+    s.edit_insert_value(target, 0);
+    s.routing_value.set("0.75".into());
+    s.submit_insert_value(target, 0);
+    assert!(s.dialog.get() == Dialog::None);
+    assert!(matches!(
+        s.model.borrow().project.tracks[0].routing.inserts[0].kind,
+        InsertKind::OnePole { coefficient: 0.75 }
+    ));
+    s.undo(false);
+    assert_snapshot(&s.model.borrow(), &before);
+}
+
+#[test]
+fn routing_save_open_and_export_use_the_same_session_graph() {
+    use resonara_core::{Destination, InsertKind};
+    let temp = Temp::new();
+    let s = Daw::new(project());
+    s.add_bus();
+    let id = s.model.borrow().selected_bus.unwrap();
+    s.set_output(RoutingTarget::Track(0), Destination::Bus(id));
+    s.add_insert(RoutingTarget::Bus(id), InsertKind::Gain { gain: 0.4 });
+    s.add_send(RoutingTarget::Track(1), id);
+    s.edit_send(RoutingTarget::Track(1), 0, routing::SendEdit::PrePost);
+    let expected = s.model.borrow().project.clone();
+    let saved = temp.0.join("routing.json");
+    submit(&s, FileAction::Save, &saved);
+    finish_io(&s);
+    assert_project(&Project::load(&saved).unwrap(), &expected);
+    let output = temp.0.join("routing.wav");
+    submit(&s, FileAction::Export, &output);
+    finish_io(&s);
+    assert!(output.metadata().unwrap().len() > 100);
+    s.delete_bus(id);
+    submit(&s, FileAction::Open, &saved);
+    finish_io(&s);
+    assert_project(&s.model.borrow().project, &expected);
+    assert!(s.model.borrow().selected_bus.is_none());
+}
+
+#[test]
+fn routing_bus_selection_never_deletes_or_splits_a_hidden_track() {
+    let s = Daw::new(project());
+    s.add_bus();
+    let id = s.model.borrow().selected_bus.unwrap();
+    let before = Daw::snapshot(&s.model.borrow());
+    s.delete(false);
+    s.delete(true);
+    s.duplicate();
+    s.split();
+    s.trim_range();
+    assert_snapshot(&s.model.borrow(), &before);
+    s.handle_key(KeyEvent::Pressed {
+        keycode: KeyCode::Char('m'),
+        modifiers: KeyModifiers::default(),
+    });
+    assert!(s.model.borrow().project.bus(id).unwrap().mute);
+    assert!(!s.model.borrow().project.tracks[0].mute);
+}
+
+#[test]
+fn routing_busy_state_rejects_bus_and_insert_mutations() {
+    use resonara_core::InsertKind;
+    let s = Daw::new(project());
+    let before = Daw::snapshot(&s.model.borrow());
+    let (_tx, rx) = mpsc::channel();
+    s.model.borrow_mut().io = Some(rx);
+    s.add_bus();
+    s.add_insert(RoutingTarget::Track(0), InsertKind::Gain { gain: 0.5 });
+    assert_snapshot(&s.model.borrow(), &before);
+    assert!(s.model.borrow().undo.is_empty());
+}
+
+#[test]
+fn routing_native_slots_dispatch_picker_add_and_bypass_without_button_clutter() {
+    wait_for_test_font();
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    let build = || {
+        let mut tree = scarlet_ui::ElementTree::new();
+        tree.set_root(
+            s.routing_rack(&s.model.borrow().project, target)
+                .create_element(),
+        );
+        tree.layout(scarlet_ui::LayoutConstraints::tight(190., 700.));
+        let mut slots = Vec::new();
+        control_bounds(
+            tree.root().unwrap(),
+            Point::ZERO,
+            "::insert_slot::SlotRender",
+            &mut slots,
+        );
+        let mut buttons = Vec::new();
+        control_bounds(
+            tree.root().unwrap(),
+            Point::ZERO,
+            "::views::button::ButtonRenderObject",
+            &mut buttons,
+        );
+        assert_eq!(
+            buttons.len(),
+            1,
+            "Only the output selector remains a persistent button"
+        );
+        (tree, slots)
+    };
+    let (mut tree, slots) = build();
+    assert_eq!(slots.len(), 1);
+    let (origin, size) = slots[0];
+    dispatched_click(
+        &mut tree,
+        (origin.x + 50.) as i32,
+        (origin.y + size.height / 2.) as i32,
+    );
+    assert!(s.dialog.get() == Dialog::InsertPicker(target));
+    let mut picker = scarlet_ui::ElementTree::new();
+    picker.set_root(s.dialog_view().create_element());
+    picker.layout(scarlet_ui::LayoutConstraints::tight(1280., 790.));
+    let mut buttons = Vec::new();
+    control_bounds(
+        picker.root().unwrap(),
+        Point::ZERO,
+        "::views::button::ButtonRenderObject",
+        &mut buttons,
+    );
+    let (origin, size) = buttons[0];
+    dispatched_click(
+        &mut picker,
+        (origin.x + size.width / 2.) as i32,
+        (origin.y + size.height / 2.) as i32,
+    );
+    assert_eq!(s.model.borrow().project.tracks[0].routing.inserts.len(), 1);
+    let (mut tree, slots) = build();
+    assert_eq!(slots.len(), 2);
+    let (origin, size) = slots[0];
+    dispatched_click(
+        &mut tree,
+        (origin.x + size.width - 31.) as i32,
+        (origin.y + size.height / 2.) as i32,
+    );
+    assert!(s.model.borrow().project.tracks[0].routing.inserts[0].bypass);
+    for (origin, size) in slots {
+        assert!(origin.x >= -0.01 && origin.x + size.width <= 190.01);
+    }
+}
+
+#[test]
+fn routing_repeated_parameter_apply_preserves_exact_value_and_audio() {
+    use resonara_core::InsertKind;
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    s.add_insert(target, InsertKind::Gain { gain: 0.25 });
+    s.play();
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    let before = Daw::snapshot(&s.model.borrow());
+    let undo = s.model.borrow().undo.len();
+    s.edit_insert_value(target, 0);
+    s.submit_insert_value(target, 0);
+    s.move_insert(target, 1, -1);
+    assert_snapshot(&s.model.borrow(), &before);
+    assert_eq!(s.model.borrow().undo.len(), undo);
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+}
+
+#[test]
+fn routing_clicking_a_clip_leaves_bus_selection_and_allows_track_edits() {
+    let s = Daw::new(project());
+    s.add_bus();
+    assert!(s.model.borrow().selected_bus.is_some());
+    s.timeline_event(0, &press(100));
+    assert!(s.model.borrow().selected_bus.is_none());
+    assert_eq!(s.model.borrow().clip, Some(0));
+    s.cancel_drag();
+    s.delete(false);
+    assert!(s.model.borrow().project.tracks[0].clips.is_empty());
+}
+
+#[test]
+fn routing_add_bus_budget_failure_keeps_project_and_history_clean() {
+    use resonara_core::{Insert, InsertKind};
+    let mut project = project();
+    project.tracks[0].routing.inserts = vec![
+        Insert {
+            kind: InsertKind::Gain { gain: 1. },
+            bypass: false
+        };
+        4090
+    ];
+    project.validate_routing().unwrap();
+    let s = Daw::new(project);
+    let before = Daw::snapshot(&s.model.borrow());
+    s.add_bus();
+    assert_snapshot(&s.model.borrow(), &before);
+    assert!(s.model.borrow().undo.is_empty());
+    assert!(s.status.get().contains("Could not add aux channel"));
+}
+
+#[test]
+fn routing_full_native_tree_aux_header_selects_its_inspector() {
+    wait_for_test_font();
+    let mut project = project();
+    project.tracks.push(project.tracks[0].clone());
+    let s = Daw::new(project);
+    s.add_bus();
+    let aux = s.model.borrow().selected_bus.unwrap();
+    s.add_bus();
+    s.choose(0, None);
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1280., 790.));
+    let mut buttons = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::views::button::ButtonRenderObject",
+        &mut buttons,
+    );
+    let (origin, size) = buttons
+        .into_iter()
+        .find(|(origin, size)| {
+            origin.x >= (1280. - 4.) * s.inspector_fraction.get() + 4. + 300.
+                && origin.x < (1280. - 4.) * s.inspector_fraction.get() + 4. + 400.
+                && origin.y > 350.
+                && size.width >= 90.
+                && size.height == 24.
+        })
+        .expect("Aux mixer header");
+    eprintln!("Aux header bounds {origin:?} {size:?}");
+    let hit = dispatched_click(
+        &mut tree,
+        (origin.x + size.width / 2.) as i32,
+        (origin.y + size.height / 2.) as i32,
+    );
+    assert_eq!(s.model.borrow().selected_bus, Some(aux), "{hit}");
+    assert_eq!(s.track_name.get(), "Aux 1");
+    assert!(s.inspector.get());
+}
+
+#[test]
+fn routing_new_bus_assignments_create_one_aux_and_are_atomic_undo_steps() {
+    use resonara_core::Destination;
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    let before = Daw::snapshot(&s.model.borrow());
+    s.create_aux_route(Some(RoutingMenu::Output(target)));
+    let first = s.model.borrow().project.buses[0].id;
+    assert_eq!(
+        s.model.borrow().project.tracks[0].routing.output,
+        Destination::Bus(first)
+    );
+    assert!(
+        s.model.borrow().selected_bus.is_none(),
+        "Keep the source selected after routing"
+    );
+    assert_eq!(s.model.borrow().undo.len(), 1);
+    s.undo(false);
+    assert_snapshot(&s.model.borrow(), &before);
+    s.undo(true);
+    let routed = Daw::snapshot(&s.model.borrow());
+    s.create_aux_route(Some(RoutingMenu::Send(target)));
+    let m = s.model.borrow();
+    assert_eq!(m.project.buses.len(), 2);
+    assert_eq!(m.project.tracks[0].routing.output, Destination::Bus(first));
+    let send = &m.project.tracks[0].routing.sends[0];
+    assert_eq!(send.target, m.project.buses[1].id);
+    assert!(!send.pre_fader);
+    assert!(send.enabled);
+    m.project.validate_routing().unwrap();
+    drop(m);
+    s.undo(false);
+    assert_snapshot(&s.model.borrow(), &routed);
+}
+
+#[test]
+fn routing_native_new_bus_choice_creates_and_connects_receiver() {
+    wait_for_test_font();
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    s.routing_menu.set(Some(RoutingMenu::Output(target)));
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(
+        s.routing_rack(&s.model.borrow().project, target)
+            .create_element(),
+    );
+    tree.layout(scarlet_ui::LayoutConstraints::tight(190., 700.));
+    let mut buttons = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::views::button::ButtonRenderObject",
+        &mut buttons,
+    );
+    let (origin, size) = buttons[2]; // Output slot, Stereo Out, New Bus → Aux.
+    dispatched_click(
+        &mut tree,
+        (origin.x + size.width / 2.) as i32,
+        (origin.y + size.height / 2.) as i32,
+    );
+    let m = s.model.borrow();
+    assert_eq!(m.project.buses.len(), 1);
+    assert_eq!(m.project.buses[0].name, "Aux 1");
+    assert_eq!(
+        m.project.tracks[0].routing.output,
+        resonara_core::Destination::Bus(m.project.buses[0].id)
+    );
+    assert!(s.routing_menu.get().is_none());
+}
+
+#[test]
+fn natural_audio_completion_retains_output_until_explicit_transport_action() {
+    let app = Daw::new(project());
+    app.play();
+    assert!(app.model.borrow().audio.is_some());
+    app.finish_audio(false, true);
+    assert!(app.model.borrow().audio.is_none());
+    assert!(app.model.borrow().retired_audio.is_some());
+    app.play();
+    assert!(app.model.borrow().audio.is_some());
+    assert!(app.model.borrow().retired_audio.is_none());
+    app.finish_audio(false, true);
+    app.stop_audio(true);
+    assert!(app.model.borrow().audio.is_none());
+    assert!(app.model.borrow().retired_audio.is_none());
+}
+
+#[test]
+fn insert_context_keyboard_moves_removes_and_undoes_without_hidden_controls() {
+    use resonara_core::InsertKind;
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    s.add_insert(target, InsertKind::Gain { gain: 0.5 });
+    s.add_insert(target, InsertKind::Delay { frames: 12 });
+    let before = Daw::snapshot(&s.model.borrow());
+    s.open_insert_actions(target, 1);
+    s.menu_choice.set(2);
+    s.handle_key(KeyEvent::Pressed {
+        keycode: KeyCode::Enter,
+        modifiers: KeyModifiers::default(),
+    });
+    assert!(matches!(
+        s.model.borrow().project.tracks[0].routing.inserts[0].kind,
+        InsertKind::Delay { .. }
+    ));
+    assert!(s.dialog.get() == Dialog::None);
+    s.undo(false);
+    assert_snapshot(&s.model.borrow(), &before);
+    s.open_insert_actions(target, 1);
+    s.insert_action(target, 1, 4);
+    assert_eq!(s.model.borrow().project.tracks[0].routing.inserts.len(), 1);
+    s.undo(false);
+    assert_snapshot(&s.model.borrow(), &before);
+    s.open_insert_picker(target);
+    s.handle_key(KeyEvent::Pressed {
+        keycode: KeyCode::Escape,
+        modifiers: KeyModifiers::default(),
+    });
+    assert!(s.dialog.get() == Dialog::None);
+    assert_snapshot(&s.model.borrow(), &before);
+}
+
+#[test]
+fn insert_parameter_popup_outside_click_cancels_without_editing_session() {
+    use resonara_core::InsertKind;
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    s.add_insert(target, InsertKind::Gain { gain: 0.5 });
+    let before = Daw::snapshot(&s.model.borrow());
+    s.open_insert_editor(target, 0);
+    s.routing_value.set("-30".into());
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1280., 790.));
+    dispatched_click(&mut tree, 1200, 50);
+    assert!(s.dialog.get() == Dialog::None);
+    assert_snapshot(&s.model.borrow(), &before);
+}
+
+#[test]
+#[ignore = "requires the built native CLAP fixture; set RESONARA_CLAP_LIBRARY"]
+fn clap_generic_editor_roundtrips_opaque_state_and_undoes_parameter_change() {
+    use resonara_core::InsertKind;
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    let plugin = resonara_core::plugins::load_bundled_gain().unwrap();
+    s.add_insert(target, InsertKind::Clap { plugin });
+    let before = Daw::snapshot(&s.model.borrow());
+    s.open_insert_editor(target, 0);
+    assert!(s.dialog.get() == Dialog::ClapEditor(target, 0));
+    assert_eq!(s.plugin_fields.borrow().len(), 1);
+    (s.plugin_knobs.borrow()[0].1.changed)(-0.75);
+    assert_eq!(s.plugin_fields.borrow()[0].1.get(), "0.25");
+    s.submit_clap_parameters(target, 0);
+    assert!(s.dialog.get() == Dialog::None, "{}", s.dialog_error.get());
+    if let InsertKind::Clap { plugin } = &s.model.borrow().project.tracks[0].routing.inserts[0].kind
+    {
+        assert_eq!(plugin.parameters[0].value, 0.25);
+        assert_eq!(plugin.state.len(), 16);
+    } else {
+        panic!("Expected CLAP insert");
+    }
+    let temp = Temp::new();
+    let path = temp.0.join("clap-session.json");
+    s.model.borrow().project.save(&path).unwrap();
+    assert_project(&Project::load(&path).unwrap(), &s.model.borrow().project);
+    s.undo(false);
+    assert_snapshot(&s.model.borrow(), &before);
+    s.open_insert_editor(target, 0);
+    s.plugin_fields.borrow()[0].1.set("NaN".into());
+    s.submit_clap_parameters(target, 0);
+    assert!(s.dialog.get() == Dialog::ClapEditor(target, 0));
+    assert_snapshot(&s.model.borrow(), &before);
+}
+
+#[test]
+#[ignore = "requires external-gain.clap in CLAP_PATH (native gain fixture)"]
+fn installed_clap_picker_edit_bypass_and_undo_keep_playback_running() {
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    s.play();
+    assert_playback_advances(&s, 1700);
+    s.open_insert_picker(target);
+    s.menu_choice.set(5);
+    s.handle_insert_popup_key(KeyCode::Enter);
+    assert!(s.dialog.get() == Dialog::ClapPicker(target));
+    assert_playback_advances(&s, 17);
+    let index = s
+        .plugin_catalog
+        .borrow()
+        .effects
+        .iter()
+        .position(|c| c.library == "external-gain.clap")
+        .unwrap();
+    s.menu_choice.set(index);
+    s.handle_insert_popup_key(KeyCode::Enter);
+    assert!(s.dialog.get() == Dialog::None, "{}", s.dialog_error.get());
+    assert_playback_advances(&s, 17);
+    s.open_insert_editor(target, 0);
+    s.plugin_fields.borrow()[0].1.set("0.25".into());
+    s.submit_clap_parameters(target, 0);
+    assert!(s.dialog.get() == Dialog::None, "{}", s.dialog_error.get());
+    assert_playback_advances(&s, 17);
+    s.toggle_insert(target, 0);
+    assert_playback_advances(&s, 17);
+    s.undo(false);
+    assert_playback_advances(&s, 17);
+    s.undo(false);
+    assert_playback_advances(&s, 17);
+    let m = s.model.borrow();
+    if let resonara_core::InsertKind::Clap { plugin } = &m.project.tracks[0].routing.inserts[0].kind
+    {
+        assert_eq!(plugin.library, "external-gain.clap");
+        assert_eq!(plugin.parameters[0].value, 1.);
+    } else {
+        panic!("CLAP insert missing");
+    }
+}
+
+#[test]
+fn clap_editor_hides_internal_parameters_and_keeps_read_only_values_visible() {
+    wait_for_test_font();
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    let parameters = (0..3)
+        .map(|id| resonara_core::ClapParameter {
+            id,
+            name: ["Editable", "Read only", "Internal"][id as usize].into(),
+            min: 0.,
+            max: 2.,
+            value: 1.,
+            stepped: false,
+            read_only: id == 1,
+            hidden: id == 2,
+        })
+        .collect();
+    s.add_insert(
+        target,
+        resonara_core::InsertKind::Clap {
+            plugin: resonara_core::ClapInsert {
+                library: "missing-editor-fixture.clap".into(),
+                plugin_id: "org.resonara.test.editor".into(),
+                name: "Editor fixture".into(),
+                state: vec![],
+                parameters,
+            },
+        },
+    );
+    s.open_insert_editor(target, 0);
+    assert_eq!(
+        s.plugin_fields
+            .borrow()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        vec![0]
+    );
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.dialog_view().create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1280., 790.));
+    let mut text = Vec::new();
+    text_layouts(tree.root().unwrap(), Point::ZERO, &mut text);
+    assert!(text.iter().any(|(text, _, _)| text == "Read only"));
+    assert!(!text.iter().any(|(text, _, _)| text == "Internal"));
+    let mut fields = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::views::text_field::TextFieldRenderObject",
+        &mut fields,
+    );
+    assert_eq!(fields.len(), 1);
+    let mut knobs = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::knob::KnobRender",
+        &mut knobs,
+    );
+    assert_eq!(knobs.len(), 1, "Only the editable parameter gets a knob");
+}
+
+#[test]
+fn full_height_inspector_is_outside_right_mixer_and_has_one_editable_name() {
+    wait_for_test_font();
+    let s = Daw::new(project());
+    for mixer in [true, false] {
+        s.panel_visible.set(mixer);
+        let mut tree = scarlet_ui::ElementTree::new();
+        tree.set_root(s.create_element());
+        tree.layout(scarlet_ui::LayoutConstraints::tight(1280., 790.));
+        let mut faders = Vec::new();
+        control_bounds(
+            tree.root().unwrap(),
+            Point::ZERO,
+            "::fader::FaderRender",
+            &mut faders,
+        );
+        let left: Vec<_> = faders
+            .iter()
+            .filter(|(origin, _)| origin.x < 224.)
+            .collect();
+        assert_eq!(left.len(), 1);
+        assert!(
+            (left[0].0.y + left[0].1.height - 724.).abs() < 1.,
+            "Selected fader remains at inspector bottom: {:?}",
+            left[0]
+        );
+        let right: Vec<_> = faders
+            .iter()
+            .filter(|(origin, _)| origin.x >= 224.)
+            .collect();
+        assert_eq!(right.len(), if mixer { 3 } else { 0 });
+        let mut panel = scarlet_ui::ElementTree::new();
+        panel.set_root(s.inspector_panel().create_element());
+        panel.layout(scarlet_ui::LayoutConstraints::tight(224., 616.));
+        let mut fields = Vec::new();
+        control_bounds(
+            panel.root().unwrap(),
+            Point::ZERO,
+            "::views::text_field::TextFieldRenderObject",
+            &mut fields,
+        );
+        assert_eq!(
+            fields.len(),
+            1,
+            "One editable name, no duplicate heading or default range fields"
+        );
+        let mut text = Vec::new();
+        text_layouts(panel.root().unwrap(), Point::ZERO, &mut text);
+        assert!(!text.iter().any(|(text, _, _)| text == "Track 0"));
+    }
+}
+
+#[test]
+fn aux_inspector_fader_shares_gain_state_and_one_gesture_undo() {
+    let s = Daw::new(project());
+    s.add_bus();
+    let id = s.model.borrow().selected_bus.unwrap();
+    let before = Daw::snapshot(&s.model.borrow());
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.inspector_panel().create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(224., 616.));
+    let mut faders = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::fader::FaderRender",
+        &mut faders,
+    );
+    assert_eq!(faders.len(), 1);
+    let (origin, size) = faders[0];
+    let geom = fader::Geometry::new(size);
+    dispatched_click(
+        &mut tree,
+        (origin.x + geom.axis) as i32,
+        (origin.y + geom.y(0.5)) as i32,
+    );
+    s.finish_mix();
+    let m = s.model.borrow();
+    assert_ne!(m.project.bus(id).unwrap().gain, 1.);
+    assert_eq!(
+        m.project.bus(id).unwrap().gain,
+        m.bus_channels[0].gain.get()
+    );
+    drop(m);
+    s.undo(false);
+    assert_snapshot(&s.model.borrow(), &before);
+}
+
+#[test]
+fn inspector_and_mixer_faders_have_identical_travel_at_all_layout_sizes() {
+    wait_for_test_font();
+    for (width, height) in [(1000., 790.), (1188., 790.), (1280., 1000.)] {
+        let s = Daw::new(project());
+        s.size.set(Size::new(width, height));
+        for fraction in [0., 0.5, 0.9] {
+            s.panel_fraction.set(fraction);
+            let mut tree = scarlet_ui::ElementTree::new();
+            for _ in 0..4 {
+                tree.set_root(s.create_element());
+                tree.layout(scarlet_ui::LayoutConstraints::tight(width, height));
+            }
+            let mut faders = Vec::new();
+            control_bounds(
+                tree.root().unwrap(),
+                Point::ZERO,
+                "::fader::FaderRender",
+                &mut faders,
+            );
+            assert_eq!(faders.len(), 4);
+            let inspector = &faders[0];
+            let expected = inspector.1.height;
+            for (origin, size) in &faders[1..] {
+                assert!(
+                    (size.height - expected).abs() < 0.01,
+                    "{width}x{height} split{fraction}: inspector {:?}, mixer {:?}",
+                    inspector,
+                    (origin, size)
+                );
+                let a = fader::Geometry::new(inspector.1);
+                let b = fader::Geometry::new(*size);
+                assert!(((a.bottom - a.top) - (b.bottom - b.top)).abs() < 0.01);
+            }
+            assert!((expected - s.mixer_fader_height()).abs() < 0.01);
+        }
+    }
+}
+
+#[test]
+fn insert_slots_are_contiguous_including_the_empty_add_slot() {
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    s.add_insert(target, resonara_core::InsertKind::Gain { gain: 1. });
+    s.add_insert(target, resonara_core::InsertKind::Delay { frames: 12 });
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(
+        s.routing_rack(&s.model.borrow().project, target)
+            .create_element(),
+    );
+    tree.layout(scarlet_ui::LayoutConstraints::tight(190., 700.));
+    let mut slots = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::insert_slot::SlotRender",
+        &mut slots,
+    );
+    assert_eq!(slots.len(), 3);
+    for pair in slots.windows(2) {
+        assert!((pair[0].0.y + pair[0].1.height - pair[1].0.y).abs() < 0.01);
+    }
+}
+
+#[test]
+fn shared_inspector_controls_match_mixer_pan_and_fader_geometry() {
+    let s = Daw::new(project());
+    let measure = |view: AnyView, size: Size| {
+        let mut tree = scarlet_ui::ElementTree::new();
+        tree.set_root(view.create_element());
+        tree.layout(scarlet_ui::LayoutConstraints::tight(
+            size.width,
+            size.height,
+        ));
+        let mut faders = Vec::new();
+        let mut knobs = Vec::new();
+        control_bounds(
+            tree.root().unwrap(),
+            Point::ZERO,
+            "::fader::FaderRender",
+            &mut faders,
+        );
+        control_bounds(
+            tree.root().unwrap(),
+            Point::ZERO,
+            "::knob::KnobRender",
+            &mut knobs,
+        );
+        (faders[0], knobs[0])
+    };
+    let (a, ap) = measure(s.inspector_panel(), Size::new(224., 616.));
+    let (b, bp) = measure(s.mixer(), Size::new(900., 382.));
+    assert_eq!(a.1, b.1);
+    assert_eq!(ap.1, bp.1);
+    assert!(((ap.0.x - a.0.x) - (bp.0.x - b.0.x)).abs() < 0.01);
+    assert!(((ap.0.y - a.0.y) - (bp.0.y - b.0.y)).abs() < 0.01);
+}
+
+#[test]
+fn live_send_knob_levels_keep_engine_and_coalesce_undo() {
+    let s = Daw::new(project());
+    s.add_bus();
+    let id = s.model.borrow().selected_bus.unwrap();
+    let target = RoutingTarget::Track(0);
+    s.add_send(target, id);
+    s.choose(0, None);
+    let before = Daw::snapshot(&s.model.borrow());
+    let count = s.model.borrow().undo.len();
+    s.play();
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    s.send_gain(target, 0, 0.4);
+    s.send_gain(target, 0, 0.7);
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    assert_eq!(s.model.borrow().undo.len(), count);
+    assert_eq!(
+        f32::from_bits(controls.send_gains[0].load(Ordering::Relaxed)),
+        0.7
+    );
+    s.finish_mix();
+    assert_eq!(s.model.borrow().undo.len(), count + 1);
+    s.undo(false);
+    assert_snapshot(&s.model.borrow(), &before);
+}
+
+#[test]
+fn native_send_knob_cancel_restores_value_without_history_or_stopping_audio() {
+    let s = Daw::new(project());
+    s.add_bus();
+    let id = s.model.borrow().selected_bus.unwrap();
+    let target = RoutingTarget::Track(0);
+    s.add_send(target, id);
+    s.choose(0, None);
+    s.play();
+    let before = Daw::snapshot(&s.model.borrow());
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    let count = s.model.borrow().undo.len();
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(
+        s.routing_rack(&s.model.borrow().project, target)
+            .create_element(),
+    );
+    tree.layout(scarlet_ui::LayoutConstraints::tight(190., 700.));
+    let mut knobs = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::send_knob::SendRender",
+        &mut knobs,
+    );
+    assert_eq!(knobs.len(), 1);
+    let (origin, size) = knobs[0];
+    let x = (origin.x + size.width / 2.) as i32;
+    let y = (origin.y + size.height / 2.) as i32;
+    let mut dispatcher = scarlet_ui::EventDispatcher::new();
+    dispatcher.dispatch(&mut tree, &Event::Mouse(MouseEvent::Moved { x, y }));
+    dispatcher.dispatch(
+        &mut tree,
+        &Event::Mouse(MouseEvent::ButtonPressed {
+            button: MouseButton::Left,
+            x,
+            y,
+            click_count: 1,
+        }),
+    );
+    dispatcher.dispatch(&mut tree, &Event::Mouse(MouseEvent::Moved { x, y: y - 30 }));
+    assert_ne!(
+        s.model.borrow().project.tracks[0].routing.sends[0].gain,
+        0.25
+    );
+    dispatcher.dispatch(
+        &mut tree,
+        &Event::Keyboard(KeyEvent::Pressed {
+            keycode: KeyCode::Escape,
+            modifiers: KeyModifiers::default(),
+        }),
+    );
+    s.finish_mix();
+    assert_snapshot(&s.model.borrow(), &before);
+    assert_eq!(s.model.borrow().undo.len(), count);
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+}
+
+#[test]
+fn compact_send_rack_has_contiguous_rows_tiny_knob_and_no_add_button() {
+    let s = Daw::new(project());
+    s.add_bus();
+    let id = s.model.borrow().selected_bus.unwrap();
+    let target = RoutingTarget::Track(0);
+    s.add_send(target, id);
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(
+        s.routing_rack(&s.model.borrow().project, target)
+            .create_element(),
+    );
+    tree.layout(scarlet_ui::LayoutConstraints::tight(190., 700.));
+    let mut knobs = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::send_knob::SendRender",
+        &mut knobs,
+    );
+    assert_eq!(knobs.len(), 1);
+    assert_eq!(knobs[0].1, Size::new(24., 24.));
+    let mut buttons = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::views::button::ButtonRenderObject",
+        &mut buttons,
+    );
+    assert_eq!(
+        buttons.len(),
+        1,
+        "Only Output, never add/mode/remove buttons"
+    );
+    fn slot_bounds(element: &dyn scarlet_ui::Element, parent: Point, out: &mut Vec<(Point, Size)>) {
+        let origin = Point::new(
+            parent.x + element.position().x,
+            parent.y + element.position().y,
+        );
+        if element
+            .type_name_debug()
+            .contains("::send_slot::SlotRender")
+        {
+            out.push((origin, element.bounds().size));
+        }
+        for child in element.children() {
+            slot_bounds(child.as_ref(), origin, out);
+        }
+    }
+    let mut slots = Vec::new();
+    slot_bounds(tree.root().unwrap(), Point::ZERO, &mut slots);
+    assert_eq!(slots.len(), 2);
+    assert_eq!(slots[0].1.height, 26.);
+    assert!((slots[0].0.y + 26. - slots[1].0.y).abs() < 0.01);
+    dispatched_click(
+        &mut tree,
+        (slots[1].0.x + 40.) as i32,
+        (slots[1].0.y + 13.) as i32,
+    );
+    assert!(s.dialog.get() == Dialog::SendPicker(target, None));
+}
+
+#[test]
+fn send_menu_retargets_and_creates_receiver_as_single_undo_step() {
+    let s = Daw::new(project());
+    s.add_bus();
+    let first = s.model.borrow().selected_bus.unwrap();
+    s.add_bus();
+    let second = s.model.borrow().selected_bus.unwrap();
+    let target = RoutingTarget::Track(0);
+    s.add_send(target, first);
+    s.choose(0, None);
+    let before = Daw::snapshot(&s.model.borrow());
+    s.open_send_picker(target, Some(0));
+    s.choose_send_destination(target, Some(0), 1);
+    assert_eq!(
+        s.model.borrow().project.tracks[0].routing.sends[0].target,
+        second
+    );
+    assert_eq!(s.model.borrow().project.tracks[0].routing.sends.len(), 1);
+    s.undo(false);
+    assert_snapshot(&s.model.borrow(), &before);
+    s.open_send_picker(target, Some(0));
+    s.choose_send_destination(target, Some(0), 2);
+    assert_eq!(s.model.borrow().project.buses.len(), 3);
+    assert_eq!(s.model.borrow().project.tracks[0].routing.sends.len(), 1);
+    s.undo(false);
+    assert_snapshot(&s.model.borrow(), &before);
+}
+
+#[test]
+fn send_level_popup_preserves_exact_noop_and_updates_live_with_undo() {
+    let s = Daw::new(project());
+    s.add_bus();
+    let id = s.model.borrow().selected_bus.unwrap();
+    let target = RoutingTarget::Track(0);
+    s.add_send(target, id);
+    s.choose(0, None);
+    s.play();
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    let before = Daw::snapshot(&s.model.borrow());
+    s.send_action(target, 0, 0);
+    s.submit_send_level(target, 0);
+    assert_snapshot(&s.model.borrow(), &before);
+    s.send_action(target, 0, 0);
+    s.routing_value.set("-6".into());
+    s.submit_send_level(target, 0);
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    s.undo(false);
+    assert_snapshot(&s.model.borrow(), &before);
+}
+
+#[test]
+fn send_popup_captures_keys_instead_of_adjusting_the_underlying_knob() {
+    let s = Daw::new(project());
+    s.add_bus();
+    let id = s.model.borrow().selected_bus.unwrap();
+    let target = RoutingTarget::Track(0);
+    s.add_send(target, id);
+    s.choose(0, None);
+    let _ = s.routing_rack(&s.model.borrow().project, target);
+    s.send_controls
+        .borrow()
+        .values()
+        .next()
+        .unwrap()
+        .focused
+        .set(true);
+    s.open_send_actions(target, 0);
+    let before = Daw::snapshot(&s.model.borrow());
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1280., 790.));
+    let mut dispatcher = scarlet_ui::EventDispatcher::new();
+    dispatcher.dispatch(
+        &mut tree,
+        &Event::Keyboard(KeyEvent::Pressed {
+            keycode: KeyCode::Down,
+            modifiers: KeyModifiers::default(),
+        }),
+    );
+    assert_eq!(s.menu_choice.get(), 1);
+    assert_snapshot(&s.model.borrow(), &before);
+    dispatcher.dispatch(
+        &mut tree,
+        &Event::Keyboard(KeyEvent::Pressed {
+            keycode: KeyCode::Escape,
+            modifiers: KeyModifiers::default(),
+        }),
+    );
+    assert!(s.dialog.get() == Dialog::None);
+    assert_snapshot(&s.model.borrow(), &before);
+}
+
+#[test]
+fn empty_send_slot_keeps_keyboard_focus_across_retained_rack_updates() {
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(
+        s.routing_rack(&s.model.borrow().project, target)
+            .create_element(),
+    );
+    tree.layout(scarlet_ui::LayoutConstraints::tight(190., 700.));
+    s.send_controls
+        .borrow()
+        .get(&(target, 0))
+        .unwrap()
+        .focused
+        .set(true);
+    let next = s.routing_rack(&s.model.borrow().project, target);
+    tree.root_mut().unwrap().update(&next);
+    tree.layout(scarlet_ui::LayoutConstraints::tight(190., 700.));
+    let mut dispatcher = scarlet_ui::EventDispatcher::new();
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Keyboard(KeyEvent::Pressed {
+            keycode: KeyCode::Enter,
+            modifiers: KeyModifiers::default(),
+        })
+    ));
+    assert!(s.dialog.get() == Dialog::SendPicker(target, None));
+    assert!(
+        !s.send_controls
+            .borrow()
+            .get(&(target, 0))
+            .unwrap()
+            .focused
+            .get()
+    );
+}
+
+#[test]
+fn region_metadata_precedes_channel_routing_and_never_interrupts_send_to_fader() {
+    wait_for_test_font();
+    let s = Daw::new(project());
+    let inspect = || {
+        let mut tree = scarlet_ui::ElementTree::new();
+        tree.set_root(s.inspector_panel().create_element());
+        tree.layout(scarlet_ui::LayoutConstraints::tight(224., 616.));
+        let mut text = Vec::new();
+        text_layouts(tree.root().unwrap(), Point::ZERO, &mut text);
+        fn button_labels(
+            element: &dyn scarlet_ui::Element,
+            parent: Point,
+            out: &mut Vec<(String, Point, Size)>,
+        ) {
+            let origin = Point::new(
+                parent.x + element.position().x,
+                parent.y + element.position().y,
+            );
+            if element
+                .type_name_debug()
+                .contains("::views::button::ButtonRenderObject")
+            {
+                let mut paint = scarlet_ui::renderer::PaintContext::new();
+                element.render_object().unwrap().paint(&mut paint, origin);
+                for command in paint.commands() {
+                    if let scarlet_ui::renderer::PaintCommand::DrawText { text, .. } = command {
+                        out.push((text.clone(), origin, element.bounds().size));
+                    }
+                }
+            }
+            for child in element.children() {
+                button_labels(child.as_ref(), origin, out);
+            }
+        }
+        button_labels(tree.root().unwrap(), Point::ZERO, &mut text);
+        let mut fields = Vec::new();
+        control_bounds(
+            tree.root().unwrap(),
+            Point::ZERO,
+            "::views::text_field::TextFieldRenderObject",
+            &mut fields,
+        );
+        let mut faders = Vec::new();
+        control_bounds(
+            tree.root().unwrap(),
+            Point::ZERO,
+            "::fader::FaderRender",
+            &mut faders,
+        );
+        (text, fields, faders)
+    };
+    let (text, fields, initial_faders) = inspect();
+    assert!(
+        !text
+            .iter()
+            .any(|(t, _, _)| t.starts_with("REGION") || t.contains("Region details"))
+    );
+    assert_eq!(fields.len(), 1);
+    s.choose(0, Some(0));
+    for expanded in [false, true] {
+        s.inspector_details.set(expanded);
+        let (text, fields, faders) = inspect();
+        let y = |name: &str| {
+            text.iter()
+                .find(|(t, _, _)| t.starts_with(name))
+                .unwrap_or_else(|| panic!("Missing {name}: {text:?}"))
+                .1
+                .y
+        };
+        assert!(y("REGION 1") < fields.last().unwrap().0.y);
+        assert!(fields.last().unwrap().0.y < y("OUTPUT"));
+        assert!(y("OUTPUT") < y("INSERTS") && y("INSERTS") < y("SENDS"));
+        assert_eq!(fields.len(), if expanded { 3 } else { 1 });
+        if expanded {
+            assert!(y("Start ") < y("OUTPUT"));
+            assert!(y("RANGE") < y("OUTPUT"));
+            assert!(fields[0].0.y < fields[2].0.y);
+            assert!(fields[1].0.y < fields[2].0.y);
+        }
+        assert_eq!(
+            faders, initial_faders,
+            "Expanding region metadata never reduces or moves the fader"
+        );
+        assert!(!text.iter().any(|(t, p, _)| p.y > y("SENDS")
+            && (t.starts_with("REGION") || t.starts_with("RANGE") || t.starts_with("Start "))));
+    }
+    s.add_bus();
+    let (text, fields, faders) = inspect();
+    assert!(!text.iter().any(|(t, _, _)| t.starts_with("REGION")));
+    assert_eq!(fields.len(), 1);
+    let inputs = text.iter().find(|(t, _, _)| t == "INPUTS").unwrap().1.y;
+    let output = text.iter().find(|(t, _, _)| t == "OUTPUT").unwrap().1.y;
+    assert!(inputs < output);
+    assert_eq!(faders, initial_faders);
+}
+
+#[test]
+fn shared_channel_mute_solo_groups_center_on_fader_axes_without_aux_label_offset() {
+    wait_for_test_font();
+    let s = Daw::new(project());
+    s.add_bus();
+    let aux = s.model.borrow().selected_bus.unwrap();
+    fn measure(
+        view: AnyView,
+        width: f32,
+        height: f32,
+    ) -> (Vec<(String, Point, Size)>, Vec<(Point, Size)>) {
+        let mut tree = scarlet_ui::ElementTree::new();
+        tree.set_root(view.create_element());
+        tree.layout(scarlet_ui::LayoutConstraints::tight(width, height));
+        fn controls(
+            e: &dyn scarlet_ui::Element,
+            parent: Point,
+            out: &mut Vec<(String, Point, Size)>,
+        ) {
+            let origin = Point::new(parent.x + e.position().x, parent.y + e.position().y);
+            if e.type_name_debug()
+                .contains("::views::button::ButtonRenderObject")
+            {
+                let mut paint = scarlet_ui::renderer::PaintContext::new();
+                e.render_object().unwrap().paint(&mut paint, origin);
+                for command in paint.commands() {
+                    if let scarlet_ui::renderer::PaintCommand::DrawText { text, .. } = command {
+                        if text == "M" || text == "S" {
+                            out.push((text.clone(), origin, e.bounds().size));
+                        }
+                    }
+                }
+            }
+            for child in e.children() {
+                controls(child.as_ref(), origin, out);
+            }
+        }
+        let mut buttons = Vec::new();
+        controls(tree.root().unwrap(), Point::ZERO, &mut buttons);
+        let mut faders = Vec::new();
+        control_bounds(
+            tree.root().unwrap(),
+            Point::ZERO,
+            "::fader::FaderRender",
+            &mut faders,
+        );
+        (buttons, faders)
+    }
+    let check = |buttons: &[(String, Point, Size)], fader: &(Point, Size), count: usize| {
+        assert_eq!(buttons.len(), count);
+        let left = buttons.first().unwrap().1.x;
+        let last = buttons.last().unwrap();
+        let right = last.1.x + last.2.width;
+        let axis = fader.0.x + fader::Geometry::new(fader.1).axis;
+        assert!(
+            ((left + right) / 2. - axis).abs() < 0.01,
+            "Buttons {buttons:?}, fader {fader:?}"
+        );
+        for (_, _, size) in buttons {
+            assert_eq!(*size, Size::new(24., 24.));
+        }
+    };
+    for width in [224., 260., 320.] {
+        s.choose(0, None);
+        let (buttons, faders) = measure(s.inspector_panel(), width, 616.);
+        check(&buttons, &faders[0], 2);
+        s.choose_bus(aux);
+        let (buttons, faders) = measure(s.inspector_panel(), width, 616.);
+        check(&buttons, &faders[0], 1);
+    }
+    for width in [560., 900., 1188.] {
+        let (buttons, faders) = measure(s.mixer(), width, 382.);
+        assert_eq!(buttons.len(), 5);
+        check(&buttons[..2], &faders[0], 2);
+        check(&buttons[2..4], &faders[1], 2);
+        check(&buttons[4..], &faders[2], 1);
+    }
+}
+
+#[test]
+fn editor_session_survives_stop_seek_resume_and_eof_without_replacing_engine() {
+    let mut app = Daw::new(project());
+    app.play();
+    // The device-free adapter models the editor pin on the real Playback owner.
+    app.model.borrow_mut().audio.as_mut().unwrap().editor_open = true;
+    let controls = app.model.borrow().audio.as_ref().unwrap().controls.clone();
+    app.model.borrow().audio.as_ref().unwrap().render(1700);
+    app.stop_audio(true);
+    assert!(app.model.borrow().audio.is_none());
+    let assert_retained = |app: &Daw| {
+        let m = app.model.borrow();
+        let audio = m
+            .retired_audio
+            .as_ref()
+            .expect("Stop destroyed editor session");
+        assert!(Arc::ptr_eq(&controls, &audio.controls));
+        assert!(audio.has_open_editors());
+        assert!(!audio.controls.playing.load(Ordering::Relaxed));
+    };
+    assert_retained(&app);
+    app.seek(0.4);
+    assert_retained(&app);
+    {
+        let m = app.model.borrow();
+        let audio = m.retired_audio.as_ref().unwrap();
+        audio.render(64);
+        assert_eq!(controls.position.load(Ordering::Relaxed), 3200);
+    }
+    app.edit("Rename while stopped", |m| {
+        m.project.tracks[0].name = "Same editor".into();
+        Ok(())
+    });
+    app.play();
+    assert!(Arc::ptr_eq(
+        &controls,
+        &app.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    app.model.borrow().audio.as_ref().unwrap().render(64);
+    assert_eq!(controls.position.load(Ordering::Relaxed), 3264);
+    app.seek(0.7);
+    app.model.borrow().audio.as_ref().unwrap().render(64);
+    assert_eq!(controls.position.load(Ordering::Relaxed), 5664);
+    app.model.borrow().audio.as_ref().unwrap().render(8000);
+    app.last_playhead
+        .set(Instant::now() - Duration::from_millis(40));
+    app.on_idle();
+    assert_retained(&app);
+    app.seek(0.2);
+    app.play();
+    assert!(Arc::ptr_eq(
+        &controls,
+        &app.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    app.model.borrow().audio.as_ref().unwrap().render(80);
+    assert_eq!(controls.position.load(Ordering::Relaxed), 1680);
+    assert!(!controls.error.load(Ordering::Relaxed));
+}
+
+#[test]
+fn initially_stopped_editor_session_can_play_and_repeatedly_stop_without_replacement() {
+    let app = Daw::new(project());
+    let mut audio = TestAudio::start_paused(&app.model.borrow().project).unwrap();
+    audio.editor_open = true;
+    let controls = audio.controls.clone();
+    audio.render(128);
+    assert_eq!(controls.position.load(Ordering::Relaxed), 0);
+    app.model.borrow_mut().retired_audio = Some(audio);
+    app.play();
+    assert!(Arc::ptr_eq(
+        &controls,
+        &app.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    app.model.borrow().audio.as_ref().unwrap().render(256);
+    assert_eq!(controls.position.load(Ordering::Relaxed), 256);
+    app.stop_audio(true);
+    app.stop_audio(true);
+    assert!(Arc::ptr_eq(
+        &controls,
+        &app.model.borrow().retired_audio.as_ref().unwrap().controls
+    ));
+    assert!(!controls.playing.load(Ordering::Relaxed));
+}
+
+#[test]
+#[ignore = "requires built bundled CLAP effect; run with RESONARA_CLAP_LIBRARY and --include-ignored"]
+fn clap_bypass_preserves_editor_session_while_stopped_and_playing() {
+    let mut p = project();
+    p.tracks[0].routing.inserts.push(resonara_core::Insert {
+        kind: resonara_core::InsertKind::Clap {
+            plugin: resonara_core::plugins::load_bundled_gain().unwrap(),
+        },
+        bypass: true,
+    });
+    let app = Daw::new(p);
+    let mut audio = TestAudio::start_paused(&app.model.borrow().project).unwrap();
+    audio.editor_open = true;
+    let controls = audio.controls.clone();
+    app.model.borrow_mut().retired_audio = Some(audio);
+    for _ in 0..3 {
+        app.toggle_insert(RoutingTarget::Track(0), 0);
+        {
+            let m = app.model.borrow();
+            let audio = m.retired_audio.as_ref().unwrap();
+            assert!(audio.has_open_editors());
+            assert!(Arc::ptr_eq(&controls, &audio.controls));
+            audio.render(64);
+            assert!(!controls.playing.load(Ordering::Relaxed));
+        }
+        app.play();
+        app.toggle_insert(RoutingTarget::Track(0), 0);
+        app.undo(false);
+        app.undo(true);
+        {
+            let m = app.model.borrow();
+            let audio = m.audio.as_ref().unwrap();
+            assert!(audio.has_open_editors());
+            assert!(Arc::ptr_eq(&controls, &audio.controls));
+            audio.render(64);
+            assert!(controls.playing.load(Ordering::Relaxed));
+        }
+        app.stop_audio(true);
+    }
+    assert!(!controls.error.load(Ordering::Relaxed));
+}
+
+#[test]
+fn send_popups_and_pre_fader_changes_keep_valid_gpu_damage() {
+    use scarlet_ui::renderer::{BackendFrame, PaintBackend, PaintContext};
+    struct GpuDamageProbe(Size, u32, Rc<Cell<usize>>);
+    impl PaintBackend for GpuDamageProbe {
+        fn resize(&mut self, size: Size, scale: u32) {
+            self.0 = size;
+            self.1 = scale;
+        }
+        fn render<'a>(
+            &'a mut self,
+            _: &PaintContext<'_>,
+            _: Color,
+            logical: Option<&[scarlet_ui::geometry::Rect]>,
+            physical: Option<&[scarlet_ui::compositor::DamageRect]>,
+        ) -> scarlet_ui::Result<BackendFrame<'a>> {
+            if let Some(damage) = physical {
+                let width = (self.0.width * self.1 as f32 / 1000.).ceil() as u32;
+                let height = (self.0.height * self.1 as f32 / 1000.).ceil() as u32;
+                if !damage
+                    .iter()
+                    .any(|&(x, y, w, h)| w > 0 && h > 0 && x < width && y < height)
+                {
+                    eprintln!("Empty GPU damage: logical={logical:?}, physical={physical:?}");
+                    return Err(scarlet_ui::Error::RenderError);
+                }
+            }
+            self.2.set(self.2.get() + 1);
+            Ok(BackendFrame::External)
+        }
+    }
+    wait_for_test_font();
+    let app = Daw::new(project());
+    let aux = app.model.borrow_mut().project.add_bus("Aux", BusKind::Aux);
+    let target = RoutingTarget::Track(0);
+    app.add_send(target, aux);
+    let mut pipeline = scarlet_ui::RenderingPipeline::new();
+    pipeline.set_root(
+        Window::new("Send GPU damage", app.clone())
+            .size(Size::new(1280., 850.))
+            .create_element(),
+    );
+    pipeline.layout_initial();
+    let submissions = Rc::new(Cell::new(0));
+    pipeline.set_paint_backend(Box::new(GpuDamageProbe(
+        Size::ZERO,
+        1000,
+        submissions.clone(),
+    )));
+    let settle = |pipeline: &mut scarlet_ui::RenderingPipeline, action: &str| {
+        let before = submissions.get();
+        for frame in 0..8 {
+            assert!(
+                pipeline.render_for_present().is_ok(),
+                "{action}: frame {frame}"
+            );
+        }
+        assert!(
+            submissions.get() > before,
+            "{action} must still repaint visible changes"
+        );
+    };
+    settle(&mut pipeline, "initial");
+    for scale in [1000, 2000] {
+        pipeline.set_scale_milli(scale);
+        if scale != 1000 {
+            settle(&mut pipeline, "scale change");
+        }
+        app.open_send_picker(target, Some(0));
+        settle(&mut pipeline, "open send destination");
+        app.choose_send_destination(target, Some(0), 0);
+        settle(&mut pipeline, "choose Aux");
+        app.open_send_actions(target, 0);
+        settle(&mut pipeline, "open send actions");
+        app.send_action(target, 0, 4);
+        settle(&mut pipeline, "switch pre/post");
+    }
+    pipeline.teardown();
+}
+
+#[test]
+fn lower_tabs_and_double_click_keep_selection_and_transport() {
+    use lower_panel::PanelTab;
+    let s = Daw::new(project());
+    s.choose(0, Some(0));
+    s.play();
+    assert_playback_advances(&s, 1800);
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    s.panel_fraction.set(0.4);
+    s.show_panel(PanelTab::Editor);
+    assert_eq!(s.panel_mode(), PanelTab::Editor);
+    assert!(s.panel_visible.get());
+    assert_eq!(s.model.borrow().clip, Some(0));
+    s.toggle_panel(PanelTab::Editor);
+    assert!(!s.panel_visible.get());
+    s.toggle_panel(PanelTab::Mixer);
+    assert!(s.panel_visible.get());
+    assert_eq!(s.panel_mode(), PanelTab::Mixer);
+    assert_eq!(s.panel_fraction.get(), 0.4);
+    let position = controls.position.load(Ordering::Relaxed);
+    s.timeline_event(
+        0,
+        &Event::Mouse(MouseEvent::ButtonPressed {
+            button: MouseButton::Left,
+            x: 100,
+            y: 40,
+            click_count: 2,
+        }),
+    );
+    assert_eq!(s.panel_mode(), PanelTab::Editor);
+    assert!(s.model.borrow().drag.is_none());
+    assert!(s.model.borrow().undo.is_empty());
+    assert_eq!(controls.position.load(Ordering::Relaxed), position);
+    assert_playback_advances(&s, 32);
+}
+
+#[test]
+fn lower_editor_layout_fills_pane_and_can_return_to_mixer() {
+    use lower_panel::PanelTab;
+    wait_for_test_font();
+    for size in [Size::new(1000., 720.), Size::new(1440., 1000.)] {
+        let s = Daw::new(project());
+        s.choose(0, Some(0));
+        s.show_panel(PanelTab::Editor);
+        let mut pipeline = scarlet_ui::RenderingPipeline::new();
+        pipeline.set_root(
+            Window::new("Editor workspace", s.clone())
+                .size(size)
+                .create_element(),
+        );
+        pipeline.layout_initial();
+        for _ in 0..8 {
+            let _ = pipeline.render();
+        }
+        let full = s.size.get().height - 174. - 4.;
+        let arrangement = s.arrangement_size.get();
+        assert!(arrangement.height >= 159.);
+        assert!(full - arrangement.height >= 259.);
+        let cursor = s.cursor.get();
+        s.panel_visible.set(false);
+        for _ in 0..8 {
+            let _ = pipeline.render();
+        }
+        assert!((s.arrangement_size.get().height - full - 4.).abs() < 2.);
+        s.show_panel(PanelTab::Mixer);
+        for _ in 0..8 {
+            let _ = pipeline.render();
+        }
+        let mixer_height = full - s.arrangement_size.get().height;
+        assert!((MIXER_MIN_HEIGHT - 1. ..=MIXER_MAX_HEIGHT + 1.).contains(&mixer_height));
+        assert_eq!(s.cursor.get(), cursor);
+        assert_eq!(s.model.borrow().clip, Some(0));
+        pipeline.teardown();
+    }
+}
+
+#[test]
+fn arrangement_edge_trim_preserves_reversed_mapping_and_fades() {
+    for (x, moved, side) in [(34, 64, DragMode::Left), (200, 170, DragMode::Right)] {
+        let mut p = project();
+        p.tracks[0].clips[0].set_reversed(true);
+        p.tracks[0].clips[0].set_fades(3000, 3000).unwrap();
+        let original = p.tracks[0].clips[0].clone();
+        let s = Daw::new(p);
+        s.snap.set(false);
+        s.choose(0, Some(0));
+        s.timeline_event(0, &press(x));
+        assert!(
+            s.model
+                .borrow()
+                .drag
+                .as_ref()
+                .is_some_and(|d| d.mode == side)
+        );
+        s.timeline_event(0, &Event::Mouse(MouseEvent::Moved { x: moved, y: 40 }));
+        s.timeline_event(
+            0,
+            &Event::Mouse(MouseEvent::ButtonReleased {
+                button: MouseButton::Left,
+                x: moved,
+                y: 40,
+                click_count: 1,
+            }),
+        );
+        let m = s.model.borrow();
+        let clip = &m.project.tracks[0].clips[0];
+        m.project.validate().unwrap();
+        let relative_start = (clip.start - original.start) as usize;
+        for i in 0..clip.frames {
+            assert_eq!(
+                clip.sample_at(i as f64),
+                original.sample_at((i + relative_start) as f64)
+            );
+        }
+        drop(m);
+        s.undo(false);
+        assert_eq!(
+            s.model.borrow().project.tracks[0].clips[0].edit,
+            original.edit
+        );
+    }
+}
+
+#[test]
+fn scarlet_tab_strip_switches_workspace_with_shared_selection_and_accent() {
+    use scarlet_ui::renderer::{PaintCommand, PaintContext};
+    fn tab_label(element: &dyn scarlet_ui::Element, parent: Point, label: &str) -> Option<Point> {
+        let origin = Point::new(
+            parent.x + element.position().x,
+            parent.y + element.position().y,
+        );
+        if let Some(render) = element
+            .render_object()
+            .filter(|r| r.as_any().is::<scarlet_ui::views::TabViewRenderObject>())
+        {
+            let mut paint = PaintContext::new();
+            render.paint(&mut paint, origin);
+            return paint.commands().iter().find_map(|command| match command {
+                PaintCommand::DrawText { text, position, .. } if text == label => Some(Point::new(
+                    position.x + 4.,
+                    origin.y + MIXER_HEADER_HEIGHT / 2.,
+                )),
+                _ => None,
+            });
+        }
+        element
+            .children()
+            .iter()
+            .find_map(|child| tab_label(child.as_ref(), origin, label))
+    }
+    wait_for_test_font();
+    let s = Daw::new(project());
+    s.choose(0, Some(0));
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.create_element());
+    for _ in 0..4 {
+        tree.root_mut().unwrap().rebuild();
+        tree.layout(scarlet_ui::LayoutConstraints::tight(1280., 790.));
+    }
+    let editor =
+        tab_label(tree.root().unwrap(), Point::ZERO, "Editor").expect("native ScarletUI tab");
+    dispatched_click(&mut tree, editor.x as i32, editor.y as i32);
+    assert_eq!(s.panel_mode(), lower_panel::PanelTab::Editor);
+    for _ in 0..4 {
+        tree.root_mut().unwrap().rebuild();
+        tree.layout(scarlet_ui::LayoutConstraints::tight(1280., 790.));
+    }
+    assert_eq!(s.model.borrow().clip, Some(0));
+    let mixer = tab_label(tree.root().unwrap(), Point::ZERO, "Mixer").unwrap();
+    dispatched_click(&mut tree, mixer.x as i32, mixer.y as i32);
+    assert_eq!(s.panel_mode(), lower_panel::PanelTab::Mixer);
+    assert!(s.model.borrow().undo.is_empty());
+    tree.clear_root();
 }

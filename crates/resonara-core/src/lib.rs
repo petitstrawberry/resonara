@@ -6,6 +6,15 @@ use std::sync::{
 };
 pub mod audio;
 pub mod graph;
+pub mod live;
+pub mod pitch;
+pub mod plugins;
+pub use plugins::{ClapInsert, ClapParameter};
+pub use resonara_clap::PluginOwner;
+pub mod routing;
+pub use routing::{Bus, BusId, BusKind, ChannelRouting, Destination, Insert, InsertKind, Send};
+mod region_edit;
+pub use region_edit::ClipEdit;
 mod metronome;
 mod wav;
 
@@ -20,6 +29,8 @@ pub struct Clip {
     pub source_offset: usize,
     pub frames: usize,
     pub samples: Arc<Vec<[f32; 2]>>,
+    #[serde(default)]
+    pub edit: ClipEdit,
 }
 fn default_source_channels() -> u16 {
     2
@@ -32,6 +43,8 @@ pub struct Track {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
+    #[serde(default)]
+    pub routing: ChannelRouting,
 }
 /// Display meter; tempo remains quarter notes per minute and audio stays sample based.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -63,6 +76,8 @@ pub struct Project {
     pub version: u32,
     pub sample_rate: u32,
     pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub buses: Vec<Bus>,
     pub master: f32,
     #[serde(default = "default_tempo")]
     pub tempo: f64,
@@ -78,6 +93,7 @@ impl Default for Project {
             version: 1,
             sample_rate: 48000,
             tracks: vec![],
+            buses: vec![],
             master: 1.0,
             tempo: default_tempo(),
             time_signature: TimeSignature::default(),
@@ -96,6 +112,7 @@ impl Project {
         {
             return Err("Invalid project header".into());
         }
+        self.validate_routing()?;
         for t in &self.tracks {
             if !t.gain.is_finite()
                 || !(0.0..=2.0).contains(&t.gain)
@@ -106,6 +123,7 @@ impl Project {
             }
             for c in &t.clips {
                 if !(1..=2).contains(&c.source_channels)
+                    || !c.edit.valid(c.frames)
                     || c.source_offset
                         .checked_add(c.frames)
                         .is_none_or(|end| end > c.samples.len())
@@ -168,11 +186,13 @@ impl Project {
                 source_offset: 0,
                 frames: length,
                 samples: Arc::new(samples),
+                edit: ClipEdit::default(),
             }],
             gain: 1.,
             pan: 0.,
             mute: false,
             solo: false,
+            routing: ChannelRouting::default(),
         });
         Ok(())
     }
@@ -183,12 +203,8 @@ impl Project {
             .iter()
             .position(|c| at > c.start && at < c.start + c.frames as u64)
             .ok_or("Split position must be inside a clip")?;
-        let mut right = t.clips[i].clone();
-        let left = (at - right.start) as usize;
-        right.start = at;
-        right.source_offset += left;
-        right.frames -= left;
-        t.clips[i].frames = left;
+        let left = (at - t.clips[i].start) as usize;
+        let right = t.clips[i].split_relative(left)?;
         t.clips.insert(i + 1, right);
         Ok(())
     }
@@ -203,9 +219,10 @@ impl Project {
             if a >= b {
                 return false;
             }
-            c.source_offset += (a - c.start) as usize;
-            c.start = a;
-            c.frames = (b - a) as usize;
+            // Valid intersections cannot fail and preserve the original
+            // reverse direction and fade envelope at both new edges.
+            c.trim_relative((a - c.start) as usize, (b - c.start) as usize)
+                .expect("valid clip intersection");
             true
         });
         Ok(())
@@ -234,7 +251,12 @@ impl Project {
     pub fn export_wav(&self, path: &std::path::Path) -> Result<()> {
         self.validate()?;
         let controls = Arc::new(Controls::new(self));
-        let mut engine = Engine::new(self, controls, self.sample_rate, 0);
+        let mut engine = Engine::try_new(self, controls, self.sample_rate, 0)?;
+        if engine.graph_info().unavailable_plugins > 0 {
+            return Err(
+                "Cannot export: an active CLAP plug-in is unavailable or incompatible".into(),
+            );
+        }
         let mut writer = hound::WavWriter::create(
             path,
             hound::WavSpec {
@@ -249,6 +271,9 @@ impl Project {
         while remaining > 0 {
             let frames = remaining.min(512) as usize;
             engine.render(&mut block[..frames * 2], 2);
+            if engine.controls.error.load(Ordering::Relaxed) {
+                return Err("Export stopped after an audio processing failure".into());
+            }
             for s in &block[..frames * 2] {
                 writer.write_sample(*s)?;
             }
@@ -279,11 +304,13 @@ impl Project {
                     source_offset: 0,
                     frames: 144000,
                     samples: Arc::new(samples),
+                    edit: ClipEdit::default(),
                 }],
                 gain: 1.,
                 pan: 0.,
                 mute: false,
                 solo: false,
+                routing: ChannelRouting::default(),
             });
         }
         p
@@ -308,18 +335,45 @@ impl Mixer {
         self.solo.store(t.solo, Ordering::Relaxed);
     }
 }
+/// Live bus controls and post-fader stereo telemetry, in Project.buses order.
+pub struct BusMixer {
+    pub gain: AtomicU32,
+    pub pan: AtomicU32,
+    pub mute: AtomicBool,
+    pub peak: AtomicU32,
+    pub peak_left: AtomicU32,
+    pub peak_right: AtomicU32,
+}
+impl BusMixer {
+    pub fn set(&self, bus: &Bus) {
+        self.gain.store(bus.gain.to_bits(), Ordering::Relaxed);
+        self.pan.store(bus.pan.to_bits(), Ordering::Relaxed);
+        self.mute.store(bus.mute, Ordering::Relaxed);
+    }
+}
 pub struct Controls {
     pub tracks: Vec<Mixer>,
+    pub buses: Vec<BusMixer>,
+    /// Live send levels, as f32 bits, in track-then-bus/send-slot order.
+    /// Includes disabled slots; use Project::send_control_index off the audio thread.
+    pub send_gains: Vec<AtomicU32>,
+    /// Live insert bypass, in track-then-bus/insert-slot order.
+    pub insert_bypasses: Vec<AtomicBool>,
     pub master: AtomicU32,
     /// Playback monitoring only. Exports construct disabled controls.
-    pub metronome: AtomicBool,
+    pub metronome: Arc<AtomicBool>,
     /// Actual stereo master sum after master gain, before clipping/device mapping.
     /// Positive f32 bits, accumulated until consumed with swap(0).
     pub master_peak_left: AtomicU32,
     pub master_peak_right: AtomicU32,
-    pub position: AtomicU64,
-    pub playing: AtomicBool,
-    pub error: AtomicBool,
+    pub position: Arc<AtomicU64>,
+    /// Coalesced transport seek, consumed only by the audio thread.
+    pub seek: Arc<AtomicU64>,
+    pub playing: Arc<AtomicBool>,
+    pub error: Arc<AtomicBool>,
+    /// Active reachable CLAP inserts that could not be prepared. Playback uses
+    /// dry placeholders; export refuses to create a file in this condition.
+    pub unavailable_plugins: AtomicU32,
 }
 impl Controls {
     pub fn new(p: &Project) -> Self {
@@ -337,54 +391,144 @@ impl Controls {
                     peak_right: AtomicU32::new(0),
                 })
                 .collect(),
+            buses: p
+                .buses
+                .iter()
+                .map(|bus| BusMixer {
+                    gain: AtomicU32::new(bus.gain.to_bits()),
+                    pan: AtomicU32::new(bus.pan.to_bits()),
+                    mute: AtomicBool::new(bus.mute),
+                    peak: AtomicU32::new(0),
+                    peak_left: AtomicU32::new(0),
+                    peak_right: AtomicU32::new(0),
+                })
+                .collect(),
+            send_gains: p
+                .channel_routings()
+                .flat_map(|routing| &routing.sends)
+                .map(|send| AtomicU32::new(send.gain.to_bits()))
+                .collect(),
+            insert_bypasses: p
+                .channel_routings()
+                .flat_map(|routing| &routing.inserts)
+                .map(|insert| AtomicBool::new(insert.bypass))
+                .collect(),
             master: AtomicU32::new(p.master.to_bits()),
-            metronome: AtomicBool::new(false),
+            metronome: Arc::new(AtomicBool::new(false)),
             master_peak_left: AtomicU32::new(0),
             master_peak_right: AtomicU32::new(0),
-            position: AtomicU64::new(0),
-            playing: AtomicBool::new(true),
-            error: AtomicBool::new(false),
+            position: Arc::new(AtomicU64::new(0)),
+            seek: Arc::new(AtomicU64::new(u64::MAX)),
+            playing: Arc::new(AtomicBool::new(true)),
+            error: Arc::new(AtomicBool::new(false)),
+            unavailable_plugins: AtomicU32::new(0),
         }
     }
 }
-/// Holds its snapshot for the entire stream lifetime; no swaps, locks, allocation or destruction in render.
+/// Owns one prepared snapshot; render does not lock, allocate or destroy graphs.
 pub struct Engine {
-    tracks: Vec<Track>,
-    clip_interpolation_ends: Vec<Vec<usize>>,
+    sources: RegionSources,
     pub controls: Arc<Controls>,
     position: f64,
     step: f64,
-    duration: u64,
     clock_only: bool,
     metronome: metronome::Metronome,
     graph: graph::CompiledGraph,
     faulted: bool,
     positions: Vec<f64>,
     block_mixers: Vec<graph::BlockMixer>,
+    block_bus_mixers: Vec<graph::BlockMixer>,
+    block_send_gains: Vec<f32>,
+    block_insert_bypasses: Vec<bool>,
+}
+
+/// Immutable source data prepared independently from routing and DSP owners.
+/// A live edit swaps this whole value and retires the old one on the control thread.
+pub(crate) struct RegionSources {
+    clips: Vec<Vec<Clip>>,
+    clip_interpolation_ends: Vec<Vec<usize>>,
+    clip_gains: Vec<Vec<f32>>,
+    duration: u64,
+}
+impl RegionSources {
+    pub(crate) fn prepare(project: &Project) -> Result<Self> {
+        for clip in project.tracks.iter().flat_map(|track| &track.clips) {
+            if !clip.edit.valid(clip.frames)
+                || !(1..=2).contains(&clip.source_channels)
+                || clip.start.checked_add(clip.frames as u64).is_none()
+                || clip
+                    .source_offset
+                    .checked_add(clip.frames)
+                    .is_none_or(|end| end > clip.samples.len())
+            {
+                return Err("Invalid region source or edit metadata".into());
+            }
+        }
+        Ok(Self {
+            clips: project
+                .tracks
+                .iter()
+                .map(|track| track.clips.clone())
+                .collect(),
+            // Splitting must not change interpolation at the cut. Only a true
+            // continuation of the same edited source receives lookahead.
+            clip_interpolation_ends: project
+                .tracks
+                .iter()
+                .map(|track| {
+                    track
+                        .clips
+                        .iter()
+                        .map(|clip| {
+                            if track.clips.iter().any(|next| clip.continues_into(next)) {
+                                clip.frames
+                            } else {
+                                clip.frames.saturating_sub(1)
+                            }
+                        })
+                        .collect()
+                })
+                .collect(),
+            clip_gains: project
+                .tracks
+                .iter()
+                .map(|track| {
+                    track
+                        .clips
+                        .iter()
+                        .map(|clip| clip.edit.gain_linear())
+                        .collect()
+                })
+                .collect(),
+            duration: project.duration(),
+        })
+    }
 }
 impl Engine {
     pub fn new(p: &Project, controls: Arc<Controls>, device_rate: u32, start: u64) -> Self {
-        let routing = graph::RoutingGraph::tracks_to_master(p.tracks.len());
-        // Keep the original constructor usable for arbitrary project sizes.
-        // Opt-in graphs use explicit admission budgets through with_graph.
-        let defaults = graph::GraphLimits::default();
-        let limits = graph::GraphLimits {
-            max_nodes: defaults.max_nodes.max(routing.nodes.len()),
-            max_edges: defaults.max_edges.max(routing.routes.len()),
-            max_scratch_bytes: defaults.max_scratch_bytes.max(
-                routing
-                    .nodes
-                    .len()
-                    .saturating_mul(defaults.quantum)
-                    .saturating_mul(8),
-            ),
-            ..defaults
-        };
-        Self::with_graph(p, controls, device_rate, start, &routing, limits)
-            .expect("the default track-to-master graph is valid")
+        Self::try_new(p, controls, device_rate, start)
+            .expect("Project routing must be valid and within engine budgets")
     }
-    /// Prepare an opt-in routing graph outside the audio callback. This does not
-    /// alter Project serialization or enable graph mutation during playback.
+    /// Prepare persistent routing outside the callback; invalid routes fail cleanly.
+    pub fn try_new(
+        p: &Project,
+        controls: Arc<Controls>,
+        device_rate: u32,
+        start: u64,
+    ) -> Result<Self> {
+        let (routing, insert_controls) = p.routing_graph_with_insert_controls()?;
+        let limits = p.routing_limits();
+        let mut engine = Self::with_graph(p, controls, device_rate, start, &routing, limits)?;
+        engine.graph.set_insert_controls(&insert_controls);
+        engine.refresh_insert_controls();
+        engine
+            .controls
+            .unavailable_plugins
+            .store(engine.graph.info().unavailable_plugins, Ordering::Relaxed);
+        Ok(engine)
+    }
+    /// Prepare an explicit runtime graph outside the audio callback, overriding
+    /// persistent routing for this engine only. No graph mutation during playback.
     pub fn with_graph(
         p: &Project,
         controls: Arc<Controls>,
@@ -396,9 +540,28 @@ impl Engine {
         if device_rate == 0 {
             return Err("Device sample rate must be nonzero".into());
         }
-        let graph = graph::CompiledGraph::compile(routing, p.tracks.len(), limits)?;
-        let duration = p.duration();
+        let sources = RegionSources::prepare(p)?;
+        let sends = p
+            .channel_routings()
+            .map(|routing| routing.sends.len())
+            .sum();
+        if controls.send_gains.len() != sends {
+            return Err("Send controls do not match project routing".into());
+        }
+        let graph = graph::CompiledGraph::compile_with_sends_at_rate(
+            routing,
+            p.tracks.len(),
+            p.buses.len(),
+            sends,
+            limits,
+            device_rate,
+        )?;
+        controls
+            .unavailable_plugins
+            .store(graph.info().unavailable_plugins, Ordering::Relaxed);
+        let duration = sources.duration;
         let clock_only = duration == 0 && controls.metronome.load(Ordering::Relaxed);
+        let inserts = controls.insert_bypasses.len();
         // The UI may read transport state before the first device callback.
         // Publish the requested start immediately rather than briefly jumping
         // to zero (which can be outside a panned arrangement viewport).
@@ -411,51 +574,72 @@ impl Engine {
             Ordering::Relaxed,
         );
         Ok(Self {
-            tracks: p.tracks.clone(),
-            // Splitting a clip must not change the interpolation at the cut.
-            // Prepare each clip's lookahead before the real-time render loop,
-            // and allow it only for an actual continuation of the same source.
-            clip_interpolation_ends: p
-                .tracks
-                .iter()
-                .map(|track| {
-                    track
-                        .clips
-                        .iter()
-                        .map(|clip| {
-                            let end = clip.start.checked_add(clip.frames as u64);
-                            let source_end = clip.source_offset.checked_add(clip.frames);
-                            let continues = clip.frames > 0
-                                && track.clips.iter().any(|next| {
-                                    next.frames > 0
-                                        && Some(next.start) == end
-                                        && Some(next.source_offset) == source_end
-                                        // JSON restores separate Arcs for shared audio.
-                                        // Compare full buffers only for adjacent source
-                                        // ranges, during setup rather than rendering.
-                                        && (Arc::ptr_eq(&clip.samples, &next.samples)
-                                            || clip.samples.as_ref() == next.samples.as_ref())
-                                });
-                            if continues {
-                                clip.frames
-                            } else {
-                                clip.frames.saturating_sub(1)
-                            }
-                        })
-                        .collect()
-                })
-                .collect(),
+            sources,
             controls,
             position: start as f64,
             step: p.sample_rate as f64 / device_rate as f64,
-            duration,
             clock_only,
             metronome: metronome::Metronome::new(p, device_rate),
             graph,
             faulted: false,
             positions: vec![0.0; limits.quantum],
             block_mixers: vec![graph::BlockMixer::default(); p.tracks.len()],
+            block_bus_mixers: vec![graph::BlockMixer::default(); p.buses.len()],
+            block_send_gains: vec![0.0; sends],
+            block_insert_bypasses: vec![false; inserts],
         })
+    }
+    /// Transfer main-thread plug-in lifecycle guards before sending the Engine
+    /// to an audio worker. Retain and drop them on this thread after the worker
+    /// and all callbacks stop. Offline rendering can leave ownership here.
+    pub fn take_plugin_owners(&mut self) -> Vec<PluginOwner> {
+        self.graph.take_plugin_owners()
+    }
+    pub(crate) fn take_keyed_plugin_owners(&mut self) -> Vec<(usize, PluginOwner)> {
+        self.graph.take_keyed_plugin_owners()
+    }
+    pub(crate) fn swap_sources(&mut self, sources: &mut RegionSources) {
+        std::mem::swap(&mut self.sources, sources);
+        self.clock_only =
+            self.sources.duration == 0 && self.controls.metronome.load(Ordering::Relaxed);
+    }
+    /// Adopt the exact next sample at a live graph boundary, including the
+    /// fractional project-frame position when device and project rates differ.
+    pub(crate) fn continue_from(&mut self, previous: &Self) {
+        self.position = if self.step == previous.step {
+            previous.position
+        } else {
+            previous.position * self.step / previous.step
+        };
+        self.faulted = previous.faulted;
+        self.controls
+            .position
+            .store(self.position as u64, Ordering::Relaxed);
+    }
+    fn refresh_insert_controls(&mut self) {
+        for (bypass, control) in self
+            .block_insert_bypasses
+            .iter_mut()
+            .zip(&self.controls.insert_bypasses)
+        {
+            *bypass = control.load(Ordering::Relaxed);
+        }
+        self.graph.refresh_unavailable(&self.block_insert_bypasses);
+    }
+    /// Control thread requests a new position; DSP and GUI instances survive.
+    pub fn request_seek(controls: &Controls, start: u64) {
+        controls
+            .seek
+            .store(start.min((1u64 << 63) - 2), Ordering::Release);
+    }
+    /// Resume and seek are adopted together at the next audio block boundary,
+    /// even when the previous block reached EOF while the request was queued.
+    pub fn request_resume(controls: &Controls, start: u64) {
+        controls.seek.store(
+            start.min((1u64 << 63) - 2) | (1u64 << 63),
+            Ordering::Release,
+        );
+        controls.playing.store(true, Ordering::Release);
     }
     pub fn graph_info(&self) -> &graph::GraphInfo {
         self.graph.info()
@@ -483,13 +667,29 @@ impl Engine {
             .any(|m| m.solo.load(Ordering::Relaxed));
         let master = f32::from_bits(self.controls.master.load(Ordering::Relaxed));
         let metronome_enabled = self.controls.metronome.load(Ordering::Relaxed);
+        self.clock_only |= self.sources.duration == 0 && metronome_enabled;
         let quantum = self.graph.info().quantum;
         for chunk in out.chunks_mut(channels.saturating_mul(quantum)) {
+            self.refresh_insert_controls();
+            let seek = self.controls.seek.swap(u64::MAX, Ordering::AcqRel);
+            if seek != u64::MAX {
+                if seek & (1u64 << 63) != 0 {
+                    self.controls.playing.store(true, Ordering::Relaxed);
+                }
+                let start = seek & !(1u64 << 63);
+                self.position = if self.clock_only {
+                    start
+                } else {
+                    start.min(self.sources.duration)
+                } as f64;
+                self.graph.reset_transport();
+            }
             let frames = chunk.len().div_ceil(channels);
             let mut active = 0;
-            if !self.faulted && self.controls.playing.load(Ordering::Relaxed) {
+            let playing = self.controls.playing.load(Ordering::Acquire);
+            if !self.faulted && playing {
                 for position in &mut self.positions[..frames] {
-                    if !self.clock_only && self.position >= self.duration as f64 {
+                    if !self.clock_only && self.position >= self.sources.duration as f64 {
                         break;
                     }
                     *position = self.position;
@@ -497,7 +697,8 @@ impl Engine {
                     active += 1;
                 }
             }
-            if active < frames {
+            if playing && active < frames && self.controls.seek.load(Ordering::Acquire) == u64::MAX
+            {
                 self.controls.playing.store(false, Ordering::Relaxed);
             }
             if active > 0 {
@@ -514,16 +715,43 @@ impl Engine {
                         graph::BlockMixer::default()
                     };
                 }
-                let tracks = &self.tracks;
-                let interpolation_ends = &self.clip_interpolation_ends;
+                for (index, mix) in self.block_bus_mixers.iter_mut().enumerate() {
+                    *mix = if let Some(control) = self.controls.buses.get(index) {
+                        graph::BlockMixer {
+                            gain: f32::from_bits(control.gain.load(Ordering::Relaxed)),
+                            pan: f32::from_bits(control.pan.load(Ordering::Relaxed)),
+                            audible: !control.mute.load(Ordering::Relaxed),
+                            peak: [0.0; 2],
+                        }
+                    } else {
+                        graph::BlockMixer::default()
+                    };
+                }
+                for (gain, control) in self
+                    .block_send_gains
+                    .iter_mut()
+                    .zip(&self.controls.send_gains)
+                {
+                    *gain = f32::from_bits(control.load(Ordering::Relaxed));
+                }
+                let clips = &self.sources.clips;
+                let interpolation_ends = &self.sources.clip_interpolation_ends;
+                let clip_gains = &self.sources.clip_gains;
                 let positions = &self.positions;
-                self.graph
-                    .process(active, &mut self.block_mixers, |track, block| {
+                let processed = self.graph.process(
+                    active,
+                    &mut self.block_mixers,
+                    &mut self.block_bus_mixers,
+                    &self.block_send_gains,
+                    &self.block_insert_bypasses,
+                    |track, block| {
                         // Visit each clip's block intersection, retaining clip
                         // summation order and sample-by-sample transport positions.
                         let positions = &positions[..block.len()];
-                        for (clip, &interpolation_end) in
-                            tracks[track].clips.iter().zip(&interpolation_ends[track])
+                        for ((clip, &interpolation_end), &gain) in clips[track]
+                            .iter()
+                            .zip(&interpolation_ends[track])
+                            .zip(&clip_gains[track])
                         {
                             let begin =
                                 positions.partition_point(|&p| p - (clip.start as f64) < 0.0);
@@ -535,17 +763,19 @@ impl Engine {
                                 block[begin..end].iter_mut().zip(&positions[begin..end])
                             {
                                 let x = position - clip.start as f64;
-                                let a = x as usize;
-                                let b = (a + 1).min(interpolation_end);
-                                let f = x.fract() as f32;
+                                let frame = clip.sample_with_gain(x, interpolation_end, gain);
                                 for (channel, value) in sample.iter_mut().enumerate() {
-                                    *value += clip.samples[clip.source_offset + a][channel]
-                                        * (1.0 - f)
-                                        + clip.samples[clip.source_offset + b][channel] * f;
+                                    *value += frame[channel];
                                 }
                             }
                         }
-                    });
+                    },
+                );
+                if !processed {
+                    self.faulted = true;
+                    self.controls.error.store(true, Ordering::Relaxed);
+                    self.controls.playing.store(false, Ordering::Relaxed);
+                }
                 for (mix, control) in self.block_mixers.iter().zip(&self.controls.tracks) {
                     control
                         .peak
@@ -557,6 +787,22 @@ impl Engine {
                         .peak_right
                         .fetch_max(mix.peak[1].to_bits(), Ordering::Relaxed);
                 }
+                for (mix, control) in self.block_bus_mixers.iter().zip(&self.controls.buses) {
+                    control
+                        .peak
+                        .fetch_max(mix.peak[0].max(mix.peak[1]).to_bits(), Ordering::Relaxed);
+                    control
+                        .peak_left
+                        .fetch_max(mix.peak[0].to_bits(), Ordering::Relaxed);
+                    control
+                        .peak_right
+                        .fetch_max(mix.peak[1].to_bits(), Ordering::Relaxed);
+                }
+            }
+            if active == 0 && !self.faulted && !self.graph.flush_plugins() {
+                self.faulted = true;
+                self.controls.error.store(true, Ordering::Relaxed);
+                self.controls.playing.store(false, Ordering::Relaxed);
             }
             // Retain the existing hard EOF boundary for this foundation. Effect
             // tails, latency compensation and live graph replacement are separate work.
@@ -614,7 +860,7 @@ impl Engine {
             if self.clock_only {
                 self.position as u64
             } else {
-                (self.position as u64).min(self.duration)
+                (self.position as u64).min(self.sources.duration)
             },
             Ordering::Relaxed,
         );

@@ -1,16 +1,22 @@
 mod animation;
 mod counter;
 mod fader;
+mod insert_slot;
 mod knob;
 mod meter;
+mod native_editor;
 mod profiling;
 mod ruler;
+mod send_knob;
+mod send_slot;
 #[cfg(test)]
 mod tests;
 mod timeline;
 mod ui;
 mod wave;
 mod workbench;
+use resonara_core::{BusId, BusKind};
+use routing::{RoutingMenu, RoutingTarget};
 use workbench::{RulerDrag, TrackMenu};
 
 use resonara_core::{Clip, Project, Result};
@@ -37,11 +43,20 @@ use std::{
 use tests::TestAudio as Audio;
 use ui::*;
 macro_rules! row { ($($v:expr),* $(,)?) => { HStack::new(Children(vec![$(Box::new($v) as Box<dyn View>),*])) }; }
+mod channel_strip;
+mod insert_editor;
+mod inspector;
+mod lower_panel;
+mod region_editor;
+mod region_processing;
+mod routing;
+mod send_editor;
 
 #[derive(Clone)]
 struct Snapshot {
     project: Project,
     selected: usize,
+    selected_bus: Option<BusId>,
     clip: Option<usize>,
     version: u64,
     path: Option<PathBuf>,
@@ -66,6 +81,14 @@ enum Dialog {
     ConfirmOpen,
     ConfirmClose,
     Help,
+    InsertValue(RoutingTarget, usize),
+    InsertPicker(RoutingTarget),
+    InsertActions(RoutingTarget, usize),
+    ClapEditor(RoutingTarget, usize),
+    ClapPicker(RoutingTarget),
+    SendPicker(RoutingTarget, Option<usize>),
+    SendActions(RoutingTarget, usize),
+    SendLevel(RoutingTarget, usize),
 }
 #[derive(Clone)]
 struct FileEntry {
@@ -112,7 +135,11 @@ struct IoResult {
 struct Model {
     project: Project,
     audio: Option<Audio>,
+    // Keep stopped native editor/DSP sessions alive for resume, and retain
+    // naturally finished outputs for SAS's separately queued hardware tail.
+    retired_audio: Option<Audio>,
     selected: usize,
+    selected_bus: Option<BusId>,
     clip: Option<usize>,
     undo: Vec<History>,
     redo: Vec<History>,
@@ -123,6 +150,7 @@ struct Model {
     mixer_before: Option<Snapshot>,
     peaks: wave::Peaks,
     channels: Vec<Channel>,
+    bus_channels: Vec<Channel>,
     io: Option<mpsc::Receiver<IoResult>>,
     picker: Option<(FileAction, FileDialogHandle)>,
     current_path: Option<PathBuf>,
@@ -140,6 +168,17 @@ struct Daw {
     signature_input: State<String>,
     track_menu: State<Option<TrackMenu>>,
     menu_choice: State<usize>,
+    routing_menu: State<Option<RoutingMenu>>,
+    routing_value: State<String>,
+    insert_focus: Rc<RefCell<std::collections::HashMap<(RoutingTarget, usize), State<bool>>>>,
+    plugin_fields: Rc<RefCell<Vec<(u32, State<String>)>>>,
+    plugin_knobs: Rc<RefCell<Vec<(u32, knob::PanKnob)>>>,
+    plugin_catalog: Rc<RefCell<resonara_core::plugins::ClapCatalog>>,
+    native_editor: Rc<RefCell<Option<(RoutingTarget, usize, resonara_core::plugins::ClapEditor)>>>,
+    native_edit_group: Rc<Cell<bool>>,
+    native_edit_time: Rc<Cell<Instant>>,
+    send_controls:
+        Rc<RefCell<std::collections::HashMap<(RoutingTarget, usize), routing::SendControl>>>,
     follow_playhead: State<bool>,
     follow_suspended: Rc<Cell<bool>>,
     ruler_drag: Rc<RefCell<Option<RulerDrag>>>,
@@ -159,9 +198,15 @@ struct Daw {
     file_selected: State<Option<usize>>,
     dialog_error: State<String>,
     inspector: State<bool>,
+    inspector_details: State<bool>,
+    inspector_fader_focus: State<bool>,
+    inspector_pan_focus: State<bool>,
     inspector_fraction: State<f32>,
-    mixer_fraction: State<f32>,
-    mixer_visible: State<bool>,
+    panel_fraction: State<f32>,
+    panel_visible: State<bool>,
+    panel_tab: State<usize>,
+    region_editor: Rc<region_editor::RegionEditor>,
+    region_job: Rc<RefCell<Option<region_processing::RegionJob>>>,
     snap: State<bool>,
     tool: State<usize>,
     view_start: State<f64>,
@@ -187,7 +232,9 @@ impl Daw {
             model: Rc::new(RefCell::new(Model {
                 project,
                 audio: None,
+                retired_audio: None,
                 selected: 0,
+                selected_bus: None,
                 clip: None,
                 undo: vec![],
                 redo: vec![],
@@ -198,6 +245,7 @@ impl Daw {
                 mixer_before: None,
                 peaks: wave::Peaks::default(),
                 channels: vec![],
+                bus_channels: vec![],
                 io: None,
                 picker: None,
                 current_path: None,
@@ -215,6 +263,16 @@ impl Daw {
             signature_input: state(35, String::new()),
             track_menu: state(32, None),
             menu_choice: state(33, 0),
+            routing_menu: state(37, None),
+            routing_value: state(38, String::new()),
+            insert_focus: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            plugin_fields: Rc::new(RefCell::new(vec![])),
+            plugin_knobs: Rc::new(RefCell::new(vec![])),
+            plugin_catalog: Rc::new(RefCell::new(Default::default())),
+            native_editor: Rc::new(RefCell::new(None)),
+            native_edit_group: Rc::new(Cell::new(false)),
+            native_edit_time: Rc::new(Cell::new(Instant::now())),
+            send_controls: Rc::new(RefCell::new(std::collections::HashMap::new())),
             follow_playhead: state(34, false),
             follow_suspended: Rc::new(Cell::new(false)),
             ruler_drag: Rc::new(RefCell::new(None)),
@@ -234,9 +292,15 @@ impl Daw {
             file_selected: state(15, None),
             dialog_error: state(16, String::new()),
             inspector: state(17, true),
+            inspector_details: state(39, false),
+            inspector_fader_focus: state(40, false),
+            inspector_pan_focus: state(41, false),
             inspector_fraction: state(26, 0.185),
-            mixer_fraction: state(27, 0.),
-            mixer_visible: state(18, true),
+            panel_fraction: state(27, 0.),
+            panel_visible: state(18, true),
+            panel_tab: state(42, lower_panel::PanelTab::Mixer as usize),
+            region_editor: Rc::new(region_editor::RegionEditor::new()),
+            region_job: Rc::new(RefCell::new(None)),
             snap: state(19, true),
             tool: state(20, 0),
             view_start: state(21, 0.),
@@ -258,6 +322,7 @@ impl Daw {
         Snapshot {
             project: m.project.clone(),
             selected: m.selected,
+            selected_bus: m.selected_bus,
             clip: m.clip,
             version: m.version,
             path: m.current_path.clone(),
@@ -265,6 +330,7 @@ impl Daw {
     }
     fn restore(m: &mut Model, s: Snapshot) {
         m.project = s.project;
+        m.selected_bus = s.selected_bus.filter(|id| m.project.bus(*id).is_some());
         m.selected = s.selected.min(m.project.tracks.len().saturating_sub(1));
         m.clip = s.clip.filter(|i| {
             m.project
@@ -372,7 +438,10 @@ impl Daw {
             m.project.time_signature,
         ));
         m.selected = m.selected.min(m.project.tracks.len().saturating_sub(1));
-        if let Some(t) = m.project.tracks.get(m.selected) {
+        m.selected_bus = m.selected_bus.filter(|id| m.project.bus(*id).is_some());
+        if let Some(bus) = m.selected_bus.and_then(|id| m.project.bus(id)) {
+            self.track_name.set(bus.name.clone());
+        } else if let Some(t) = m.project.tracks.get(m.selected) {
             self.track_name.set(t.name.clone());
         } else {
             self.track_name.set(String::new());
@@ -382,21 +451,7 @@ impl Daw {
         while m.channels.len() < len {
             let i = m.channels.len();
             let id = 1000 + i as u64 * 10;
-            m.channels.push(Channel {
-                gain: state(id, 1.),
-                gain_normalized: state(id + 9, fader::gain_to_fraction(1.)),
-                pan: state(id + 1, 0.),
-                meter: state(id + 2, "Peak −∞ dBFS".into()),
-                peak: state(id + 6, meter::StereoMeter::default()),
-                focused: state(id + 7, false),
-                pan_focused: state(id + 8, false),
-                dragging_gain: state(id + 3, false),
-                dragging_pan: state(id + 4, false),
-                canvas: SgfxCanvasHandle::new(),
-                playhead_mesh: SgfxMeshHandle::new(),
-                frame: state(id + 5, Arc::new(SgfxCanvasFrame::new(0, BG))),
-                mesh: SgfxMesh::new(vec![]),
-            });
+            m.channels.push(Channel::new(id));
         }
         m.channels.truncate(len);
         for i in 0..len {
@@ -406,6 +461,7 @@ impl Daw {
                 .set(fader::gain_to_fraction(m.project.tracks[i].gain));
             m.channels[i].pan.set(m.project.tracks[i].pan);
         }
+        Self::refresh_bus_channels(&mut m);
         if waveforms {
             if self.profiler.borrow().active() {
                 self.profiler.borrow_mut().waveform_refreshes += 1;
@@ -446,6 +502,7 @@ impl Daw {
         }
         drop(m);
         self.update_frames();
+        self.refresh_region_editor();
         self.changed();
     }
     fn animate_playhead(&self, position: f64) {
@@ -490,14 +547,29 @@ impl Daw {
     fn finish_mix(&self) {
         let mut m = self.model.borrow_mut();
         if let Some(before) = m.mixer_before.take() {
-            let changed = before.project.master != m.project.master
+            let changed = before
+                .project
+                .buses
+                .iter()
+                .zip(&m.project.buses)
+                .any(|(a, b)| {
+                    a.gain != b.gain
+                        || a.pan != b.pan
+                        || a.mute != b.mute
+                        || a.routing.sends != b.routing.sends
+                })
+                || before.project.master != m.project.master
                 || before
                     .project
                     .tracks
                     .iter()
                     .zip(&m.project.tracks)
                     .any(|(a, b)| {
-                        a.gain != b.gain || a.pan != b.pan || a.mute != b.mute || a.solo != b.solo
+                        a.gain != b.gain
+                            || a.pan != b.pan
+                            || a.mute != b.mute
+                            || a.routing.sends != b.routing.sends
+                            || a.solo != b.solo
                     });
             if changed {
                 Self::history(&mut m, before, "Mixer change");
@@ -507,33 +579,80 @@ impl Daw {
         self.changed();
     }
     fn edit(&self, label: &str, f: impl FnOnce(&mut Model) -> Result<()>) {
+        self.poll_native_editors(true);
+        self.native_edit_group.set(false);
         self.track_menu.set(None);
+        self.routing_menu.set(None);
         if self.busy() {
             return;
         }
         self.finish_mix();
-        self.stop_audio(false);
         let mut m = self.model.borrow_mut();
+        // Retain a stopped editor across unrelated edits. Its slot is scoped to
+        // this project layout, so invalidate it if the edit replaces that insert.
+        let editor_insert = self
+            .native_editor
+            .borrow()
+            .as_ref()
+            .map(|(target, slot, _)| {
+                (
+                    *target,
+                    *slot,
+                    target
+                        .get(&m.project)
+                        .and_then(|r| r.inserts.get(*slot))
+                        .map(|i| i.kind.clone()),
+                )
+            });
         let before = Self::snapshot(&m);
-        match f(&mut m) {
+        match f(&mut m).and_then(|()| Self::sync_audio(&mut m)) {
             Ok(()) => {
                 Self::history(&mut m, before, label);
-                self.status.set(label.into());
+                self.status.set(Self::edit_status(&m, label.into()));
             }
             Err(e) => {
                 Self::restore(&mut m, before);
                 self.status.set(format!("Could not {label}: {e}"));
             }
         }
+        let invalidate_editor = editor_insert.is_some_and(|(target, slot, previous)| {
+            previous
+                != target
+                    .get(&m.project)
+                    .and_then(|r| r.inserts.get(slot))
+                    .map(|i| i.kind.clone())
+        });
         drop(m);
+        if invalidate_editor {
+            // The old state was captured before the edit. Do not snapshot the
+            // retired editor into a slot that now belongs to a different insert.
+            self.native_editor.borrow_mut().take();
+        }
         self.refresh(true);
     }
+    fn sync_audio(m: &mut Model) -> Result<()> {
+        if let Some(audio) = m.audio.as_mut().or(m.retired_audio.as_mut()) {
+            audio.update(&m.project)?;
+        }
+        Ok(())
+    }
+    fn edit_status(m: &Model, label: String) -> String {
+        let missing = m.audio.as_ref().map_or(0, |a| {
+            a.controls.unavailable_plugins.load(Ordering::Relaxed)
+        });
+        if missing == 0 {
+            label
+        } else {
+            format!("{label} · {missing} unavailable CLAP insert(s) bypassed")
+        }
+    }
     fn undo(&self, redo: bool) {
+        self.poll_native_editors(true);
+        self.native_edit_group.set(false);
         if self.busy() {
             return;
         }
         self.finish_mix();
-        self.stop_audio(false);
         let mut m = self.model.borrow_mut();
         let item = if redo { m.redo.pop() } else { m.undo.pop() };
         if let Some(h) = item {
@@ -541,9 +660,27 @@ impl Daw {
             let label = h.label;
             let restore_path = h.restore_path;
             let current_path = m.current_path.clone();
+            let rejected = h.state.clone();
             Self::restore(&mut m, h.state);
             if !restore_path {
                 m.current_path = current_path;
+            }
+            if let Err(error) = Self::sync_audio(&mut m) {
+                Self::restore(&mut m, current);
+                let item = History {
+                    state: rejected,
+                    label,
+                    restore_path,
+                };
+                if redo {
+                    m.redo.push(item);
+                } else {
+                    m.undo.push(item);
+                }
+                self.status.set(format!("Could not restore edit: {error}"));
+                drop(m);
+                self.refresh(true);
+                return;
             }
             let next = History {
                 state: current,
@@ -555,17 +692,22 @@ impl Daw {
             } else {
                 m.redo.push(next);
             }
-            self.status
-                .set(format!("{}: {label}", if redo { "Redid" } else { "Undid" }));
+            self.status.set(Self::edit_status(
+                &m,
+                format!("{}: {label}", if redo { "Redid" } else { "Undid" }),
+            ));
         }
         drop(m);
         self.refresh(true);
     }
     fn choose(&self, index: usize, clip: Option<usize>) {
+        self.insert_focus.borrow_mut().clear();
+        self.routing_menu.set(None);
         self.finish_mix();
         let mut m = self.model.borrow_mut();
         if index < m.project.tracks.len() {
             m.selected = index;
+            m.selected_bus = None;
             m.clip = clip;
         }
         drop(m);
@@ -635,6 +777,7 @@ impl Daw {
             self.stop_audio(true);
             return;
         }
+        self.poll_native_editors(true);
         self.finish_mix();
         self.reset_meters();
         let result = self.seconds(&self.cursor.get()).and_then(|start| {
@@ -647,8 +790,26 @@ impl Daw {
             } else {
                 start
             };
-            let a = Audio::start_with_metronome(&m.project, start, self.metronome.get())?;
-            self.status.set(format!("Playing · {}", a.device));
+            let a = if let Some(mut audio) = m.retired_audio.take() {
+                audio.update(&m.project)?;
+                if audio.resume(start, self.metronome.get()) {
+                    audio
+                } else {
+                    drop(audio);
+                    Audio::start_with_metronome(&m.project, start, self.metronome.get())?
+                }
+            } else {
+                Audio::start_with_metronome(&m.project, start, self.metronome.get())?
+            };
+            let missing = a.controls.unavailable_plugins.load(Ordering::Relaxed);
+            self.status.set(if missing == 0 {
+                format!("Playing · {}", a.device)
+            } else {
+                format!(
+                    "Playing · {} · {missing} unavailable CLAP insert(s) bypassed",
+                    a.device
+                )
+            });
             m.audio = Some(a);
             self.playhead
                 .set(start as f64 / m.project.sample_rate as f64);
@@ -690,7 +851,17 @@ impl Daw {
         }
     }
     fn stop_audio(&self, message: bool) {
+        self.finish_audio(message, false);
+    }
+    fn finish_audio(&self, message: bool, preserve_device_tail: bool) {
+        self.poll_native_editors(true);
         let mut m = self.model.borrow_mut();
+        if m.retired_audio
+            .as_ref()
+            .is_some_and(|a| !a.has_open_editors())
+        {
+            m.retired_audio = None;
+        }
         if let Some(a) = m.audio.take() {
             let pos =
                 a.controls.position.load(Ordering::Relaxed) as f64 / m.project.sample_rate as f64;
@@ -702,6 +873,12 @@ impl Daw {
                 m.project.sample_rate,
                 m.project.time_signature,
             ));
+            a.pause();
+            if preserve_device_tail
+                || (a.has_open_editors() && !a.controls.error.load(Ordering::Relaxed))
+            {
+                m.retired_audio = Some(a);
+            }
         }
         if message {
             self.status.set("Stopped".into());
@@ -712,7 +889,13 @@ impl Daw {
         self.changed();
     }
     fn reset_meters(&self) {
-        for channel in &self.model.borrow().channels {
+        for channel in self
+            .model
+            .borrow()
+            .channels
+            .iter()
+            .chain(&self.model.borrow().bus_channels)
+        {
             channel.peak.set(meter::StereoMeter::default());
             channel.meter.set(meter::StereoMeter::default().summary());
         }
@@ -751,6 +934,18 @@ impl Daw {
                 });
             update(&channel.peak, &channel.meter, input);
         }
+        for (index, channel) in self.model.borrow().bus_channels.iter().enumerate() {
+            let input = controls
+                .and_then(|c| c.buses.get(index))
+                .map_or([0.; 2], |bus| {
+                    bus.peak.swap(0, Ordering::Relaxed);
+                    [
+                        f32::from_bits(bus.peak_left.swap(0, Ordering::Relaxed)),
+                        f32::from_bits(bus.peak_right.swap(0, Ordering::Relaxed)),
+                    ]
+                });
+            update(&channel.peak, &channel.meter, input);
+        }
         let input = controls.map_or([0.; 2], |c| {
             [
                 f32::from_bits(c.master_peak_left.swap(0, Ordering::Relaxed)),
@@ -761,13 +956,26 @@ impl Daw {
     }
     fn seek(&self, seconds: f64) {
         let was_playing = self.model.borrow().audio.is_some();
-        self.stop_audio(false);
         let seconds = seconds.max(0.);
+        let direct = {
+            let m = self.model.borrow();
+            let start = (seconds * m.project.sample_rate as f64).round() as u64;
+            if let Some(audio) = m.audio.as_ref() {
+                audio.resume(start, self.metronome.get())
+            } else {
+                m.retired_audio
+                    .as_ref()
+                    .is_some_and(|audio| audio.seek(start))
+            }
+        };
+        if !direct {
+            self.stop_audio(false);
+        }
         self.playhead.set(seconds);
         self.cursor.set(timeline::seconds_input(seconds));
         self.animate_playhead(seconds);
         self.update_frames();
-        if was_playing {
+        if was_playing && !direct {
             self.play();
         }
     }
@@ -780,12 +988,21 @@ impl Daw {
                 state.set(next);
             }
         };
-        for channel in &self.model.borrow().channels {
+        for channel in self
+            .model
+            .borrow()
+            .channels
+            .iter()
+            .chain(&self.model.borrow().bus_channels)
+        {
             release(&channel.peak);
         }
         release(&self.master_peak);
     }
     fn split(&self) {
+        if self.model.borrow().selected_bus.is_some() {
+            return;
+        }
         let at = match self.seconds(&self.cursor.get()) {
             Ok(v) => v,
             Err(e) => {
@@ -803,6 +1020,10 @@ impl Daw {
         });
     }
     fn duplicate(&self) {
+        if self.model.borrow().selected_bus.is_some() {
+            self.status.set("Select an audio track to duplicate".into());
+            return;
+        }
         self.edit("Duplicate track", |m| {
             let mut t = m
                 .project
@@ -818,6 +1039,11 @@ impl Daw {
         });
     }
     fn delete(&self, track: bool) {
+        if self.model.borrow().selected_bus.is_some() {
+            self.status
+                .set("Use Delete bus in the inspector to remove this bus".into());
+            return;
+        }
         self.edit(
             if track {
                 "Delete track"
@@ -850,6 +1076,9 @@ impl Daw {
         );
     }
     fn trim_range(&self) {
+        if self.model.borrow().selected_bus.is_some() {
+            return;
+        }
         let r = self
             .seconds(&self.cursor.get())
             .and_then(|a| self.seconds(&self.range_end.get()).map(|b| (a, b)));
@@ -896,7 +1125,6 @@ impl Daw {
                 ..
             }) => {
                 self.finish_mix();
-                self.stop_audio(false);
                 self.focus.set(true);
                 let at = seconds(*x as f32).max(0.);
                 let mut m = self.model.borrow_mut();
@@ -904,6 +1132,7 @@ impl Daw {
                     return false;
                 }
                 let rate = m.project.sample_rate;
+                let was_playing = m.audio.is_some();
                 let frame = (at * rate as f64) as u64;
                 let hit = m.project.tracks[index]
                     .clips
@@ -913,7 +1142,23 @@ impl Daw {
                     .find(|(_, c)| frame >= c.start && frame <= c.start + c.frames as u64)
                     .map(|(i, _)| i);
                 m.selected = index;
+                m.selected_bus = None;
+                self.routing_menu.set(None);
                 m.clip = hit;
+                if matches!(
+                    e,
+                    Event::Mouse(MouseEvent::ButtonPressed {
+                        click_count: 2..,
+                        ..
+                    })
+                ) && hit.is_some()
+                {
+                    m.drag = None;
+                    drop(m);
+                    self.open_editor_panel();
+                    self.refresh(true);
+                    return true;
+                }
                 if let Some(ci) = hit {
                     let c = m.project.tracks[index].clips[ci].clone();
                     let start = (c.start as f64 / rate as f64 - self.view_start.get())
@@ -942,7 +1187,11 @@ impl Daw {
                     });
                 }
                 drop(m);
-                self.seek(self.snap_position(at));
+                // Selecting/dragging a region preserves transport. A click in
+                // empty space (or the scissors tool) explicitly seeks instead.
+                if !was_playing || hit.is_none() || self.tool.get() == 1 {
+                    self.seek(self.snap_position(at));
+                }
                 if self.tool.get() == 1 && hit.is_some() {
                     self.model.borrow_mut().drag = None;
                     self.split();
@@ -982,22 +1231,33 @@ impl Daw {
                     DragMode::Left => {
                         let wanted = (quantize(c.start as f64 / rate as f64 + delta) * rate as f64)
                             .round() as i64;
+                        let available = if c.edit.reversed {
+                            c.samples.len() - c.source_offset - c.frames
+                        } else {
+                            c.source_offset
+                        };
                         let diff = (wanted - c.start as i64).clamp(
-                            -(c.source_offset as i64).min(c.start as i64),
+                            -(available as i64).min(c.start as i64),
                             c.frames.saturating_sub(1) as i64,
                         );
-                        c.start = (c.start as i64 + diff) as u64;
-                        c.source_offset = (c.source_offset as i64 + diff) as usize;
-                        c.frames = (c.frames as i64 - diff) as usize;
+                        if let Err(error) = c.resize_relative(diff, c.frames as i64) {
+                            self.status.set(format!("Could not trim region: {error}"));
+                        }
                     }
                     DragMode::Right => {
                         let wanted =
                             (quantize((c.start + c.frames as u64) as f64 / rate as f64 + delta)
                                 * rate as f64)
                                 .round() as i64;
-                        let length = (wanted - c.start as i64)
-                            .clamp(1, (c.samples.len() - c.source_offset) as i64);
-                        c.frames = length as usize;
+                        let maximum = if c.edit.reversed {
+                            c.source_offset + c.frames
+                        } else {
+                            c.samples.len() - c.source_offset
+                        };
+                        let length = (wanted - c.start as i64).clamp(1, maximum as i64);
+                        if let Err(error) = c.resize_relative(0, length) {
+                            self.status.set(format!("Could not trim region: {error}"));
+                        }
                     }
                 }
                 self.status.set(format!(
@@ -1021,15 +1281,21 @@ impl Daw {
                 let mut m = self.model.borrow_mut();
                 if let Some(d) = m.drag.take() {
                     if d.moved {
-                        Self::history(
-                            &mut m,
-                            d.before,
-                            if d.mode == DragMode::Move {
-                                "Move region"
-                            } else {
-                                "Trim region"
-                            },
-                        );
+                        match Self::sync_audio(&mut m) {
+                            Ok(()) => Self::history(
+                                &mut m,
+                                d.before,
+                                if d.mode == DragMode::Move {
+                                    "Move region"
+                                } else {
+                                    "Trim region"
+                                },
+                            ),
+                            Err(error) => {
+                                Self::restore(&mut m, d.before);
+                                self.status.set(format!("Could not edit region: {error}"));
+                            }
+                        }
                     }
                 }
                 drop(m);
@@ -1286,11 +1552,17 @@ impl Daw {
         self.start_io(action, path);
     }
     fn start_io(&self, action: FileAction, path: PathBuf) {
+        self.poll_native_editors(true);
+        self.native_edit_group.set(false);
         if self.busy() {
             return;
         }
         self.finish_mix();
-        self.stop_audio(false);
+        if action == FileAction::Open {
+            self.close_native_editors();
+            self.stop_audio(false);
+            self.model.borrow_mut().retired_audio = None;
+        }
         let mut m = self.model.borrow_mut();
         if m.io.is_some() || m.picker.is_some() {
             return;
@@ -1352,6 +1624,15 @@ impl Daw {
                 if let Some(project) = project {
                     let before = Self::snapshot(&m);
                     m.project = project;
+                    if let Err(error) = Self::sync_audio(&mut m) {
+                        Self::restore(&mut m, before);
+                        self.status
+                            .set(format!("Could not apply audio import: {error}"));
+                        drop(m);
+                        self.refresh(true);
+                        return;
+                    }
+                    m.selected_bus = None;
                     m.selected = if out.action == FileAction::Import {
                         m.project.tracks.len().saturating_sub(1)
                     } else {
@@ -1456,6 +1737,12 @@ impl Daw {
             return false;
         };
         if self.dialog.get() != Dialog::None {
+            if self.handle_send_popup_key(keycode) {
+                return true;
+            }
+            if self.handle_insert_popup_key(keycode) {
+                return true;
+            }
             if keycode == KeyCode::Escape {
                 self.dialog.set(Dialog::None);
                 self.close_after_save.set(false);
@@ -1498,6 +1785,7 @@ impl Daw {
             KeyCode::Space => self.play(),
             KeyCode::Home => self.seek(0.),
             KeyCode::Escape => {
+                self.routing_menu.set(None);
                 if !self.cancel_ruler_drag() {
                     self.cancel_drag();
                 }
@@ -1508,10 +1796,16 @@ impl Daw {
             KeyCode::Char('s' | 'S') => self.split(),
             KeyCode::Char('c' | 'C') => self.toggle_metronome(),
             KeyCode::Char('m' | 'M') => {
-                let i = self.model.borrow().selected;
-                self.mix(i, None, None, Some(false));
+                let selected_bus = self.model.borrow().selected_bus;
+                if let Some(id) = selected_bus {
+                    self.bus_mix(id, None, None, true);
+                } else {
+                    let i = self.model.borrow().selected;
+                    self.mix(i, None, None, Some(false));
+                }
             }
-            KeyCode::Char('x' | 'X') => self.mixer_visible.set(!self.mixer_visible.get()),
+            KeyCode::Char('x' | 'X') => self.toggle_panel(lower_panel::PanelTab::Mixer),
+            KeyCode::Char('e' | 'E') => self.toggle_panel(lower_panel::PanelTab::Editor),
             KeyCode::Char('i' | 'I') => self.inspector.set(!self.inspector.get()),
             KeyCode::Char('1') => self.tool.set(0),
             KeyCode::Char('2') => self.tool.set(1),
@@ -1700,7 +1994,7 @@ impl Daw {
                     .frame(size.width, (size.height - 60.).max(100.)),
             )
         };
-        let layout=AnyView::new(vstack!{self.ruler(),TrackArea(content,None),row!{self.icon(Icon::ChevronLeft,"Scroll timeline left",false,|s|{s.scroll_timeline(-s.view_span.get()*0.5);}),caption(format!("{:.2}s — {:.2}s",self.view_start.get(),self.view_start.get()+self.view_span.get())),Spacer::new(),caption("Drag region • edge = trim • S = split"),self.icon(Icon::ChevronRight,"Scroll timeline right",false,|s|{s.scroll_timeline(s.view_span.get()*0.5);})}.spacing(6.).padding_insets(EdgeInsets::new(8.,0.,8.,0.)).frame_height(30.).background(PANEL)}.spacing(0.).background(BG).on_geometry_change(|g|g.size(),move|size|{let old=resize.arrangement_size.get();if(old.width-size.width).abs()>1.||(old.height-size.height).abs()>1.{resize.arrangement_size.set(size);if resize.mixer_visible.get(){let full=(resize.size.get().height-44.-66.-36.-28.-4.).max(1.);resize.mixer_fraction.set((size.height/full).clamp(0.1,0.9));}resize.refresh(true);}}));
+        let layout=AnyView::new(vstack!{self.ruler(),TrackArea(content,None),row!{self.icon(Icon::ChevronLeft,"Scroll timeline left",false,|s|{s.scroll_timeline(-s.view_span.get()*0.5);}),caption(format!("{:.2}s — {:.2}s",self.view_start.get(),self.view_start.get()+self.view_span.get())),Spacer::new(),caption("Drag region • edge = trim • S = split"),self.icon(Icon::ChevronRight,"Scroll timeline right",false,|s|{s.scroll_timeline(s.view_span.get()*0.5);})}.spacing(6.).padding_insets(EdgeInsets::new(8.,0.,8.,0.)).frame_height(30.).background(PANEL)}.spacing(0.).background(BG).on_geometry_change(|g|g.size(),move|size|{let old=resize.arrangement_size.get();if(old.width-size.width).abs()>1.||(old.height-size.height).abs()>1.{resize.arrangement_size.set(size);if resize.panel_visible.get(){let full=(resize.size.get().height-44.-66.-36.-28.-4.).max(1.);resize.panel_fraction.set((size.height/full).clamp(0.1,0.9));}resize.refresh(true);}}));
         let wheel = self.clone();
         AnyView::new(HorizontalWheel(
             layout,
@@ -1711,98 +2005,13 @@ impl Daw {
         ))
     }
     fn inspector_panel(&self) -> AnyView {
-        let m = self.model.borrow();
-        let i = m.selected;
-        let panel_resize = self.clone();
-        let title = m
-            .project
-            .tracks
-            .get(i)
-            .map(|t| t.name.as_str())
-            .unwrap_or("No track selected");
-        let rename = self.clone();
-        let gain = self.clone();
-        let pan = self.clone();
-        let mut rows:Vec<Box<dyn View>>=vec![Box::new(row!{caption("INSPECTOR"),Spacer::new(),self.icon(Icon::X,"Hide inspector · I",false,|s|s.inspector.set(false))}.frame_height(30.)),Box::new(ui::name_label(title,22,18.,self.status.clone())),Box::new(caption("AUDIO TRACK"))];
-        if let Some(t) = m.project.tracks.get(i) {
-            let c = &m.channels[i];
-            rows.push(Box::new(
-                ui::field(self.track_name.clone())
-                    .on_submit(move || {
-                        let name = rename.track_name.get();
-                        rename.edit("Rename track", |m| {
-                            if name.trim().is_empty() {
-                                return Err("Track name cannot be empty".into());
-                            }
-                            m.project.tracks[m.selected].name = name.trim().into();
-                            Ok(())
-                        });
-                    })
-                    .blur_on_submit(true)
-                    .frame_width(190.)
-                    .input_guard(),
-            ));
-            rows.push(Box::new(caption("LEVEL")));
-            rows.push(Box::new(row!{Slider::new(c.gain_normalized.clone()).min(0.).max(1.).dragging_state(c.dragging_gain.clone()).on_change(move|v|gain.mix_normalized(i,v)).frame_width(115.),label(ui::db(t.gain)).frame_width(70.)}.spacing(5.)));
-            rows.push(Box::new(caption("PAN")));
-            rows.push(Box::new(row!{Slider::new(c.pan.clone()).min(-1.).max(1.).dragging_state(c.dragging_pan.clone()).on_change(move|v|pan.mix(i,None,Some(v),None)).frame_width(115.),label(ui::pan(t.pan)).frame_width(70.)}.spacing(5.)));
-            rows.push(Box::new(row!{self.button(if t.mute{"Unmute"}else{"Mute"},"Toggle track mute · M",move|s|s.mix(i,None,None,Some(false))),self.button(if t.solo{"Unsolo"}else{"Solo"},"Listen to this track in isolation",move|s|s.mix(i,None,None,Some(true)))}.spacing(6.)));
-            rows.push(Box::new(Rectangle::new().fill(LINE).frame(190., 1.)));
-            rows.push(Box::new(caption("SELECTED REGION")));
-            if let Some(c) = m.clip.and_then(|ci| t.clips.get(ci)) {
-                rows.push(Box::new(label(format!(
-                    "Start  {:.3}s",
-                    c.start as f64 / m.project.sample_rate as f64
-                ))));
-                rows.push(Box::new(label(format!(
-                    "Length  {:.3}s",
-                    c.frames as f64 / m.project.sample_rate as f64
-                ))));
-                rows.push(Box::new(caption("Drag edges for non-destructive trim")));
-            } else {
-                rows.push(Box::new(caption("Click a waveform to select a region")));
-            }
-            rows.push(Box::new(Rectangle::new().fill(LINE).frame(190., 1.)));
-            rows.push(Box::new(caption("PRECISE RANGE · SECONDS")));
-            rows.push(Box::new(row!{ui::field(self.cursor.clone()).frame_width(90.).input_guard(),ui::field(self.range_end.clone()).frame_width(90.).input_guard()}.spacing(8.)));
-            rows.push(Box::new(self.button(
-                "Keep range on track",
-                "Keep only audio between range start and end (undoable)",
-                |s| s.trim_range(),
-            )));
-        }
-        rows.push(Box::new(Spacer::new()));
-        rows.push(Box::new(caption("Stereo output")));
-        rows.push(Box::new(caption(format!(
-            "{} Hz • 32-bit float export",
-            m.project.sample_rate
-        ))));
-        AnyView::new(
-            ScrollView::new(
-                VStack::new(Children(rows))
-                    .alignment(Alignment::TopLeading)
-                    .spacing(10.)
-                    .padding(14.),
-            )
-            .vertical()
-            .content_size(220., 630.)
-            .background(PANEL)
-            .on_geometry_change(
-                |g| g.size().width,
-                move |width| {
-                    let f = width / (panel_resize.size.get().width - 4.);
-                    if (f - panel_resize.inspector_fraction.get()).abs() > 0.001 {
-                        panel_resize.inspector_fraction.set(f);
-                    }
-                },
-            ),
-        )
+        self.channel_inspector_panel()
     }
     fn mixer_fader_height(&self) -> f32 {
         let available = (self.size.get().height - 174.).max(320.) - 4.;
         let max_first = (available - MIXER_MIN_HEIGHT).max(0.);
         let min_first = (available - MIXER_MAX_HEIGHT).max(230.).min(max_first);
-        let first = (available * self.mixer_fraction.get()).clamp(min_first, max_first);
+        let first = (available * self.panel_fraction.get()).clamp(min_first, max_first);
         (available - first - MIXER_HEADER_HEIGHT - MIXER_STRIP_OVERHEAD)
             .clamp(112., MIXER_FADER_MAX_HEIGHT)
     }
@@ -1813,24 +2022,23 @@ impl Daw {
         let mut channels: Vec<Box<dyn View>> = vec![];
         for (i, t) in m.project.tracks.iter().enumerate() {
             let c = &m.channels[i];
-            let gain = self.clone();
-            let pan = self.clone();
             let select = self.clone();
-            let mute = self.clone();
-            let solo = self.clone();
             let status = self.status.clone();
             let full_name = t.name.clone();
-            let meter_status = self.status.clone();
-            let meter_peak = c.peak.clone();
             channels.push(Box::new(vstack!{
                 Rectangle::new().fill(ui::color(i)).frame(90.,3.),
-                ui::button(format!("{:02} {}",i+1,ui::elide(&t.name,11))).font_size(10.).on_click(move||select.choose(i,None)).frame(92.,24.).on_hover(move||status.set(full_name.clone())),
-                row!{ui::button("M").background_color(if t.mute{GOLD}else{RAISED}).text_color(if t.mute{BG}else{TEXT}).on_click(move||mute.mix(i,None,None,Some(false))),ui::button("S").background_color(if t.solo{GOLD}else{RAISED}).text_color(if t.solo{BG}else{TEXT}).on_click(move||solo.mix(i,None,None,Some(true)))}.spacing(6.).frame_height(24.),
-                vstack!{knob::PanKnob::new(c.pan.clone(),c.dragging_pan.clone(),c.pan_focused.clone(),move|v|pan.mix(i,None,Some(v),None)).frame(32.,32.),caption(ui::pan(t.pan)).font_size(10.)}.spacing(0.).frame(90.,44.),
-                fader::Fader::new(c.gain.clone(),c.peak.clone(),c.dragging_gain.clone(),c.focused.clone(),move|v|gain.mix(i,Some(v),None,None)).frame(90.,fader_height),
-                label(format!("Gain {}",ui::db(t.gain))).font_size(10.).alignment(Alignment::Center).frame(90.,14.),
-                animation::Readout::new(c.meter.clone(),9.,ACCENT,Size::new(90.,12.)).on_hover(move||meter_status.set(meter_peak.get().detail(false))),
-            }.spacing(2.).padding(4.).frame(100.,strip_height - 2.).background(if i==m.selected{RAISED}else{PANEL}).border(LINE,1.)));
+                ui::button(format!("{:02} {}",i+1,ui::elide(&t.name,11))).font_size(10.).on_click(move||{select.choose(i,None);select.inspector.set(true);}).frame(92.,24.).on_hover(move||status.set(full_name.clone())),
+                self.channel_strip_controls(RoutingTarget::Track(i),c,t.gain,t.pan,t.mute,Some(t.solo),fader_height,false)
+            }.spacing(2.).padding(4.).frame(100.,strip_height-2.).background(if i==m.selected&&m.selected_bus.is_none(){RAISED}else{PANEL}).border(LINE,1.)));
+        }
+        for (index, bus) in m.project.buses.iter().enumerate() {
+            channels.push(Box::new(self.bus_strip(
+                bus,
+                &m.bus_channels[index],
+                fader_height,
+                strip_height,
+                m.selected_bus == Some(bus.id),
+            )));
         }
         let master = self.clone();
         let master_status = self.status.clone();
@@ -1841,7 +2049,7 @@ impl Daw {
             label(format!("Gain {}",ui::db(m.project.master))).font_size(10.).alignment(Alignment::Center).frame(90.,14.),animation::Readout::new(self.master_meter.clone(),9.,ACCENT,Size::new(90.,12.)).on_hover(move||master_status.set(master_peak.get().detail(true)))
         }.spacing(2.).padding(4.).frame(100.,strip_height - 2.).background(RAISED).border(LINE,1.)));
         let width = channels.len() as f32 * 100.;
-        AnyView::new(vstack!{row!{caption("MIXER"),caption(format!("{} audio channels",m.project.tracks.len())),Spacer::new(),caption("Click gain ticks · ↑ / ↓ · Shift = fine · double-click thumb = reset"),self.icon(Icon::X,"Hide mixer · X",false,|s|s.mixer_visible.set(false))}.spacing(12.).padding_insets(EdgeInsets::new(12.,0.,8.,0.)).frame_height(MIXER_HEADER_HEIGHT).background(PANEL),ScrollView::new(HStack::new(Children(channels)).spacing(0.).alignment(Alignment::TopLeading)).both_axes().content_size(width,strip_height).frame_height(strip_height)}.spacing(0.).background(BG))
+        AnyView::new(vstack!{self.lower_panel_header(),ScrollView::new(HStack::new(Children(channels)).spacing(0.).alignment(Alignment::TopLeading)).both_axes().content_size(width,strip_height).frame_height(strip_height)}.spacing(0.).background(BG))
     }
     fn toolbar(&self) -> AnyView {
         let m = self.model.borrow();
@@ -1893,39 +2101,49 @@ impl Daw {
             self.header_button(if self.tool.get()==0{"• Pointer  1"}else{"Pointer  1"},"Pointer: select, move, trim edges · 1",|s|s.tool.set(0)),self.header_button(if self.tool.get()==1{"• Split  2"}else{"Split  2"},"Scissors: click a region to split · 2",|s|s.tool.set(1)),
             self.header_button(&snap,"Toggle snapping to the displayed musical/time/sample grid",|s|s.snap.set(!s.snap.get())),Spacer::new(),
             self.header_button(if self.follow_playhead.get(){"Follow"}else{"Fixed"},"Toggle playhead-follow scrolling",|s|s.toggle_follow()),self.header_icon(Icon::ZoomOut,"Zoom out · −",false,|s|s.zoom(2.)),self.header_icon(Icon::ZoomIn,"Zoom in · +",false,|s|s.zoom(0.5)),self.header_button("Fit","Fit project to timeline · F",|s|s.fit()),Rectangle::new().fill(LINE).frame(1.,20.),
-            self.header_icon(Icon::List,"Toggle inspector · I",self.inspector.get(),|s|s.inspector.set(!s.inspector.get())),self.header_icon(Icon::Adjustments,"Toggle mixer · X",self.mixer_visible.get(),|s|s.mixer_visible.set(!s.mixer_visible.get()))
+            self.header_icon(Icon::List,"Toggle inspector · I",self.inspector.get(),|s|s.inspector.set(!s.inspector.get())),self.header_icon(Icon::Adjustments,"Mixer · X",self.panel_visible.get() && self.panel_mode()==lower_panel::PanelTab::Mixer,|s|s.toggle_panel(lower_panel::PanelTab::Mixer)),self.header_icon(Icon::Pencil,"Selected-region editor · E",self.panel_visible.get() && self.panel_mode()==lower_panel::PanelTab::Editor,|s|s.toggle_panel(lower_panel::PanelTab::Editor))
         }.spacing(6.).padding_insets(EdgeInsets::new(10.,3.,10.,3.)).frame_height(36.).background(PANEL))
     }
     fn workspace(&self) -> AnyView {
         let size = self.size.get();
         let height = (size.height - 44. - 66. - 36. - 28.).max(320.);
-        let arrangement = if self.inspector.get() {
+        // The inspector owns the full work-area height. Only the right pane
+        // splits vertically, so mixer channels never extend under the inspector.
+        let right = if self.panel_visible.get() {
             AnyView::new(
-                SplitView::new(self.inspector_panel(), self.arrangement())
-                    .axis(SplitAxis::Horizontal)
-                    .fraction(self.inspector_fraction.get())
-                    .min_first(205.)
-                    .min_second(560.)
+                SplitView::new(self.arrangement(), self.lower_panel())
+                    .axis(SplitAxis::Vertical)
+                    .fraction(self.panel_fraction.get())
+                    .min_first(if self.panel_mode() == lower_panel::PanelTab::Mixer {
+                        (height - 4. - MIXER_MAX_HEIGHT).max(230.)
+                    } else {
+                        160.
+                    })
+                    .min_second(if self.panel_mode() == lower_panel::PanelTab::Mixer {
+                        MIXER_MIN_HEIGHT
+                    } else {
+                        260.
+                    })
                     .divider_thickness(4.)
                     .divider_colors(LINE, ACCENT)
-                    .frame_width(size.width),
+                    .frame_height(height),
             )
         } else {
-            AnyView::new(self.arrangement().frame_width(size.width))
+            AnyView::new(self.arrangement().frame_height(height))
         };
-        let content = if self.mixer_visible.get() {
+        let content = if self.inspector.get() {
             AnyView::new(
-                SplitView::new(arrangement, self.mixer())
-                    .axis(SplitAxis::Vertical)
-                    .fraction(self.mixer_fraction.get())
-                    .min_first((height - 4. - MIXER_MAX_HEIGHT).max(230.))
-                    .min_second(MIXER_MIN_HEIGHT)
+                SplitView::new(self.inspector_panel(), right)
+                    .axis(SplitAxis::Horizontal)
+                    .fraction(self.inspector_fraction.get())
+                    .min_first(224.)
+                    .min_second(560.)
                     .divider_thickness(4.)
                     .divider_colors(LINE, ACCENT)
                     .frame(size.width, height),
             )
         } else {
-            AnyView::new(arrangement.frame(size.width, height))
+            AnyView::new(right.frame(size.width, height))
         };
         // Both split and mixer-hidden modes own the workspace height; child
         // geometry supplies the waveform viewport after either transition.
@@ -2033,7 +2251,7 @@ impl Daw {
                     "1   Pointer       2   Scissors       S   Split at playhead",
                     "Drag a region to move it. Drag either edge to trim it.",
                     "Snap follows the display: musical notes/bars, 100 ms, or one sample. C toggles the metronome.",
-                    "+ / −   Zoom       F   Fit project       I   Inspector       X   Mixer",
+                    "+ / −   Zoom       F   Fit project       I   Inspector       X   Mixer       E   Editor",
                     "↑ / ↓   Select track       M   Mute       Delete   Delete region",
                     "Ctrl/Cmd + Z   Undo       Shift + Ctrl/Cmd + Z   Redo",
                     "Ctrl/Cmd + D   Duplicate track       Ctrl/Cmd + I   Import audio",
@@ -2043,7 +2261,7 @@ impl Daw {
                 ] {
                     rows.push(Box::new(label(text)));
                 }
-                rows.push(Box::new(caption("Audio arrangement and mixing. Recording, MIDI and plug-ins are not implemented.")));
+                rows.push(Box::new(caption("Audio arrangement and mixing. Built-in inserts and native stereo CLAP effects are supported. Recording and MIDI are not implemented.")));
                 rows.push(Box::new(self.button(
                     "Back to session",
                     "Close keyboard reference · Escape",
@@ -2059,6 +2277,16 @@ impl Daw {
                     "This session has unsaved edits. Save them before continuing.",
                 )));
                 rows.push(Box::new(row!{self.button("Cancel","Keep working",|s|s.dialog.set(Dialog::None)),self.button("Discard changes","Continue without saving this session",move|s|{if close{scarlet_ui::dismiss_window("resonara");}else{s.open_dialog(FileAction::Open);}}),self.button("Save project…","Choose where to save this session",move|s|{s.close_after_save.set(close);s.open_after_save.set(!close);s.save();})}.spacing(10.)));
+            }
+            Dialog::SendPicker(target, slot) => return self.send_picker_dialog(target, slot),
+            Dialog::SendActions(target, slot) => return self.send_actions_dialog(target, slot),
+            Dialog::SendLevel(target, slot) => return self.send_level_dialog(target, slot),
+            Dialog::InsertPicker(target) => return self.insert_picker_dialog(target),
+            Dialog::InsertActions(target, slot) => return self.insert_actions_dialog(target, slot),
+            Dialog::ClapEditor(target, slot) => return self.clap_editor_dialog(target, slot),
+            Dialog::ClapPicker(target) => return self.clap_picker_dialog(target),
+            Dialog::InsertValue(target, slot) => {
+                return self.insert_value_dialog(target, slot);
             }
             Dialog::None => {}
         }
@@ -2107,6 +2335,24 @@ impl Daw {
             AnyView::new(vstack!{Text::new("Working on your audio…").font_size(24.).color(TEXT),Text::from_state(self.status.clone()).font_size(14.).color(MUTED),caption("The session will be available as soon as the file operation finishes.")}.spacing(12.).frame(self.size.get().width,self.size.get().height).background(BG))
         } else if self.dialog.get() == Dialog::None {
             self.workspace()
+        } else if matches!(
+            self.dialog.get(),
+            Dialog::InsertValue(..)
+                | Dialog::InsertPicker(..)
+                | Dialog::InsertActions(..)
+                | Dialog::ClapEditor(..)
+                | Dialog::ClapPicker(..)
+                | Dialog::SendPicker(..)
+                | Dialog::SendActions(..)
+                | Dialog::SendLevel(..)
+        ) {
+            AnyView::new(
+                ZStack::new(Children(vec![
+                    Box::new(self.workspace()),
+                    Box::new(self.dialog_view()),
+                ]))
+                .frame(self.size.get().width, self.size.get().height),
+            )
         } else {
             self.dialog_view()
         };
@@ -2140,6 +2386,22 @@ impl Daw {
         AnyView::new(InputBoundary(
             AnyView::new(ShortcutBoundary(content)),
             Rc::new(move |root, e| {
+                if matches!(
+                    context.dialog.get(),
+                    Dialog::InsertPicker(..)
+                        | Dialog::ClapPicker(..)
+                        | Dialog::InsertActions(..)
+                        | Dialog::SendPicker(..)
+                        | Dialog::SendActions(..)
+                ) {
+                    if let Event::Keyboard(KeyEvent::Pressed { keycode, .. }) = e {
+                        return context.handle_insert_popup_key(*keycode)
+                            || context.handle_send_popup_key(*keycode);
+                    }
+                    if matches!(e, Event::Keyboard(_)) {
+                        return true;
+                    }
+                }
                 context.track_context_event(
                     root,
                     e,
@@ -2169,9 +2431,11 @@ impl View for Daw {
             &self.arrangement_size,
             &self.dialog,
             &self.inspector,
+            &self.inspector_details,
             &self.inspector_fraction,
-            &self.mixer_fraction,
-            &self.mixer_visible,
+            &self.panel_fraction,
+            &self.panel_visible,
+            &self.panel_tab,
             &self.snap,
             &self.tool,
             &self.view_start,
@@ -2179,6 +2443,7 @@ impl View for Daw {
             &self.dialog_error,
             &self.time_format,
             &self.track_menu,
+            &self.routing_menu,
             &self.menu_choice,
             &self.follow_playhead,
             &self.signature_input,
@@ -2218,6 +2483,7 @@ impl Application for Daw {
         if self.busy() {
             return false;
         }
+        self.close_native_editors();
         self.finish_mix();
         self.track_menu.set(None);
         if self.dirty() {
@@ -2241,17 +2507,32 @@ impl Application for Daw {
         }
     }
     fn on_idle(&mut self) {
+        self.poll_native_editors(false);
+        {
+            let mut m = self.model.borrow_mut();
+            let m = &mut *m;
+            if let Some(audio) = m.audio.as_mut().or(m.retired_audio.as_mut()) {
+                audio.collect_retired();
+            }
+        }
         if self.profiler.borrow().expired() {
             self.finish_profile();
         }
         self.poll_picker();
         self.poll_io();
+        self.poll_region_processing();
         let dragging = {
             let m = self.model.borrow();
             self.master_dragging.get()
                 || m.channels
                     .iter()
+                    .chain(&m.bus_channels)
                     .any(|c| c.dragging_gain.get() || c.dragging_pan.get())
+                || self
+                    .send_controls
+                    .borrow()
+                    .values()
+                    .any(|c| c.dragging.get())
         };
         if !dragging && self.model.borrow().mixer_before.is_some() {
             self.finish_mix();
@@ -2284,7 +2565,7 @@ impl Application for Daw {
                 if meter_due {
                     self.update_meters(Some(&a.controls), meter_elapsed.as_secs_f32());
                 }
-                ended = !a.controls.playing.load(Ordering::Relaxed);
+                ended = a.is_finished();
                 failure = a.controls.error.load(Ordering::Relaxed);
             } else if meter_due {
                 self.update_meters(None, meter_elapsed.as_secs_f32());
@@ -2297,10 +2578,10 @@ impl Application for Daw {
             self.animate_playhead(pos);
         }
         if (ended && self.ruler_drag.borrow().is_none()) || failure {
-            self.stop_audio(false);
+            self.finish_audio(false, !failure);
             self.status.set(
                 if failure {
-                    "Audio device error. Check the output device, then press Play to retry."
+                    "Audio processing or device error. Check inserts and the output device, then press Play to retry."
                 } else {
                     "Playback complete"
                 }
@@ -2353,14 +2634,99 @@ fn smoke() -> Result<()> {
     let dir = std::path::Path::new(&path);
     std::fs::create_dir_all(dir)?;
     let mut p = Project::demo();
+    let live_edits = std::env::var_os("RESONARA_SMOKE_LIVE_EDITS").is_some();
+    if live_edits {
+        p.tracks[0].routing.inserts.push(resonara_core::Insert {
+            kind: resonara_core::InsertKind::Gain { gain: 0.5 },
+            bypass: false,
+        });
+    }
     p.split(0, 48000)?;
     p.trim(1, 24000, 96000)?;
+    if std::env::var_os("RESONARA_SMOKE_ROUTING").is_some() {
+        use resonara_core::{Destination, Insert, InsertKind, Send};
+        let aux = p.add_bus("Smoke delay", BusKind::Aux);
+        let group = p.add_bus("Smoke group", BusKind::Group);
+        p.tracks[0].routing.inserts.push(Insert {
+            kind: InsertKind::OnePole { coefficient: 0.5 },
+            bypass: false,
+        });
+        p.tracks[0].routing.sends.push(Send {
+            target: aux,
+            gain: 0.25,
+            pre_fader: true,
+            enabled: true,
+        });
+        p.tracks[0].routing.output = Destination::Bus(group);
+        p.bus_mut(aux).unwrap().routing.inserts.push(Insert {
+            kind: InsertKind::Delay { frames: 4800 },
+            bypass: false,
+        });
+        p.bus_mut(aux).unwrap().routing.output = Destination::Bus(group);
+        p.bus_mut(group).unwrap().routing.inserts.push(Insert {
+            kind: InsertKind::Gain { gain: 0.8 },
+            bypass: false,
+        });
+    }
+    let clap_id = std::env::var("RESONARA_SMOKE_CLAP_ID").ok();
+    if std::env::var_os("RESONARA_SMOKE_CLAP").is_some() || clap_id.is_some() {
+        let plugin = if let Some(id) = clap_id {
+            let catalog = resonara_core::plugins::scan_installed();
+            let choice = catalog
+                .effects
+                .iter()
+                .find(|c| c.plugin_id == id)
+                .ok_or_else(|| format!("Smoke CLAP ID not installed: {id}"))?;
+            resonara_core::plugins::load_installed(choice)?
+        } else {
+            let plugin = resonara_core::plugins::load_bundled_gain()?;
+            resonara_core::plugins::set_parameter(&plugin, 0, 0.5)?
+        };
+        println!("Smoke CLAP: {} ({})", plugin.name, plugin.plugin_id);
+        p.tracks[0].routing.inserts.push(resonara_core::Insert {
+            kind: resonara_core::InsertKind::Clap { plugin },
+            bypass: false,
+        });
+    }
     p.save(&dir.join("smoke.resonara.json"))?;
-    let p = Project::load(&dir.join("smoke.resonara.json"))?;
+    let mut p = Project::load(&dir.join("smoke.resonara.json"))?;
     p.export_wav(&dir.join("smoke.wav"))?;
-    let a = Audio::start(&p, 0)?;
+    let mut a = Audio::start(&p, 0)?;
+    let transport = a.controls.position.clone();
+    let mut edits = 0;
     let start = Instant::now();
     while start.elapsed().as_secs_f32() < 2. {
+        a.collect_retired();
+        if live_edits && edits < 7 && start.elapsed().as_millis() >= (edits + 1) * 100 {
+            match edits {
+                0 => p.tracks[0].name = "Live rename".into(),
+                1 | 2 => p.tracks[0].routing.inserts[0].bypass = edits == 1,
+                3 | 4 => {
+                    for insert in &mut p.tracks[0].routing.inserts {
+                        if matches!(insert.kind, resonara_core::InsertKind::Clap { .. }) {
+                            insert.bypass = edits == 3;
+                        }
+                    }
+                }
+                5 => {
+                    let bus = p.add_bus("Live routing", BusKind::Aux);
+                    p.tracks[0].routing.output = resonara_core::Destination::Bus(bus);
+                }
+                _ => p.tracks[0].routing.inserts.push(resonara_core::Insert {
+                    kind: resonara_core::InsertKind::Gain { gain: 0.8 },
+                    bypass: false,
+                }),
+            }
+            let position = transport.load(Ordering::Relaxed);
+            a.update(&p)?;
+            if !Arc::ptr_eq(&transport, &a.controls.position)
+                || transport.load(Ordering::Relaxed) < position
+                || !a.controls.playing.load(Ordering::Relaxed)
+            {
+                return Err("Live edit interrupted or rewound transport".into());
+            }
+            edits += 1;
+        }
         if a.controls.position.load(Ordering::Relaxed) >= p.sample_rate as u64 {
             break;
         }
@@ -2368,12 +2734,15 @@ fn smoke() -> Result<()> {
     }
     if a.controls.error.load(Ordering::Relaxed)
         || a.controls.position.load(Ordering::Relaxed) < p.sample_rate as u64
+        || (live_edits && edits != 7)
     {
         return Err("Audio callback did not advance successfully".into());
     }
     println!(
-        "Smoke passed: {} tracks, save/load/export, audio device {}, callback position {}",
+        "Smoke passed: {} tracks, {} buses, save/load/export, {} live edits, audio device {}, callback position {}",
         p.tracks.len(),
+        p.buses.len(),
+        edits,
         a.device,
         a.controls.position.load(Ordering::Relaxed)
     );

@@ -7,28 +7,49 @@ import tomllib
 
 root = Path.cwd()
 app = tomllib.loads((root / 'crates/resonara-app/Cargo.toml').read_text())
-dependency = app['dependencies']['scarlet-ui']
-revision = 'cdd852eb22678b7b0d1c7e035c1f2b2ba4d057a7'
+host_dependency = app['target']['cfg(not(target_os = "scarlet"))']['dependencies']['scarlet-ui']
+scarlet_dependency = app['target']['cfg(target_os = "scarlet")']['dependencies']['scarlet-ui']
+dependency = host_dependency
+assert host_dependency['features'] == ['std', 'platform-winit'], 'Host must use the native desktop backend'
+assert scarlet_dependency['features'] == ['std', 'platform-sws'], 'Scarlet must use SWS'
+assert {k: v for k, v in host_dependency.items() if k != 'features'} == {k: v for k, v in scarlet_dependency.items() if k != 'features'}, 'Both targets must share the same ScarletUI pin'
+platform = tomllib.loads((root / 'crates/resonara-platform/Cargo.toml').read_text())
+assert 'cpal' not in platform['dependencies'], 'CPAL must not leak into Scarlet builds'
+assert 'cpal' in platform['target']['cfg(not(target_os = "scarlet"))']['dependencies']
+assert 'scarlet-os' not in platform['dependencies'], 'Scheduler control must remain Scarlet-only'
+sas = platform['target']['cfg(target_os = "scarlet")']['dependencies']['sas-client']
+assert sas.get('git') == 'https://github.com/petitstrawberry/Scarlet' and sas.get('rev') == 'b3d2a55740a3d2ca49daad0ec7baba233f706f7a'
+assert 'path' not in sas, 'Native audio must use a portable Git pin'
+scheduler = platform['target']['cfg(target_os = "scarlet")']['dependencies']['scarlet-os']
+assert scheduler.get('git') == sas.get('git') and scheduler.get('rev') == sas.get('rev'), 'Scheduler and SAS must share the same Scarlet runtime'
+assert scheduler.get('features') == ['std'] and not scheduler.get('default-features', True)
+revision = '8468af9bcc977153259a82203962b84f9b78700a'
 repository = 'https://github.com/petitstrawberry/scarlet-ui'
 assert dependency.get('git') == repository, 'ScarletUI must use its Git source'
 assert dependency.get('rev') == revision, 'Review and update the ScarletUI pin explicitly'
 assert 'path' not in dependency, 'Committed ScarletUI dependency must not require a local checkout'
+editor = tomllib.loads((root / 'plugins/resonara-freeverb/editor/Cargo.toml').read_text())['dependencies']['scarlet-ui']
+assert editor.get('git') == repository and editor.get('rev') == revision
+assert not editor.get('default-features', True), 'Plugin editor selects its own platform adapter'
+assert 'resonara-freeverb-editor' not in app['dependencies'], 'Host must open Freeverb via CLAP GUI rather than a dedicated View'
 
-vendor = tomllib.loads((root / 'vendor/scarlet-ui-renderer-sgfx/Cargo.toml').read_text())
-assert vendor['dependencies']['scarlet-ui-core'].get('rev') == revision, 'Vendored renderer must share the ScarletUI core pin'
 
+runtime_repository = 'https://github.com/petitstrawberry/Scarlet'
+runtime_revision = 'b3d2a55740a3d2ca49daad0ec7baba233f706f7a'
 packages = tomllib.loads((root / 'Cargo.lock').read_text())['package']
 ui = [p for p in packages if p['name'].startswith('scarlet-ui') or p['name'] == 'scarlet-scroll-motion']
 expected = f'git+{repository}?rev={revision}#{revision}'
-renderer = [p for p in ui if p['name'] == 'scarlet-ui-renderer-sgfx']
-assert len(renderer) == 1 and 'source' not in renderer[0], 'The reviewed renderer patch must be workspace-local'
-assert ui and all(p.get('source') == expected for p in ui if p['name'] != 'scarlet-ui-renderer-sgfx'), 'Other ScarletUI crates must share one pinned source'
+assert ui and all(p.get('source') == expected for p in ui), 'All ScarletUI crates must share one pinned source'
+protocol = [p for p in packages if p['name'] == 'sws-protocol']
+assert len(protocol) == 1 and 'source' not in protocol[0], 'SWS protocol update must resolve once, workspace-local'
+for name in ('sws-client', 'sas-client', 'sas-protocol', 'scarlet-os'):
+    selected = [p for p in packages if p['name'] == name]
+    assert len(selected) == 1 and selected[0].get('source') == f'git+{runtime_repository}?rev={runtime_revision}#{runtime_revision}', f'{name} must retain one runtime identity shared with SGFX'
 workspace = tomllib.loads((root / 'Cargo.toml').read_text())
-patch = workspace['patch'][repository]['scarlet-ui-renderer-sgfx']
-assert patch == {'path': 'vendor/scarlet-ui-renderer-sgfx'}, 'Renderer patch must be portable'
+assert workspace.get('patch') == {runtime_repository: {'sws-protocol': {'path': 'vendor/sws-protocol'}}}, 'Only the portable SWS protocol update is needed'
 assert len(ui) == len({p['name'] for p in ui}), 'Duplicate ScarletUI crate identities'
 core = [p for p in packages if p['name'] == 'sgfx-core']
 assert len(core) == 1, 'SGFX core must resolve to one crate identity'
 assert core[0].get('source', '').startswith('git+https://github.com/petitstrawberry/sgfx?rev='), 'SGFX core must be Git-pinned'
-print(f'Dependency pins verified: {len(ui) - 1} pinned ScarletUI crates, one local renderer patch, one SGFX core identity')
+print(f'Dependency pins verified: {len(ui)} pinned ScarletUI crates, one local SWS protocol update, one SGFX core identity')
 PY
