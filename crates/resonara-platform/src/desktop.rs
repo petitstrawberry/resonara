@@ -23,6 +23,35 @@ impl Audio {
         self.controls = self.playback.controls.clone();
         Ok(())
     }
+    pub fn open_editor(&self, slot: usize) -> Result<bool> {
+        self.playback.open_editor(slot)
+    }
+    pub fn has_open_editors(&self) -> bool {
+        self.playback.has_open_editors().unwrap_or(false)
+    }
+    pub fn pause(&self) {
+        self.controls.playing.store(false, Ordering::Release);
+    }
+    pub fn seek(&self, start: u64) -> bool {
+        resonara_core::Engine::request_seek(&self.controls, start);
+        self.controls.position.store(start, Ordering::Relaxed);
+        true
+    }
+    pub fn resume(&self, start: u64, metronome: bool) -> bool {
+        self.controls.metronome.store(metronome, Ordering::Relaxed);
+        resonara_core::Engine::request_resume(&self.controls, start);
+        self.controls.position.store(start, Ordering::Relaxed);
+        true
+    }
+    pub fn close_editors(&self) -> Result<()> {
+        self.playback.close_editors()
+    }
+    pub fn poll_plugins(
+        &mut self,
+        force: bool,
+    ) -> Result<Vec<(usize, resonara_core::plugins::ClapInsert)>> {
+        self.playback.poll_plugins(force)
+    }
     pub fn collect_retired(&mut self) {
         self.playback.collect_retired();
     }
@@ -34,6 +63,17 @@ impl Audio {
         Self::start_with_metronome(project, start, false)
     }
     pub fn start_with_metronome(project: &Project, start: u64, metronome: bool) -> Result<Self> {
+        Self::start_transport(project, start, metronome, true)
+    }
+    pub fn start_paused(project: &Project) -> Result<Self> {
+        Self::start_transport(project, 0, false, false)
+    }
+    fn start_transport(
+        project: &Project,
+        start: u64,
+        metronome: bool,
+        playing: bool,
+    ) -> Result<Self> {
         project.validate()?;
         let device = cpal::default_host()
             .default_output_device()
@@ -43,6 +83,7 @@ impl Audio {
         let config: cpal::StreamConfig = supported.clone().into();
         let (playback, engine) = Playback::new(project, config.sample_rate.0, start, metronome)?;
         let controls = playback.controls.clone();
+        controls.playing.store(playing, Ordering::Relaxed);
         let error = controls.clone();
         let channels = config.channels as usize;
         let stream = match supported.sample_format() {

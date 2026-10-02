@@ -1,19 +1,22 @@
 //! Small, deliberately bounded CLAP effect host for trusted native plug-ins.
 //!
 //! Supported: one stereo float32 input/output, generic inactive parameters, opaque
-//! state, no latency, no note ports, no GUI. Loading a DSO executes native code;
+//! state, one disconnected mono/stereo sidechain, optional disconnected MIDI
+//! control input, no latency, no GUI. Loading a DSO executes native code;
 //! validation is not a security boundary. Use native binaries built for the OS.
 //!
 //! Create, activate, deactivate, state and destroy on the same owner/main thread.
 //! `RealtimePlugin` may move to an exclusive audio callback; keep its paired
 //! `PluginOwner` on the creating thread until that callback/proxy is destroyed.
-//! Each nonempty quantum is bracketed with start/process/stop on that quantum's
-//! symbolic audio thread. There is no allocation, lock,
+//! The first nonempty quantum starts processing; the exclusive proxy stops it
+//! at teardown. Processing state survives block boundaries. There is no allocation, lock,
 //! library loading or state work in the host's process path. Plug-ins must honor
 //! their own realtime contract. Off-owner destruction intentionally leaks the
 //! instance and DSO rather than running illegal callbacks or unloading live code.
 //! Callers should stop/rebuild an insert on `MainThreadRequest`/`RestartRequested`.
 //! Main callbacks are serviced while inactive, never silently called on audio.
+#[cfg(test)]
+mod compat_tests;
 mod gui;
 mod loader;
 pub use gui::GuiSupport;
@@ -299,6 +302,7 @@ struct HostContext {
     rescan: AtomicU32,
     dirty: AtomicBool,
     latency_changed: AtomicBool,
+    gui: gui::HostGui,
 }
 impl HostContext {
     fn new() -> Result<Self> {
@@ -315,6 +319,7 @@ impl HostContext {
             rescan: AtomicU32::new(0),
             dirty: AtomicBool::new(false),
             latency_changed: AtomicBool::new(false),
+            gui: gui::HostGui::new(),
         })
     }
     fn check_owner(&self) -> Result<()> {
@@ -343,7 +348,7 @@ unsafe extern "C" fn get_host_extension(_: *const clap_host, id: *const c_char) 
     } else if id == CLAP_EXT_LATENCY {
         (&HOST_LATENCY as *const clap_host_latency).cast()
     } else {
-        ptr::null()
+        gui::host_extension(id)
     }
 }
 unsafe extern "C" fn request_restart(h: *const clap_host) {
@@ -405,12 +410,16 @@ struct Instance {
     state: clap_plugin_state,
     latency: Option<clap_plugin_latency>,
     active: bool,
+    sidechain_channels: u32,
+    // Only the original owner accesses this cell, independently of immutable DSP identity.
+    editor: UnsafeCell<Option<gui::Editor>>,
     _library: LibraryLease,
 }
 unsafe impl Send for Instance {}
 impl Drop for Instance {
     fn drop(&mut self) {
         debug_assert_eq!(loader::thread_token(), self.context.owner);
+        gui::close(self).expect("CLAP owner checked before destruction");
         unsafe {
             if self.active {
                 (*self.plugin).deactivate.unwrap()(self.plugin);
@@ -522,6 +531,8 @@ impl HostPlugin {
             },
             latency: None,
             active: false,
+            sidechain_channels: 0,
+            editor: UnsafeCell::new(None),
             _library: library,
         });
         let created_descriptor = unsafe { (*instance.plugin).desc };
@@ -532,7 +543,7 @@ impl HostPlugin {
                 "CLAP instance descriptor differs from selected plugin",
             ));
         }
-        instance.validate_ports()?;
+        instance.sidechain_channels = instance.validate_ports()?;
         instance.params = unsafe { instance.extension::<clap_plugin_params>(CLAP_EXT_PARAMS) };
         instance.state = unsafe { instance.extension::<clap_plugin_state>(CLAP_EXT_STATE) }
             .ok_or_else(|| Error::new("CLAP state extension is required"))?;
@@ -706,6 +717,7 @@ impl HostPlugin {
         if i.context.rescan.swap(0, Ordering::Relaxed) != 0 {
             i.read_parameters()?;
         }
+        gui::service(i)?;
         if i.context.restart.load(Ordering::Relaxed) {
             return Err(Error::new(
                 "CLAP requested unsupported restart; reload this insert",
@@ -726,7 +738,9 @@ impl HostPlugin {
             return Err(Error::new("Invalid CLAP activation format"));
         }
         let i = self.instance_mut();
-        i.validate_ports()?;
+        i.sidechain_channels = i.validate_ports()?;
+        let sidechain =
+            (i.sidechain_channels != 0).then(|| [vec![0.; max_frames], vec![0.; max_frames]]);
         // Prepare all owned audio memory before calling activate.
         let input = [vec![0.; max_frames], vec![0.; max_frames]];
         let output = [vec![0.; max_frames], vec![0.; max_frames]];
@@ -759,9 +773,11 @@ impl HostPlugin {
                 shared,
                 input,
                 output,
+                sidechain,
                 max_frames,
                 steady_time: 0,
                 failure: None,
+                started: false,
                 _not_sync: PhantomData,
             },
         ))
@@ -792,7 +808,7 @@ impl Instance {
             Some(unsafe { *p })
         }
     }
-    fn validate_ports(&self) -> Result<()> {
+    fn validate_ports(&self) -> Result<u32> {
         let ports = unsafe { self.extension::<clap_plugin_audio_ports>(CLAP_EXT_AUDIO_PORTS) }
             .ok_or_else(|| Error::new("CLAP audio ports are required"))?;
         let count = ports
@@ -801,21 +817,45 @@ impl Instance {
         let get = ports
             .get
             .ok_or_else(|| Error::new("Invalid CLAP audio ports"))?;
+        let inputs = unsafe { count(self.plugin, true) };
+        let outputs = unsafe { count(self.plugin, false) };
+        if !(1..=2).contains(&inputs) || outputs != 1 {
+            return Err(Error::new(format!(
+                "CLAP requires one stereo output and up to two inputs (inputs={inputs}, outputs={outputs})"
+            )));
+        }
+        let mut sidechain_channels = 0;
         for input in [true, false] {
-            if unsafe { count(self.plugin, input) } != 1 {
-                return Err(Error::new(
-                    "CLAP effect must have exactly one input and output",
-                ));
-            }
-            let mut info: clap_audio_port_info = unsafe { std::mem::zeroed() };
-            if !unsafe { get(self.plugin, 0, input, &mut info) }
-                || info.id == CLAP_INVALID_ID
-                || info.channel_count != 2
-                || info.flags & CLAP_AUDIO_PORT_IS_MAIN == 0
-                || info.port_type.is_null()
-                || unsafe { CStr::from_ptr(info.port_type) } != CLAP_PORT_STEREO
-            {
-                return Err(Error::new("CLAP effect must use main stereo float32 ports"));
+            let mut ids = std::collections::BTreeSet::new();
+            for index in 0..if input { inputs } else { outputs } {
+                let mut info: clap_audio_port_info = unsafe { std::mem::zeroed() };
+                if !unsafe { get(self.plugin, index, input, &mut info) }
+                    || info.id == CLAP_INVALID_ID
+                    || !ids.insert(info.id)
+                    || info.port_type.is_null()
+                {
+                    return Err(Error::new("Invalid CLAP audio port metadata"));
+                }
+                let kind = unsafe { CStr::from_ptr(info.port_type) };
+                if index == 0 {
+                    if info.channel_count != 2
+                        || info.flags & CLAP_AUDIO_PORT_IS_MAIN == 0
+                        || kind != CLAP_PORT_STEREO
+                    {
+                        return Err(Error::new(format!(
+                            "CLAP main port must be stereo (input={input}, channels={})",
+                            info.channel_count
+                        )));
+                    }
+                } else {
+                    if info.flags & CLAP_AUDIO_PORT_IS_MAIN != 0
+                        || !((info.channel_count == 1 && kind == CLAP_PORT_MONO)
+                            || (info.channel_count == 2 && kind == CLAP_PORT_STEREO))
+                    {
+                        return Err(Error::new("CLAP auxiliary input must be mono or stereo"));
+                    }
+                    sidechain_channels = info.channel_count;
+                }
             }
         }
         if let Some(notes) =
@@ -824,12 +864,18 @@ impl Instance {
             let count = notes
                 .count
                 .ok_or_else(|| Error::new("Invalid CLAP note ports"))?;
-            if unsafe { count(self.plugin, true) } != 0 || unsafe { count(self.plugin, false) } != 0
+            // An effect may expose optional MIDI control. This audio-only host
+            // sends no note events, so one disconnected input is harmless.
+            if unsafe { count(self.plugin, true) } > 1 || unsafe { count(self.plugin, false) } != 0
             {
-                return Err(Error::new("CLAP note ports are unsupported"));
+                return Err(Error::new(format!(
+                    "CLAP note ports are unsupported (inputs={}, outputs={})",
+                    unsafe { count(self.plugin, true) },
+                    unsafe { count(self.plugin, false) }
+                )));
             }
         }
-        Ok(())
+        Ok(sidechain_channels)
     }
     fn read_parameters(&mut self) -> Result<()> {
         self.parameters.clear();
@@ -909,9 +955,11 @@ pub struct RealtimePlugin {
     shared: Arc<InstanceCell>,
     input: [Vec<f32>; 2],
     output: [Vec<f32>; 2],
+    sidechain: Option<[Vec<f32>; 2]>,
     max_frames: usize,
     steady_time: i64,
     failure: Option<ProcessError>,
+    started: bool,
     _not_sync: PhantomData<Cell<()>>,
 }
 unsafe impl Send for RealtimePlugin {}
@@ -932,6 +980,51 @@ impl RealtimePlugin {
     }
     pub fn failure(&self) -> Option<ProcessError> {
         self.failure
+    }
+    /// Service GUI edits on the symbolic audio thread while transport is stopped.
+    /// This is serialized with process by the same exclusive proxy.
+    pub fn flush_pending(&mut self) -> std::result::Result<(), ProcessError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let i = self.instance();
+        let result = (|| {
+            check_requests(&i.context)?;
+            if i.context.flush.swap(false, Ordering::AcqRel) {
+                let token = loader::thread_token();
+                if token == 0 {
+                    return Err(ProcessError::StartFailed);
+                }
+                i.context.audio.store(token, Ordering::Relaxed);
+                if let Some(params) = i.params {
+                    unsafe {
+                        params.flush.unwrap()(
+                            i.plugin,
+                            &empty_events(),
+                            &output_events(&i.context),
+                        );
+                    }
+                }
+                i.context.audio.store(0, Ordering::Relaxed);
+                check_requests(&i.context)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+        result
+    }
+    /// Clear transport-dependent DSP history without destroying GUI or activation.
+    pub fn reset_transport(&mut self) {
+        let i = self.instance();
+        i.context
+            .audio
+            .store(loader::thread_token(), Ordering::Relaxed);
+        unsafe {
+            (*i.plugin).reset.unwrap()(i.plugin);
+        }
+        i.context.audio.store(0, Ordering::Relaxed);
     }
     pub fn process(
         &mut self,
@@ -969,13 +1062,27 @@ impl RealtimePlugin {
         self.output[1][..audio.len()].fill(0.);
         let mut input_ptrs = [self.input[0].as_mut_ptr(), self.input[1].as_mut_ptr()];
         let mut output_ptrs = [self.output[0].as_mut_ptr(), self.output[1].as_mut_ptr()];
-        let input = clap_audio_buffer {
+        let mut sidechain_ptrs = [ptr::null_mut(); 2];
+        let mut inputs = [clap_audio_buffer {
             data32: input_ptrs.as_mut_ptr(),
             data64: ptr::null_mut(),
             channel_count: 2,
             latency: 0,
             constant_mask: 0,
-        };
+        }; 2];
+        if let Some(sidechain) = &mut self.sidechain {
+            for channel in 0..2 {
+                sidechain[channel][..audio.len()].fill(0.);
+                sidechain_ptrs[channel] = sidechain[channel].as_mut_ptr();
+            }
+            inputs[1] = clap_audio_buffer {
+                data32: sidechain_ptrs.as_mut_ptr(),
+                data64: ptr::null_mut(),
+                channel_count: i.sidechain_channels,
+                latency: 0,
+                constant_mask: (1 << i.sidechain_channels) - 1,
+            };
+        }
         let mut output = clap_audio_buffer {
             data32: output_ptrs.as_mut_ptr(),
             data64: ptr::null_mut(),
@@ -989,9 +1096,9 @@ impl RealtimePlugin {
             steady_time: self.steady_time,
             frames_count: audio.len() as u32,
             transport: ptr::null(),
-            audio_inputs: &input,
+            audio_inputs: inputs.as_ptr(),
             audio_outputs: &mut output,
-            audio_inputs_count: 1,
+            audio_inputs_count: if self.sidechain.is_some() { 2 } else { 1 },
             audio_outputs_count: 1,
             in_events: &events,
             out_events: &output_events,
@@ -1003,17 +1110,19 @@ impl RealtimePlugin {
             return Err(ProcessError::StartFailed);
         }
         i.context.audio.store(token, Ordering::Relaxed);
-        if !unsafe { (*i.plugin).start_processing.unwrap()(i.plugin) } {
-            i.context.audio.store(0, Ordering::Relaxed);
-            return Err(ProcessError::StartFailed);
+        if !self.started {
+            if !unsafe { (*i.plugin).start_processing.unwrap()(i.plugin) } {
+                i.context.audio.store(0, Ordering::Relaxed);
+                return Err(ProcessError::StartFailed);
+            }
+            self.started = true;
         }
+        i.context.flush.swap(false, Ordering::Relaxed);
         let status = unsafe { (*i.plugin).process.unwrap()(i.plugin, &process) };
-        unsafe {
-            (*i.plugin).stop_processing.unwrap()(i.plugin);
-        }
         i.context.audio.store(0, Ordering::Relaxed);
         self.steady_time = self.steady_time.saturating_add(audio.len() as i64);
-        i.context.flush.store(false, Ordering::Relaxed); // process serviced request_process/flush
+        // A concurrent GUI request must survive until the next process call.
+        // process itself performs the bidirectional parameter flush.
         check_requests(&i.context)?;
         let status = match status {
             CLAP_PROCESS_ERROR => return Err(ProcessError::PluginError),
@@ -1046,7 +1155,26 @@ impl RealtimePlugin {
         Ok(status)
     }
 }
-// Dropping the audio proxy never calls deactivate/destroy/deinit/dlclose.
+impl Drop for RealtimePlugin {
+    fn drop(&mut self) {
+        if self.started {
+            // Exclusive ownership of this proxy proves all processing finished.
+            // A backend joins/destroys its callback first; graph retirement also
+            // transfers this proxy exclusively to the control thread. CLAP allows
+            // that thread to be the symbolic audio thread during stop_processing.
+            let instance = self.instance();
+            instance
+                .context
+                .audio
+                .store(loader::thread_token(), Ordering::Relaxed);
+            unsafe {
+                (*instance.plugin).stop_processing.unwrap()(instance.plugin);
+            }
+            instance.context.audio.store(0, Ordering::Relaxed);
+        }
+    }
+}
+// Dropping the audio proxy stops processing, but never deactivates/destroys/unloads.
 // The non-realtime owner guard must outlive this proxy.
 
 struct InstanceCell {
@@ -1082,6 +1210,67 @@ impl fmt::Debug for PluginOwner {
     }
 }
 impl PluginOwner {
+    fn instance(&self) -> &Instance {
+        // Shared identity is immutable until the realtime proxy is gone.
+        unsafe {
+            (&*self.shared.as_ref().unwrap().inner.get())
+                .as_ref()
+                .unwrap()
+        }
+    }
+    /// Service active owner callbacks and native GUI events. Never flush active
+    /// parameters here: the audio proxy's process call delivers GUI edits.
+    pub fn service_main_thread(&self) -> Result<()> {
+        let i = self.instance();
+        i.context.check_owner()?;
+        service_callbacks(i)?;
+        gui::service(i)
+    }
+    pub fn open_editor(&self) -> Result<bool> {
+        gui::open(self.instance())
+    }
+    pub fn close_editor(&self) -> Result<()> {
+        gui::close(self.instance())
+    }
+    pub fn editor_is_open(&self) -> Result<bool> {
+        gui::is_open(self.instance())
+    }
+    /// CLAP state.save and params.get_value are main-thread methods, permitted
+    /// while active. No host metadata, audio buffers or DSP proxy are mutated.
+    pub fn editor_snapshot(&self, force: bool) -> Result<Option<(Vec<(u32, f64)>, Vec<u8>)>> {
+        let i = self.instance();
+        i.context.check_owner()?;
+        if !force && !i.context.dirty.swap(false, Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let mut values = Vec::with_capacity(i.parameters.len());
+        if let Some(params) = i.params {
+            for parameter in &i.parameters {
+                let mut value = 0.;
+                if !unsafe { params.get_value.unwrap()(i.plugin, parameter.id, &mut value) }
+                    || !value.is_finite()
+                    || !(parameter.min_value..=parameter.max_value).contains(&value)
+                {
+                    i.context.dirty.store(true, Ordering::Relaxed);
+                    return Err(Error::new("Invalid CLAP editor parameter value"));
+                }
+                values.push((parameter.id, value));
+            }
+        }
+        let mut output = StateOutput {
+            bytes: Vec::new(),
+            failed: false,
+        };
+        let stream = clap_ostream {
+            ctx: (&mut output as *mut StateOutput).cast(),
+            write: Some(write_state),
+        };
+        if !unsafe { i.state.save.unwrap()(i.plugin, &stream) } || output.failed {
+            i.context.dirty.store(true, Ordering::Relaxed);
+            return Err(Error::new("CLAP editor state save failed"));
+        }
+        Ok(Some((values, output.bytes)))
+    }
     pub fn realtime_alive(&self) -> bool {
         self.shared
             .as_ref()
@@ -1089,6 +1278,7 @@ impl PluginOwner {
     }
     /// Retrieve inactive state after dropping the realtime proxy, on the owner.
     pub fn deactivate(mut self) -> Result<HostPlugin> {
+        self.close_editor()?;
         let shared = self.shared.as_mut().unwrap();
         let cell =
             Arc::get_mut(shared).ok_or_else(|| Error::new("CLAP audio proxy is still alive"))?;
@@ -1114,13 +1304,27 @@ impl Drop for PluginOwner {
         // If another proxy exists, InstanceCell quarantines on final drop.
     }
 }
+fn service_callbacks(i: &Instance) -> Result<()> {
+    i.context.check_owner()?;
+    for _ in 0..16 {
+        if !i.context.callback.swap(false, Ordering::Relaxed) {
+            break;
+        }
+        unsafe {
+            (*i.plugin).on_main_thread.unwrap()(i.plugin);
+        }
+    }
+    if i.context.callback.load(Ordering::Relaxed) {
+        return Err(Error::new("CLAP main-thread callback did not settle"));
+    }
+    Ok(())
+}
 fn check_requests(c: &HostContext) -> std::result::Result<(), ProcessError> {
     if c.restart.load(Ordering::Relaxed) {
         Err(ProcessError::RestartRequested)
-    } else if c.callback.load(Ordering::Relaxed) {
-        Err(ProcessError::MainThreadRequest)
     } else if c.latency_changed.load(Ordering::Relaxed)
-        || c.rescan.load(Ordering::Relaxed) & !(CLAP_PARAM_RESCAN_VALUES | CLAP_PARAM_RESCAN_TEXT)
+        || c.rescan.load(Ordering::Relaxed)
+            & !(CLAP_PARAM_RESCAN_VALUES | CLAP_PARAM_RESCAN_TEXT | CLAP_PARAM_RESCAN_INFO)
             != 0
     {
         Err(ProcessError::UnsupportedChange)

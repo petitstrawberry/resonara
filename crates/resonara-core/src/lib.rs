@@ -362,6 +362,8 @@ pub struct Controls {
     pub master_peak_left: AtomicU32,
     pub master_peak_right: AtomicU32,
     pub position: Arc<AtomicU64>,
+    /// Coalesced transport seek, consumed only by the audio thread.
+    pub seek: Arc<AtomicU64>,
     pub playing: Arc<AtomicBool>,
     pub error: Arc<AtomicBool>,
     /// Active reachable CLAP inserts that could not be prepared. Playback uses
@@ -411,6 +413,7 @@ impl Controls {
             master_peak_left: AtomicU32::new(0),
             master_peak_right: AtomicU32::new(0),
             position: Arc::new(AtomicU64::new(0)),
+            seek: Arc::new(AtomicU64::new(u64::MAX)),
             playing: Arc::new(AtomicBool::new(true)),
             error: Arc::new(AtomicBool::new(false)),
             unavailable_plugins: AtomicU32::new(0),
@@ -451,6 +454,7 @@ impl Engine {
         let limits = p.routing_limits();
         let mut engine = Self::with_graph(p, controls, device_rate, start, &routing, limits)?;
         engine.graph.set_insert_controls(&insert_controls);
+        engine.refresh_insert_controls();
         Ok(engine)
     }
     /// Prepare an explicit runtime graph outside the audio callback, overriding
@@ -554,6 +558,9 @@ impl Engine {
     pub fn take_plugin_owners(&mut self) -> Vec<PluginOwner> {
         self.graph.take_plugin_owners()
     }
+    pub(crate) fn take_keyed_plugin_owners(&mut self) -> Vec<(usize, PluginOwner)> {
+        self.graph.take_keyed_plugin_owners()
+    }
     /// Adopt the exact next sample at a live graph boundary, including the
     /// fractional project-frame position when device and project rates differ.
     pub(crate) fn continue_from(&mut self, previous: &Self) {
@@ -566,6 +573,34 @@ impl Engine {
         self.controls
             .position
             .store(self.position as u64, Ordering::Relaxed);
+    }
+    fn refresh_insert_controls(&mut self) {
+        for (bypass, control) in self
+            .block_insert_bypasses
+            .iter_mut()
+            .zip(&self.controls.insert_bypasses)
+        {
+            *bypass = control.load(Ordering::Relaxed);
+        }
+        let missing = self.graph.refresh_unavailable(&self.block_insert_bypasses);
+        self.controls
+            .unavailable_plugins
+            .store(missing, Ordering::Relaxed);
+    }
+    /// Control thread requests a new position; DSP and GUI instances survive.
+    pub fn request_seek(controls: &Controls, start: u64) {
+        controls
+            .seek
+            .store(start.min((1u64 << 63) - 2), Ordering::Release);
+    }
+    /// Resume and seek are adopted together at the next audio block boundary,
+    /// even when the previous block reached EOF while the request was queued.
+    pub fn request_resume(controls: &Controls, start: u64) {
+        controls.seek.store(
+            start.min((1u64 << 63) - 2) | (1u64 << 63),
+            Ordering::Release,
+        );
+        controls.playing.store(true, Ordering::Release);
     }
     pub fn graph_info(&self) -> &graph::GraphInfo {
         self.graph.info()
@@ -593,11 +628,27 @@ impl Engine {
             .any(|m| m.solo.load(Ordering::Relaxed));
         let master = f32::from_bits(self.controls.master.load(Ordering::Relaxed));
         let metronome_enabled = self.controls.metronome.load(Ordering::Relaxed);
+        self.clock_only |= self.duration == 0 && metronome_enabled;
         let quantum = self.graph.info().quantum;
         for chunk in out.chunks_mut(channels.saturating_mul(quantum)) {
+            self.refresh_insert_controls();
+            let seek = self.controls.seek.swap(u64::MAX, Ordering::AcqRel);
+            if seek != u64::MAX {
+                if seek & (1u64 << 63) != 0 {
+                    self.controls.playing.store(true, Ordering::Relaxed);
+                }
+                let start = seek & !(1u64 << 63);
+                self.position = if self.clock_only {
+                    start
+                } else {
+                    start.min(self.duration)
+                } as f64;
+                self.graph.reset_transport();
+            }
             let frames = chunk.len().div_ceil(channels);
             let mut active = 0;
-            if !self.faulted && self.controls.playing.load(Ordering::Relaxed) {
+            let playing = self.controls.playing.load(Ordering::Acquire);
+            if !self.faulted && playing {
                 for position in &mut self.positions[..frames] {
                     if !self.clock_only && self.position >= self.duration as f64 {
                         break;
@@ -607,7 +658,8 @@ impl Engine {
                     active += 1;
                 }
             }
-            if active < frames {
+            if playing && active < frames && self.controls.seek.load(Ordering::Acquire) == u64::MAX
+            {
                 self.controls.playing.store(false, Ordering::Relaxed);
             }
             if active > 0 {
@@ -644,13 +696,6 @@ impl Engine {
                     *gain = f32::from_bits(control.load(Ordering::Relaxed));
                 }
                 let tracks = &self.tracks;
-                for (bypass, control) in self
-                    .block_insert_bypasses
-                    .iter_mut()
-                    .zip(&self.controls.insert_bypasses)
-                {
-                    *bypass = control.load(Ordering::Relaxed);
-                }
                 let interpolation_ends = &self.clip_interpolation_ends;
                 let positions = &self.positions;
                 let processed = self.graph.process(
@@ -715,6 +760,11 @@ impl Engine {
                         .peak_right
                         .fetch_max(mix.peak[1].to_bits(), Ordering::Relaxed);
                 }
+            }
+            if active == 0 && !self.faulted && !self.graph.flush_plugins() {
+                self.faulted = true;
+                self.controls.error.store(true, Ordering::Relaxed);
+                self.controls.playing.store(false, Ordering::Relaxed);
             }
             // Retain the existing hard EOF boundary for this foundation. Effect
             // tails, latency compensation and live graph replacement are separate work.

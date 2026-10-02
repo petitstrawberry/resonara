@@ -149,3 +149,30 @@ fn concurrent_graph_publication_and_retirement_remain_bounded() {
     assert_eq!(playback.controls.position.load(Ordering::Relaxed), 10_001);
     drop(renderer);
 }
+
+#[test]
+fn latest_seek_survives_graph_handoff_and_preserves_fractional_device_clock() {
+    let project = source();
+    let (mut playback, mut renderer) = Playback::new(&project, 44100, 0, false).unwrap();
+    let original_position = playback.controls.position.clone();
+    let mut output = [0f32; 128];
+    renderer.render(&mut output, 2);
+    // Coalesce scrubbing, then replace the graph before the callback sees it.
+    Engine::request_seek(&playback.controls, 100);
+    Engine::request_seek(&playback.controls, 400);
+    let mut changed = project.clone();
+    changed.tracks[0].routing.inserts.push(Insert {
+        kind: InsertKind::Gain { gain: 0.5 },
+        bypass: false,
+    });
+    playback.update(&changed).unwrap();
+    renderer.render(&mut output, 2);
+    assert!(Arc::ptr_eq(&original_position, &playback.controls.position));
+    let expected = (400f64 + 64. * project.sample_rate as f64 / 44100.) as u64;
+    assert_eq!(playback.controls.position.load(Ordering::Relaxed), expected);
+    assert!(output.iter().any(|sample| *sample != 0.));
+    assert!(playback.controls.playing.load(Ordering::Relaxed));
+    assert!(!playback.controls.error.load(Ordering::Relaxed));
+    drop(renderer);
+    playback.collect_retired();
+}

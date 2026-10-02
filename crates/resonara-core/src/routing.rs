@@ -392,10 +392,9 @@ impl Project {
             let fader = NodeId(source.0 + 1);
             let mut tap = source;
             for (slot, insert) in routing.inserts.iter().enumerate() {
-                // A bypassed external plugin need not be loaded. Enabling it
-                // prepares a replacement graph; built-ins stay allocated live.
-                if insert.bypass && (!live_bypass || matches!(insert.kind, InsertKind::Clap { .. }))
-                {
+                // Live bypass keeps every processor (and its GUI) allocated.
+                // Static/offline routing can still omit disabled inserts.
+                if insert.bypass && !live_bypass {
                     continue;
                 }
                 let id = NodeId(graph.nodes.len() as u64);

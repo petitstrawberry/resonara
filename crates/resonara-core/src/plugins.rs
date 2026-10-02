@@ -243,3 +243,54 @@ pub(crate) fn activate(
 ) -> Result<(PluginOwner, RealtimePlugin)> {
     Ok(load_inactive(insert)?.activate(sample_rate as f64, quantum)?)
 }
+
+/// Main-thread editor for a stopped/bypassed insert. Playback editors instead
+/// use the live PluginOwner, never a second instance of the playing processor.
+pub struct ClapEditor {
+    host: HostPlugin,
+    library: String,
+}
+impl ClapEditor {
+    pub fn open(insert: &ClapInsert) -> Result<Option<Self>> {
+        let host = load_inactive(insert)?;
+        if !host.open_editor()? {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            host,
+            library: insert.library.clone(),
+        }))
+    }
+    pub fn poll(&mut self) -> Result<bool> {
+        self.host.service_main_thread()?;
+        Ok(self.host.editor_is_open()?)
+    }
+    pub fn snapshot(&mut self, force: bool) -> Result<Option<ClapInsert>> {
+        if !force && !self.host.take_editor_dirty()? {
+            return Ok(None);
+        }
+        snapshot(&mut self.host, &self.library).map(Some)
+    }
+    pub fn close(&self) -> Result<()> {
+        self.host.close_editor()?;
+        Ok(())
+    }
+}
+pub(crate) fn snapshot_live(
+    owner: &PluginOwner,
+    previous: &ClapInsert,
+    force: bool,
+) -> Result<Option<ClapInsert>> {
+    let Some((values, state)) = owner.editor_snapshot(force)? else {
+        return Ok(None);
+    };
+    let mut insert = previous.clone();
+    insert.state = state;
+    for parameter in &mut insert.parameters {
+        if let Some((_, value)) = values.iter().find(|(id, _)| *id == parameter.id) {
+            parameter.value = *value;
+        }
+    }
+    insert.validate()?;
+    Ok(Some(insert))
+}

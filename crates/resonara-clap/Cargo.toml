@@ -6,5 +6,10 @@ edition = "2024"
 [dependencies]
 clap-sys = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.4"
+objc2-foundation = { version = "=0.3.2", features = ["NSString", "NSThread"] }
+objc2-app-kit = { version = "=0.3.2", features = ["NSApplication", "NSWindow", "NSView", "NSResponder", "NSGraphics"] }
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }

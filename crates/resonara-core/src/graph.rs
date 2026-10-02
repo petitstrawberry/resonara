@@ -383,7 +383,8 @@ impl CompiledGraph {
             .count();
         let plugin_scratch_bytes = plugin_count
             .checked_mul(limits.quantum)
-            .and_then(|frames| frames.checked_mul(4 * std::mem::size_of::<f32>()))
+            // Two main input/output planes and at most two disconnected sidechain planes.
+            .and_then(|frames| frames.checked_mul(6 * std::mem::size_of::<f32>()))
             .ok_or("CLAP scratch size overflow")?;
         let scratch_bytes = scratch_frames
             .checked_mul(std::mem::size_of::<[f32; 2]>())
@@ -471,12 +472,60 @@ impl CompiledGraph {
     pub fn take_plugin_owners(&mut self) -> Vec<PluginOwner> {
         std::mem::take(&mut self.plugin_owners)
     }
+    pub(crate) fn take_keyed_plugin_owners(&mut self) -> Vec<(usize, PluginOwner)> {
+        let slots: Vec<_> = self
+            .operations
+            .iter()
+            .filter_map(|op| {
+                matches!(op.processor, RuntimeProcessor::Clap(_)).then_some(op.insert_control)
+            })
+            .collect();
+        slots
+            .into_iter()
+            .zip(self.take_plugin_owners())
+            .filter_map(|(slot, owner)| slot.map(|slot| (slot, owner)))
+            .collect()
+    }
     pub(crate) fn set_insert_controls(&mut self, controls: &[(NodeId, usize)]) {
         for op in &mut self.operations {
             op.insert_control = controls
                 .iter()
                 .find(|(id, _)| *id == op.id)
                 .map(|(_, slot)| *slot);
+        }
+    }
+    pub(crate) fn refresh_unavailable(&mut self, bypasses: &[bool]) -> u32 {
+        self.info.unavailable_plugins = self
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(op.processor, RuntimeProcessor::MissingClap)
+                    && !op.insert_control.is_some_and(|slot| bypasses[slot])
+            })
+            .count() as u32;
+        self.info.unavailable_plugins
+    }
+    pub(crate) fn flush_plugins(&mut self) -> bool {
+        for op in &mut self.operations {
+            if let RuntimeProcessor::Clap(plugin) = &mut op.processor
+                && plugin.flush_pending().is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+    pub(crate) fn reset_transport(&mut self) {
+        for op in &mut self.operations {
+            match &mut op.processor {
+                RuntimeProcessor::Clap(plugin) => plugin.reset_transport(),
+                RuntimeProcessor::Delay { ring, cursor } => {
+                    ring.fill([0.; 2]);
+                    *cursor = 0;
+                }
+                RuntimeProcessor::OnePole { previous, .. } => *previous = [0.; 2],
+                _ => {}
+            }
         }
     }
     pub fn info(&self) -> &GraphInfo {
@@ -527,7 +576,13 @@ impl CompiledGraph {
             }
             let block = &mut self.scratch[start..start + frames];
             if op.insert_control.is_some_and(|slot| insert_bypasses[slot]) {
-                // Dry passthrough, retaining the prepared effect's DSP state.
+                // Dry passthrough retains DSP/GUI lifetime. Still deliver GUI
+                // parameter edits on this same symbolic audio thread.
+                if let RuntimeProcessor::Clap(plugin) = &mut op.processor
+                    && plugin.flush_pending().is_err()
+                {
+                    return false;
+                }
                 op.calls = op.calls.saturating_add(1);
                 continue;
             }

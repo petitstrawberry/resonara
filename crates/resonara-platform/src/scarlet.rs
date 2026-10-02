@@ -84,6 +84,31 @@ impl Audio {
         self.controls = self.playback.controls.clone();
         Ok(())
     }
+    pub fn open_editor(&self, slot: usize) -> Result<bool> {
+        self.playback.open_editor(slot)
+    }
+    pub fn has_open_editors(&self) -> bool {
+        false
+    }
+    pub fn pause(&self) {
+        self.controls.playing.store(false, Ordering::Relaxed);
+    }
+    // SAS drains/finishes its producer at Stop; restart it through normal setup.
+    pub fn seek(&self, _: u64) -> bool {
+        false
+    }
+    pub fn resume(&self, _: u64, _: bool) -> bool {
+        false
+    }
+    pub fn close_editors(&self) -> Result<()> {
+        self.playback.close_editors()
+    }
+    pub fn poll_plugins(
+        &mut self,
+        force: bool,
+    ) -> Result<Vec<(usize, resonara_core::plugins::ClapInsert)>> {
+        self.playback.poll_plugins(force)
+    }
     pub fn collect_retired(&mut self) {
         self.playback.collect_retired();
     }

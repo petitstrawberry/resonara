@@ -4,6 +4,7 @@ mod fader;
 mod insert_slot;
 mod knob;
 mod meter;
+mod native_editor;
 mod profiling;
 mod ruler;
 mod send_knob;
@@ -131,8 +132,8 @@ struct IoResult {
 struct Model {
     project: Project,
     audio: Option<Audio>,
-    // Keep a naturally finished output alive until the next transport/edit action.
-    // SAS has a separate device queue after its shared client ring is consumed.
+    // Keep stopped native editor/DSP sessions alive for resume, and retain
+    // naturally finished outputs for SAS's separately queued hardware tail.
     retired_audio: Option<Audio>,
     selected: usize,
     selected_bus: Option<BusId>,
@@ -169,6 +170,9 @@ struct Daw {
     insert_focus: Rc<RefCell<std::collections::HashMap<(RoutingTarget, usize), State<bool>>>>,
     plugin_fields: Rc<RefCell<Vec<(u32, State<String>)>>>,
     plugin_catalog: Rc<RefCell<resonara_core::plugins::ClapCatalog>>,
+    native_editor: Rc<RefCell<Option<(RoutingTarget, usize, resonara_core::plugins::ClapEditor)>>>,
+    native_edit_group: Rc<Cell<bool>>,
+    native_edit_time: Rc<Cell<Instant>>,
     send_controls:
         Rc<RefCell<std::collections::HashMap<(RoutingTarget, usize), routing::SendControl>>>,
     follow_playhead: State<bool>,
@@ -257,6 +261,9 @@ impl Daw {
             insert_focus: Rc::new(RefCell::new(std::collections::HashMap::new())),
             plugin_fields: Rc::new(RefCell::new(vec![])),
             plugin_catalog: Rc::new(RefCell::new(Default::default())),
+            native_editor: Rc::new(RefCell::new(None)),
+            native_edit_group: Rc::new(Cell::new(false)),
+            native_edit_time: Rc::new(Cell::new(Instant::now())),
             send_controls: Rc::new(RefCell::new(std::collections::HashMap::new())),
             follow_playhead: state(34, false),
             follow_suspended: Rc::new(Cell::new(false)),
@@ -560,6 +567,8 @@ impl Daw {
         self.changed();
     }
     fn edit(&self, label: &str, f: impl FnOnce(&mut Model) -> Result<()>) {
+        self.poll_native_editors(true);
+        self.native_edit_group.set(false);
         self.track_menu.set(None);
         self.routing_menu.set(None);
         if self.busy() {
@@ -567,6 +576,22 @@ impl Daw {
         }
         self.finish_mix();
         let mut m = self.model.borrow_mut();
+        // Retain a stopped editor across unrelated edits. Its slot is scoped to
+        // this project layout, so invalidate it if the edit replaces that insert.
+        let editor_insert = self
+            .native_editor
+            .borrow()
+            .as_ref()
+            .map(|(target, slot, _)| {
+                (
+                    *target,
+                    *slot,
+                    target
+                        .get(&m.project)
+                        .and_then(|r| r.inserts.get(*slot))
+                        .map(|i| i.kind.clone()),
+                )
+            });
         let before = Self::snapshot(&m);
         match f(&mut m).and_then(|()| Self::sync_audio(&mut m)) {
             Ok(()) => {
@@ -578,11 +603,23 @@ impl Daw {
                 self.status.set(format!("Could not {label}: {e}"));
             }
         }
+        let invalidate_editor = editor_insert.is_some_and(|(target, slot, previous)| {
+            previous
+                != target
+                    .get(&m.project)
+                    .and_then(|r| r.inserts.get(slot))
+                    .map(|i| i.kind.clone())
+        });
         drop(m);
+        if invalidate_editor {
+            // The old state was captured before the edit. Do not snapshot the
+            // retired editor into a slot that now belongs to a different insert.
+            self.native_editor.borrow_mut().take();
+        }
         self.refresh(true);
     }
     fn sync_audio(m: &mut Model) -> Result<()> {
-        if let Some(audio) = &mut m.audio {
+        if let Some(audio) = m.audio.as_mut().or(m.retired_audio.as_mut()) {
             audio.update(&m.project)?;
         }
         Ok(())
@@ -598,6 +635,8 @@ impl Daw {
         }
     }
     fn undo(&self, redo: bool) {
+        self.close_native_editors();
+        self.native_edit_group.set(false);
         if self.busy() {
             return;
         }
@@ -726,6 +765,7 @@ impl Daw {
             self.stop_audio(true);
             return;
         }
+        self.poll_native_editors(true);
         self.finish_mix();
         self.reset_meters();
         let result = self.seconds(&self.cursor.get()).and_then(|start| {
@@ -738,8 +778,17 @@ impl Daw {
             } else {
                 start
             };
-            m.retired_audio = None;
-            let a = Audio::start_with_metronome(&m.project, start, self.metronome.get())?;
+            let a = if let Some(mut audio) = m.retired_audio.take() {
+                audio.update(&m.project)?;
+                if audio.resume(start, self.metronome.get()) {
+                    audio
+                } else {
+                    drop(audio);
+                    Audio::start_with_metronome(&m.project, start, self.metronome.get())?
+                }
+            } else {
+                Audio::start_with_metronome(&m.project, start, self.metronome.get())?
+            };
             let missing = a.controls.unavailable_plugins.load(Ordering::Relaxed);
             self.status.set(if missing == 0 {
                 format!("Playing · {}", a.device)
@@ -793,8 +842,14 @@ impl Daw {
         self.finish_audio(message, false);
     }
     fn finish_audio(&self, message: bool, preserve_device_tail: bool) {
+        self.poll_native_editors(true);
         let mut m = self.model.borrow_mut();
-        m.retired_audio = None;
+        if m.retired_audio
+            .as_ref()
+            .is_some_and(|a| !a.has_open_editors())
+        {
+            m.retired_audio = None;
+        }
         if let Some(a) = m.audio.take() {
             let pos =
                 a.controls.position.load(Ordering::Relaxed) as f64 / m.project.sample_rate as f64;
@@ -806,7 +861,10 @@ impl Daw {
                 m.project.sample_rate,
                 m.project.time_signature,
             ));
-            if preserve_device_tail {
+            a.pause();
+            if preserve_device_tail
+                || (a.has_open_editors() && !a.controls.error.load(Ordering::Relaxed))
+            {
                 m.retired_audio = Some(a);
             }
         }
@@ -886,13 +944,26 @@ impl Daw {
     }
     fn seek(&self, seconds: f64) {
         let was_playing = self.model.borrow().audio.is_some();
-        self.stop_audio(false);
         let seconds = seconds.max(0.);
+        let direct = {
+            let m = self.model.borrow();
+            let start = (seconds * m.project.sample_rate as f64).round() as u64;
+            if let Some(audio) = m.audio.as_ref() {
+                audio.resume(start, self.metronome.get())
+            } else {
+                m.retired_audio
+                    .as_ref()
+                    .is_some_and(|audio| audio.seek(start))
+            }
+        };
+        if !direct {
+            self.stop_audio(false);
+        }
         self.playhead.set(seconds);
         self.cursor.set(timeline::seconds_input(seconds));
         self.animate_playhead(seconds);
         self.update_frames();
-        if was_playing {
+        if was_playing && !direct {
             self.play();
         }
     }
@@ -1444,12 +1515,16 @@ impl Daw {
         self.start_io(action, path);
     }
     fn start_io(&self, action: FileAction, path: PathBuf) {
+        self.poll_native_editors(true);
+        self.native_edit_group.set(false);
         if self.busy() {
             return;
         }
         self.finish_mix();
         if action == FileAction::Open {
+            self.close_native_editors();
             self.stop_audio(false);
+            self.model.borrow_mut().retired_audio = None;
         }
         let mut m = self.model.borrow_mut();
         if m.io.is_some() || m.picker.is_some() {
@@ -2361,6 +2436,7 @@ impl Application for Daw {
         if self.busy() {
             return false;
         }
+        self.close_native_editors();
         self.finish_mix();
         self.track_menu.set(None);
         if self.dirty() {
@@ -2384,8 +2460,13 @@ impl Application for Daw {
         }
     }
     fn on_idle(&mut self) {
-        if let Some(audio) = &mut self.model.borrow_mut().audio {
-            audio.collect_retired();
+        self.poll_native_editors(false);
+        {
+            let mut m = self.model.borrow_mut();
+            let m = &mut *m;
+            if let Some(audio) = m.audio.as_mut().or(m.retired_audio.as_mut()) {
+                audio.collect_retired();
+            }
         }
         if self.profiler.borrow().expired() {
             self.finish_profile();
@@ -2539,9 +2620,21 @@ fn smoke() -> Result<()> {
             bypass: false,
         });
     }
-    if std::env::var_os("RESONARA_SMOKE_CLAP").is_some() {
-        let plugin = resonara_core::plugins::load_bundled_gain()?;
-        let plugin = resonara_core::plugins::set_parameter(&plugin, 0, 0.5)?;
+    let clap_id = std::env::var("RESONARA_SMOKE_CLAP_ID").ok();
+    if std::env::var_os("RESONARA_SMOKE_CLAP").is_some() || clap_id.is_some() {
+        let plugin = if let Some(id) = clap_id {
+            let catalog = resonara_core::plugins::scan_installed();
+            let choice = catalog
+                .effects
+                .iter()
+                .find(|c| c.plugin_id == id)
+                .ok_or_else(|| format!("Smoke CLAP ID not installed: {id}"))?;
+            resonara_core::plugins::load_installed(choice)?
+        } else {
+            let plugin = resonara_core::plugins::load_bundled_gain()?;
+            resonara_core::plugins::set_parameter(&plugin, 0, 0.5)?
+        };
+        println!("Smoke CLAP: {} ({})", plugin.name, plugin.plugin_id);
         p.tracks[0].routing.inserts.push(resonara_core::Insert {
             kind: resonara_core::InsertKind::Clap { plugin },
             bypass: false,

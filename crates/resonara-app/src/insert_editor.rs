@@ -50,6 +50,13 @@ impl Daw {
             return;
         }
         self.clear_control_focus();
+        if self.open_native_editor(target, slot) {
+            self.dialog.set(Dialog::None);
+            return;
+        }
+        self.open_generic_editor(target, slot);
+    }
+    pub(super) fn open_generic_editor(&self, target: RoutingTarget, slot: usize) {
         let kind = target
             .get(&self.model.borrow().project)
             .and_then(|r| r.inserts.get(slot))
@@ -186,6 +193,7 @@ impl Daw {
             self.insert_menu_item("Move earlier",2,move|s|s.insert_action(target,slot,2)),
             self.insert_menu_item("Move later",3,move|s|s.insert_action(target,slot,3)),
             self.insert_menu_item("Remove",4,move|s|s.insert_action(target,slot,4)),
+            self.insert_menu_item("Generic parameters…",6,move|s| { s.close_native_editors(); s.dialog.set(Dialog::None); s.open_generic_editor(target,slot); }),
             self.insert_menu_item("Cancel",5,|s|s.dialog.set(Dialog::None)),
         }.alignment(Alignment::TopLeading).spacing(2.).padding(14.)),278.)
     }
@@ -197,13 +205,17 @@ impl Daw {
             2 => self.move_insert(target, slot, -1),
             3 => self.move_insert(target, slot, 1),
             4 => self.remove_insert(target, slot),
+            6 => {
+                self.close_native_editors();
+                self.open_generic_editor(target, slot);
+            }
             _ => {}
         }
     }
     pub(super) fn handle_insert_popup_key(&self, key: KeyCode) -> bool {
         let count = match self.dialog.get() {
             Dialog::InsertPicker(_) => 6,
-            Dialog::InsertActions(..) => 6,
+            Dialog::InsertActions(..) => 7,
             Dialog::ClapPicker(_) => self.plugin_catalog.borrow().effects.len() + 2,
             _ => return false,
         };

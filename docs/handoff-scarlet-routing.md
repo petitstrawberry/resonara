@@ -1,5 +1,14 @@
 # Resonara / Scarlet 引き継ぎ（2026-10-02）
 
+## macOS CLAP GUI の transport 寿命修正（同日）
+
+- インストール済み Pro-Q 4 の Cocoa GUI はユーザーが表示・操作を確認。SGFX の main window とは別の host NSWindow / NSView に埋め込む。
+- GUI が閉じる原因は `play()` の inactive editor close、`finish_audio()` の全 editor close、`seek()` の Stop→Play。重なり順の修正だけでは解決しなかった。
+- 有効な insert の停止中 GUI も paused CPAL session の同じ PluginOwner を使う。GUI が開いている間は Stop / EOF 後も session を保持し、Play はその session を再開する。停止中は無音の callback で active CLAP の pending params flush を処理する。
+- desktop の seek / resume は audio block 境界の atomic request。DSP history は reset するが GUI / activation / owner を破棄しない。graph handoff でも request を共有する。Scarlet SAS は従来の drain / restart 経路を維持する。
+- 別 project の Open、insert の置換・削除など graph rebuild、app close は editor の寿命を終える。Scarlet 用 CLAP GUI ABI は引き続き未実装。
+- 回帰テストは stopped editor→Play、Stop→seek→Play、EOF→Play、繰り返し Stop、paused CLAP flush / reset の start/stop 回数、seek と graph handoff の競合を含む。328テスト成功（長時間 stress のみ除外）。ログは `artifacts/plugin-transport-tests.log`。この transport 修正後の実 GUI 操作はまだユーザー再確認待ち。
+
 ## 手元での再生継続修正（同日、クラウド引き継ぎ後）
 
 - 名前変更、built-in bypass、通常の編集、Undo/Redo、Import、Save、Export は再生を継続する。

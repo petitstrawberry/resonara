@@ -10,12 +10,47 @@ pub(super) struct TestAudio {
     playback: resonara_core::live::Playback,
     pub controls: Arc<resonara_core::Controls>,
     pub device: String,
+    editor_open: bool,
 }
 impl TestAudio {
     pub fn update(&mut self, project: &Project) -> Result<()> {
         self.playback.update(project)?;
         self.controls = self.playback.controls.clone();
         Ok(())
+    }
+    pub fn open_editor(&self, slot: usize) -> Result<bool> {
+        self.playback.open_editor(slot)
+    }
+    pub fn has_open_editors(&self) -> bool {
+        self.editor_open
+    }
+    pub fn pause(&self) {
+        self.controls.playing.store(false, Ordering::Release);
+    }
+    pub fn seek(&self, start: u64) -> bool {
+        resonara_core::Engine::request_seek(&self.controls, start);
+        self.controls.position.store(start, Ordering::Relaxed);
+        true
+    }
+    pub fn resume(&self, start: u64, metronome: bool) -> bool {
+        self.controls.metronome.store(metronome, Ordering::Relaxed);
+        resonara_core::Engine::request_resume(&self.controls, start);
+        self.controls.position.store(start, Ordering::Relaxed);
+        true
+    }
+    pub fn start_paused(project: &Project) -> Result<Self> {
+        let audio = Self::start_with_metronome(project, 0, false)?;
+        audio.pause();
+        Ok(audio)
+    }
+    pub fn close_editors(&self) -> Result<()> {
+        self.playback.close_editors()
+    }
+    pub fn poll_plugins(
+        &mut self,
+        force: bool,
+    ) -> Result<Vec<(usize, resonara_core::plugins::ClapInsert)>> {
+        self.playback.poll_plugins(force)
     }
     pub fn collect_retired(&mut self) {
         self.playback.collect_retired();
@@ -35,6 +70,7 @@ impl TestAudio {
             playback,
             controls,
             device: "Test output".into(),
+            editor_open: false,
             engine: RefCell::new(engine),
         })
     }
@@ -4449,7 +4485,7 @@ fn playing_ruler_drag_keeps_stream_alive_and_seeks_once_on_release() {
         false,
     );
     let resumed = s.model.borrow().audio.as_ref().unwrap().controls.clone();
-    assert!(!Arc::ptr_eq(&original, &resumed));
+    assert!(Arc::ptr_eq(&original, &resumed));
     assert!(resumed.playing.load(Ordering::Relaxed));
     assert!((resumed.position.load(Ordering::Relaxed) as f64 / 8000. - preview).abs() < 0.002);
     s.model.borrow().audio.as_ref().unwrap().render(80);
@@ -6589,4 +6625,88 @@ fn shared_channel_mute_solo_groups_center_on_fader_axes_without_aux_label_offset
         check(&buttons[2..4], &faders[1], 2);
         check(&buttons[4..], &faders[2], 1);
     }
+}
+
+#[test]
+fn editor_session_survives_stop_seek_resume_and_eof_without_replacing_engine() {
+    let mut app = Daw::new(project());
+    app.play();
+    // The device-free adapter models the editor pin on the real Playback owner.
+    app.model.borrow_mut().audio.as_mut().unwrap().editor_open = true;
+    let controls = app.model.borrow().audio.as_ref().unwrap().controls.clone();
+    app.model.borrow().audio.as_ref().unwrap().render(1700);
+    app.stop_audio(true);
+    assert!(app.model.borrow().audio.is_none());
+    let assert_retained = |app: &Daw| {
+        let m = app.model.borrow();
+        let audio = m
+            .retired_audio
+            .as_ref()
+            .expect("Stop destroyed editor session");
+        assert!(Arc::ptr_eq(&controls, &audio.controls));
+        assert!(audio.has_open_editors());
+        assert!(!audio.controls.playing.load(Ordering::Relaxed));
+    };
+    assert_retained(&app);
+    app.seek(0.4);
+    assert_retained(&app);
+    {
+        let m = app.model.borrow();
+        let audio = m.retired_audio.as_ref().unwrap();
+        audio.render(64);
+        assert_eq!(controls.position.load(Ordering::Relaxed), 3200);
+    }
+    app.edit("Rename while stopped", |m| {
+        m.project.tracks[0].name = "Same editor".into();
+        Ok(())
+    });
+    app.play();
+    assert!(Arc::ptr_eq(
+        &controls,
+        &app.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    app.model.borrow().audio.as_ref().unwrap().render(64);
+    assert_eq!(controls.position.load(Ordering::Relaxed), 3264);
+    app.seek(0.7);
+    app.model.borrow().audio.as_ref().unwrap().render(64);
+    assert_eq!(controls.position.load(Ordering::Relaxed), 5664);
+    app.model.borrow().audio.as_ref().unwrap().render(8000);
+    app.last_playhead
+        .set(Instant::now() - Duration::from_millis(40));
+    app.on_idle();
+    assert_retained(&app);
+    app.seek(0.2);
+    app.play();
+    assert!(Arc::ptr_eq(
+        &controls,
+        &app.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    app.model.borrow().audio.as_ref().unwrap().render(80);
+    assert_eq!(controls.position.load(Ordering::Relaxed), 1680);
+    assert!(!controls.error.load(Ordering::Relaxed));
+}
+
+#[test]
+fn initially_stopped_editor_session_can_play_and_repeatedly_stop_without_replacement() {
+    let app = Daw::new(project());
+    let mut audio = TestAudio::start_paused(&app.model.borrow().project).unwrap();
+    audio.editor_open = true;
+    let controls = audio.controls.clone();
+    audio.render(128);
+    assert_eq!(controls.position.load(Ordering::Relaxed), 0);
+    app.model.borrow_mut().retired_audio = Some(audio);
+    app.play();
+    assert!(Arc::ptr_eq(
+        &controls,
+        &app.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    app.model.borrow().audio.as_ref().unwrap().render(256);
+    assert_eq!(controls.position.load(Ordering::Relaxed), 256);
+    app.stop_audio(true);
+    app.stop_audio(true);
+    assert!(Arc::ptr_eq(
+        &controls,
+        &app.model.borrow().retired_audio.as_ref().unwrap().controls
+    ));
+    assert!(!controls.playing.load(Ordering::Relaxed));
 }
