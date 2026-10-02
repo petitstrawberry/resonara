@@ -120,6 +120,22 @@ impl Playback {
             ) {
                 control.store(insert.bypass, Ordering::Relaxed);
             }
+            // Report the edited session immediately, without waiting for the
+            // callback. A bypassed missing insert remains a dry placeholder.
+            let owners = &self.owners[&self.current];
+            let missing = project
+                .channel_routings()
+                .flat_map(|routing| &routing.inserts)
+                .enumerate()
+                .filter(|(slot, insert)| {
+                    !insert.bypass
+                        && matches!(insert.kind, crate::InsertKind::Clap { .. })
+                        && !owners.iter().any(|(index, _)| index == slot)
+                })
+                .count() as u32;
+            self.controls
+                .unavailable_plugins
+                .store(missing, Ordering::Relaxed);
             self.project = project.clone();
             return Ok(());
         }

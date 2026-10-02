@@ -455,6 +455,10 @@ impl Engine {
         let mut engine = Self::with_graph(p, controls, device_rate, start, &routing, limits)?;
         engine.graph.set_insert_controls(&insert_controls);
         engine.refresh_insert_controls();
+        engine
+            .controls
+            .unavailable_plugins
+            .store(engine.graph.info().unavailable_plugins, Ordering::Relaxed);
         Ok(engine)
     }
     /// Prepare an explicit runtime graph outside the audio callback, overriding
@@ -582,10 +586,7 @@ impl Engine {
         {
             *bypass = control.load(Ordering::Relaxed);
         }
-        let missing = self.graph.refresh_unavailable(&self.block_insert_bypasses);
-        self.controls
-            .unavailable_plugins
-            .store(missing, Ordering::Relaxed);
+        self.graph.refresh_unavailable(&self.block_insert_bypasses);
     }
     /// Control thread requests a new position; DSP and GUI instances survive.
     pub fn request_seek(controls: &Controls, start: u64) {

@@ -175,7 +175,7 @@ fn unknown_plugin_state_and_cached_parameters_survive_save_load() {
 }
 
 #[test]
-fn bypassed_missing_plugin_is_not_loaded_or_counted() {
+fn bypassed_missing_plugin_is_not_required_or_counted() {
     let p = project(missing(), true);
     let mut engine = Engine::try_new(&p, Arc::new(Controls::new(&p)), 48000, 0).unwrap();
     assert_eq!(engine.graph_info().unavailable_plugins, 0);
@@ -184,6 +184,69 @@ fn bypassed_missing_plugin_is_not_loaded_or_counted() {
     p.export_wav(&path).unwrap();
     assert!(path.is_file());
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn missing_insert_bypass_updates_warning_without_replacing_engine() {
+    let mut p = project(missing(), true);
+    let (mut playback, mut renderer) = live::Playback::new(&p, 48000, 0, false).unwrap();
+    let controls = playback.controls.clone();
+    for bypass in [false, true, false, true] {
+        p.tracks[0].routing.inserts[0].bypass = bypass;
+        playback.update(&p).unwrap();
+        assert!(Arc::ptr_eq(&controls, &playback.controls));
+        assert_eq!(
+            controls.unavailable_plugins.load(Ordering::Relaxed),
+            u32::from(!bypass)
+        );
+        let mut output = [0.; 2];
+        renderer.render(&mut output, 2);
+        assert_eq!(output, [0.125, -0.25]);
+        assert!(!controls.error.load(Ordering::Relaxed));
+    }
+    drop(renderer);
+}
+
+#[test]
+#[ignore = "requires built bundled CLAP effect; run with RESONARA_CLAP_LIBRARY and --include-ignored"]
+fn initially_bypassed_clap_is_loaded_and_toggles_without_replacement() {
+    require_effect();
+    let mut p = project(saved_gain(0.5), true);
+    let mut engine = Engine::try_new(&p, Arc::new(Controls::new(&p)), 48000, 0).unwrap();
+    let owners = engine.take_plugin_owners();
+    assert_eq!(
+        owners.len(),
+        1,
+        "Bypassed GUI needs the same live plugin owner"
+    );
+    drop(engine);
+    drop(owners);
+    let (mut playback, mut renderer) = live::Playback::new(&p, 48000, 0, false).unwrap();
+    let controls = playback.controls.clone();
+    for bypass in [true, false, true, false] {
+        p.tracks[0].routing.inserts[0].bypass = bypass;
+        playback.update(&p).unwrap();
+        assert!(Arc::ptr_eq(&controls, &playback.controls));
+        let mut output = [0.; 2];
+        ALLOCS.with(|n| n.set(0));
+        FREES.with(|n| n.set(0));
+        AUDITING.with(|a| a.set(true));
+        renderer.render(&mut output, 2);
+        AUDITING.with(|a| a.set(false));
+        assert_eq!(
+            output,
+            if bypass {
+                [0.125, -0.25]
+            } else {
+                [0.0625, -0.125]
+            }
+        );
+        assert_eq!(ALLOCS.with(Cell::get), 0);
+        assert_eq!(FREES.with(Cell::get), 0);
+        assert!(controls.playing.load(Ordering::Relaxed));
+    }
+    assert_eq!(controls.position.load(Ordering::Relaxed), 4);
+    drop(renderer);
 }
 
 #[test]

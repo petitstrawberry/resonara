@@ -1,10 +1,17 @@
 # Resonara / Scarlet 引き継ぎ（2026-10-02）
 
+## CLAP bypass の GUI / DSP 保持（同日）
+
+- CLAP bypass も built-in と同じ atomic 制御に変更。graph / PluginOwner / GUI を交換せず、音声だけを dry passthrough にする。内部 DSP history は保持して凍結する。bypass 中も GUI の pending params flush は同じ audio thread で処理する。
+- 最初から bypass の insert も live graph には用意し、停止中 GUI は enabled / bypass 共に同じ paused CPAL session を使う。bypass の Undo / Redo でも editor を閉じない。plugin state の変更や削除など、実際の graph rebuild は引き続き editor を閉じる。
+- missing CLAP の placeholder は保持するが、bypass 中は unavailable 警告や export の必須 effect に数えない。警告は control thread で編集直後に更新する。
+- 実 Gain fixture で initially bypassed の owner 保持、繰り返す dry / wet 切り替え、callback の allocation / deallocation なしを確認。app の editor pin 回帰テストで停止中・再生中の bypass と Undo / Redo を確認。331テスト成功（長時間 stress のみ除外）、`artifacts/plugin-bypass-tests.log`。この変更後の実 GUI 操作は未再確認。
+
 ## macOS CLAP GUI の transport 寿命修正（同日）
 
 - インストール済み Pro-Q 4 の Cocoa GUI はユーザーが表示・操作を確認。SGFX の main window とは別の host NSWindow / NSView に埋め込む。
 - GUI が閉じる原因は `play()` の inactive editor close、`finish_audio()` の全 editor close、`seek()` の Stop→Play。重なり順の修正だけでは解決しなかった。
-- 有効な insert の停止中 GUI も paused CPAL session の同じ PluginOwner を使う。GUI が開いている間は Stop / EOF 後も session を保持し、Play はその session を再開する。停止中は無音の callback で active CLAP の pending params flush を処理する。
+- 停止中 GUI も paused CPAL session の同じ PluginOwner を使う。GUI が開いている間は Stop / EOF 後も session を保持し、Play はその session を再開する。停止中は無音の callback で active CLAP の pending params flush を処理する。
 - desktop の seek / resume は audio block 境界の atomic request。DSP history は reset するが GUI / activation / owner を破棄しない。graph handoff でも request を共有する。Scarlet SAS は従来の drain / restart 経路を維持する。
 - 別 project の Open、insert の置換・削除など graph rebuild、app close は editor の寿命を終える。Scarlet 用 CLAP GUI ABI は引き続き未実装。
 - 回帰テストは stopped editor→Play、Stop→seek→Play、EOF→Play、繰り返し Stop、paused CLAP flush / reset の start/stop 回数、seek と graph handoff の競合を含む。328テスト成功（長時間 stress のみ除外）。ログは `artifacts/plugin-transport-tests.log`。この transport 修正後の実 GUI 操作はまだユーザー再確認待ち。
@@ -13,7 +20,7 @@
 
 - 名前変更、built-in bypass、通常の編集、Undo/Redo、Import、Save、Export は再生を継続する。
 - CPAL/SAS の出力を閉じず、構造変更は control thread で準備して音声 block 境界で交換する。小数を含む再生位置を引き継ぎ、古い Engine と CLAP owner は control thread で回収する。
-- built-in bypass は atomic 制御で、effect の内部状態を保持して凍結する。CLAP の bypass／parameter と構造変更は新しい DSP 状態になる。crossfade／click-free は未実装。
+- built-in / CLAP bypass は atomic 制御で、effect の内部状態を保持して凍結する。汎用 popup の CLAP parameter / state 編集と構造変更は新しい DSP 状態になる。native GUI の変更は同じ instance に反映する。crossfade／click-free は未実装。
 - Region の選択と drag は再生位置を維持し、drag の変更は release 時に反映する。空白クリックと scissors は明示的 seek。
 - Stop、別 project の Open、自然 EOF、音声エラーでは停止する。以下のクラウド検証結果と native ELF snapshot はこの修正前の記録であり、この修正後の Scarlet ゲスト再検証は未実施。
 
@@ -67,7 +74,7 @@
 - Bus の経路と Aux の受け口を分けた操作。Output または空 Send 行の `New Bus → Aux` は作成・接続を一度に行う。手動の `+Aux` も用意
 - Insert は連続したスロット。名前でエディター、電源で bypass、右クリック／矢印から並べ替え・削除。Send は連続した小さい行とノブ、空行から行き先を選ぶ
 - Inspector は左全高。リージョン情報をチャンネルの上に置き、上側だけスクロール、下の共通フェーダーは固定。Mixer と同じ channel strip を使い、M/S を中央配置
-- 音量・Pan・Send level と built-in bypass は atomic な live control。構造変更と CLAP bypass は出力を維持してグラフ交換する（手元での修正を参照）
+- 音量・Pan・Send level と built-in / CLAP bypass は atomic な live control。構造変更は出力を維持してグラフ交換する（手元での修正を参照）
 - Undo/Redo、旧 version-1 JSON の読込、Bus 削除時の参照修復、循環・資源上限の検証を実装
 
 ### 最初の CLAP

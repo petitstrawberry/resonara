@@ -635,7 +635,7 @@ impl Daw {
         }
     }
     fn undo(&self, redo: bool) {
-        self.close_native_editors();
+        self.poll_native_editors(true);
         self.native_edit_group.set(false);
         if self.busy() {
             return;

@@ -6710,3 +6710,45 @@ fn initially_stopped_editor_session_can_play_and_repeatedly_stop_without_replace
     ));
     assert!(!controls.playing.load(Ordering::Relaxed));
 }
+
+#[test]
+#[ignore = "requires built bundled CLAP effect; run with RESONARA_CLAP_LIBRARY and --include-ignored"]
+fn clap_bypass_preserves_editor_session_while_stopped_and_playing() {
+    let mut p = project();
+    p.tracks[0].routing.inserts.push(resonara_core::Insert {
+        kind: resonara_core::InsertKind::Clap {
+            plugin: resonara_core::plugins::load_bundled_gain().unwrap(),
+        },
+        bypass: true,
+    });
+    let app = Daw::new(p);
+    let mut audio = TestAudio::start_paused(&app.model.borrow().project).unwrap();
+    audio.editor_open = true;
+    let controls = audio.controls.clone();
+    app.model.borrow_mut().retired_audio = Some(audio);
+    for _ in 0..3 {
+        app.toggle_insert(RoutingTarget::Track(0), 0);
+        {
+            let m = app.model.borrow();
+            let audio = m.retired_audio.as_ref().unwrap();
+            assert!(audio.has_open_editors());
+            assert!(Arc::ptr_eq(&controls, &audio.controls));
+            audio.render(64);
+            assert!(!controls.playing.load(Ordering::Relaxed));
+        }
+        app.play();
+        app.toggle_insert(RoutingTarget::Track(0), 0);
+        app.undo(false);
+        app.undo(true);
+        {
+            let m = app.model.borrow();
+            let audio = m.audio.as_ref().unwrap();
+            assert!(audio.has_open_editors());
+            assert!(Arc::ptr_eq(&controls, &audio.controls));
+            audio.render(64);
+            assert!(controls.playing.load(Ordering::Relaxed));
+        }
+        app.stop_audio(true);
+    }
+    assert!(!controls.error.load(Ordering::Relaxed));
+}
