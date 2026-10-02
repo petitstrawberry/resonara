@@ -5858,7 +5858,8 @@ fn clap_generic_editor_roundtrips_opaque_state_and_undoes_parameter_change() {
     s.open_insert_editor(target, 0);
     assert!(s.dialog.get() == Dialog::ClapEditor(target, 0));
     assert_eq!(s.plugin_fields.borrow().len(), 1);
-    s.plugin_fields.borrow()[0].1.set("0.25".into());
+    (s.plugin_knobs.borrow()[0].1.changed)(-0.75);
+    assert_eq!(s.plugin_fields.borrow()[0].1.get(), "0.25");
     s.submit_clap_parameters(target, 0);
     assert!(s.dialog.get() == Dialog::None, "{}", s.dialog_error.get());
     if let InsertKind::Clap { plugin } = &s.model.borrow().project.tracks[0].routing.inserts[0].kind
@@ -5978,6 +5979,14 @@ fn clap_editor_hides_internal_parameters_and_keeps_read_only_values_visible() {
         &mut fields,
     );
     assert_eq!(fields.len(), 1);
+    let mut knobs = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::knob::KnobRender",
+        &mut knobs,
+    );
+    assert_eq!(knobs.len(), 1, "Only the editable parameter gets a knob");
 }
 
 #[test]

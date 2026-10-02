@@ -172,20 +172,30 @@ BINARY="$TARGET_DIR/aarch64-unknown-scarlet/release/resonara"
 # on any additional unresolved symbol or unsupported ELF feature before staging.
 python3 "$REPO/crates/resonara-clap/scripts/audit-scarlet-host.py" "$BINARY" \
   --arch aarch64 --json "$ARTIFACTS/native-host-audit.json"
-# This builder audits its own native shared object before returning success.
-python3 "$REPO/plugins/resonara-gain/build.py" --arch aarch64 \
-  --toolchain "$(rustc --print sysroot)" --output "$ARTIFACTS/gain-aarch64"
-PLUGIN_STAGING="$ARTIFACTS/gain-aarch64/staging/system/plugins"
-for required in resonara-gain.clap resonara-gain.LICENSE.txt; do
-  if [[ ! -f "$PLUGIN_STAGING/$required" ]]; then
-    printf 'Audited gain-plugin output is missing: %s\n' "$PLUGIN_STAGING/$required" >&2
-    exit 2
-  fi
+# Every bundled native plugin must be audited before any application is staged.
+PLUGIN_NAMES=(resonara-gain scarlet-freeverb)
+PLUGIN_BUILD_DIRS=(gain-aarch64 freeverb-aarch64)
+for i in "${!PLUGIN_NAMES[@]}"; do
+  plugin="${PLUGIN_NAMES[$i]}"
+  output="$ARTIFACTS/${PLUGIN_BUILD_DIRS[$i]}"
+  python3 "$REPO/plugins/$plugin/build.py" --arch aarch64 \
+    --toolchain "$(rustc --print sysroot)" --output "$output"
+  for required in "$plugin.clap" "$plugin.LICENSE.txt"; do
+    if [[ ! -f "$output/staging/system/plugins/$required" ]]; then
+      printf 'Audited plugin output is missing: %s\n' "$required" >&2
+      exit 2
+    fi
+  done
 done
 mkdir -p "$ARTIFACTS/rootfs/bin" "$ARTIFACTS/rootfs/etc/stemd.d/apps" "$ARTIFACTS/rootfs/system/plugins"
 install -m 0755 "$BINARY" "$ARTIFACTS/rootfs/bin/resonara"
-install -m 0644 "$PLUGIN_STAGING/resonara-gain.clap" "$ARTIFACTS/rootfs/system/plugins/resonara-gain.clap"
-install -m 0644 "$PLUGIN_STAGING/resonara-gain.LICENSE.txt" "$ARTIFACTS/rootfs/system/plugins/resonara-gain.LICENSE.txt"
+for i in "${!PLUGIN_NAMES[@]}"; do
+  plugin="${PLUGIN_NAMES[$i]}"
+  for suffix in clap LICENSE.txt; do
+    install -m 0644 "$ARTIFACTS/${PLUGIN_BUILD_DIRS[$i]}/staging/system/plugins/$plugin.$suffix" \
+      "$ARTIFACTS/rootfs/system/plugins/$plugin.$suffix"
+  done
+done
 cat > "$ARTIFACTS/rootfs/etc/stemd.d/apps/org.resonara.Resonara.desktop" <<'EOF'
 [Desktop Entry]
 Name=Resonara

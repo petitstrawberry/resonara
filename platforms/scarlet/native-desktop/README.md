@@ -20,7 +20,8 @@ That bundle includes base and CLI utilities, SWS, SAS, the desktop shell, native
 applications, fonts, cursors, icons and service definitions. The initramfs uses
 the same base and CLI bundles as the full project. Kernel features, static
 modules, BSP and the official QEMU runner are retained. The image wrapper adds
-only audited Resonara, its launcher, and the audited native gain effect/license.
+only audited Resonara, its launcher, and the audited native Gain / Freeverb effects
+and their license notices.
 The top-level Debian/Wine, experimental and in-guest Rust-toolchain bundles are
 not selected. This does not remove individual layers from the desktop bundle.
 
@@ -66,3 +67,9 @@ bundle. Any missing build dependency must be addressed rather than silently
 removing the affected application. The same exact AArch64 EDK2 firmware and
 GL-enabled VirtIO GPU requirements apply as for the full project. Audio capture
 and actual guest playback must be verified separately from image construction.
+
+The application overlay also installs the MIT-licensed Scarlet Freeverb port
+(`org.scarlet.freeverb`) and its license notices in `/system/plugins`. Both Gain
+and Freeverb must pass ELF audits before staging begins. In Resonara, select
+Installed CLAP effects… → Rescan → Scarlet Freeverb. Its parameters use the
+existing generic CLAP editor; see [Freeverb](../../../plugins/scarlet-freeverb/README.md).

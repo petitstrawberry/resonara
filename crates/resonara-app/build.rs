@@ -17,5 +17,6 @@ fn main() {
         "now",
     ] {
         println!("cargo:rustc-link-arg-bin=resonara={argument}");
+        println!("cargo:rustc-link-arg-examples={argument}");
     }
 }

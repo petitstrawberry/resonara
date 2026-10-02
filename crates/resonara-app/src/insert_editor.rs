@@ -73,6 +73,16 @@ impl Daw {
                     )
                 })
                 .collect();
+            *self.plugin_knobs.borrow_mut() = self
+                .plugin_fields
+                .borrow()
+                .iter()
+                .filter_map(|(id, text)| {
+                    let p = plugin.parameters.iter().find(|p| p.id == *id)?;
+                    knob::PanKnob::parameter(text.clone(), p.min, p.max, p.value, p.stepped)
+                        .map(|knob| (*id, knob))
+                })
+                .collect();
             self.dialog_error.set(String::new());
             self.dialog.set(Dialog::ClapEditor(target, slot));
         } else {
@@ -362,7 +372,17 @@ impl Daw {
                 continue;
             };
             let submit = self.clone();
-            parameter_rows.push(Box::new(row!{label(&parameter.name).font_size(12.).frame_width(140.),ui::field(value).on_submit(move||submit.submit_clap_parameters(target,slot)).frame_width(130.).input_guard(),caption(format!("{} … {}",parameter.min,parameter.max)).font_size(10.)}.spacing(8.)));
+            let dial = self
+                .plugin_knobs
+                .borrow()
+                .iter()
+                .find(|(id, _)| *id == parameter.id)
+                .map(|(_, dial)| dial.clone());
+            let dial = match dial {
+                Some(dial) => AnyView::new(dial.frame(40., 40.)),
+                None => AnyView::new(Spacer::new().frame(40., 40.)),
+            };
+            parameter_rows.push(Box::new(row!{label(&parameter.name).font_size(12.).frame_width(122.),dial,ui::field(value).on_submit(move||submit.submit_clap_parameters(target,slot)).frame_width(110.).input_guard(),caption(format!("{} … {}",parameter.min,parameter.max)).font_size(10.)}.spacing(8.).alignment(Alignment::Center)));
         }
         rows.push(Box::new(
             ScrollView::new(
@@ -372,8 +392,8 @@ impl Daw {
             )
             .frame(
                 426.,
-                (plugin.parameters.iter().filter(|p| !p.hidden).count() as f32 * 38.)
-                    .clamp(38., 260.),
+                (plugin.parameters.iter().filter(|p| !p.hidden).count() as f32 * 52.)
+                    .clamp(40., 300.),
             ),
         ));
         rows.push(Box::new(

@@ -1,5 +1,42 @@
 # Resonara / Scarlet 引き継ぎ（2026-10-02）
 
+## 外部 PR マージ後の依存更新（同日）
+
+- ユーザーが Scarlet PR #576 / ScarletUI PR #34 をマージ。Scarlet の merge commit は `10a4a4768f745e02377a4b32e96d36cad697522f`（dev）、ScarletUI は `4005841e514690f3328c6e09b8b2b77656fa07de`（main）。
+- ScarletUI の merge tree は検証済み PR head `587c8f722863a610c9f60b76a49cd060f67a652c` と同一。Resonara の両 OS 用 Cargo pin、lock の全8 UI packages、依存検証 script を merge commit へ更新。Scarlet runtime ABI の pin は既存のまま。
+- `../Scarlet` の既存変更を含む作業ツリーは維持。Files の修正 source は既に反映済み。マージ後 binary を新たに user image に書き込む操作は行っていない。
+- merge pin 更新後の依存検証 / format / diff check、real Gain fixture を含む335 tests（long stress のみ除外）、macOS release build、AArch64 / RISC-V64 release build と ELF audits が成功。ログは `artifacts/merged-ui-{lock-update,dependencies,tests,host-build,native-verify}.log`。マージ後 pin での guest runtime は再実行していない（UI source tree は既存 native QA と同一）。
+
+## 拡張子フィルター実装と汎用 CLAP ノブ（同日・前節を更新）
+
+- ユーザーの指示で、省略するだけだったフィルターを Files 側に実装。[Scarlet PR #576](https://github.com/petitstrawberry/Scarlet/pull/576)、commit `b99de066c64616455ec874e8164c6d39455e6e90`。`GetPickerCapabilities` の `extension-list-v1` と既存 filter 引数の `extensions:wav,flac,json` を追加。任意の literal extensions の union、ASCII case-insensitive、final suffix matching。既存 MIME 指定は維持。
+- Files は対象外の file を一覧から除外し、folder は navigation 用に残す。Open / Save の accept でもチェックし、異なる拡張子の Save は picker を閉じず error を表示。自動で拡張子を足さない。不正な list は child launch 前に拒否。matcher / malformed list / file・folder・Save acceptance の host 3 tests と native Files release build に成功。
+- [ScarletUI PR #34](https://github.com/petitstrawberry/scarlet-ui/pull/34)、pin `587c8f722863a610c9f60b76a49cd060f67a652c`。同じ IPC worker connection で capability を確認し、複数 filter の拡張子 union を deduplicate して送る。古い Files の明確な UnknownMethod は未対応として扱う。Required は Unsupported、Optional は未対応の場合だけ unfiltered。capability がある場合は両 policy とも絞り込む。その他の IPC failures は errors のまま。
+- Resonara の Open / Save / Import / Export は default Required に戻した。アプリの戻り値検証は維持。PR #33 は merge 済み。ScarletUI の既存 checkout は変更せず、Scarlet 側の4 source/docs files は QA 後に `../Scarlet` の作業ツリーにも patch として反映。ほかの既存編集は維持。ゲストの元 image は更新していない。
+- 実 Scarlet AArch64 で WAV picker が `impulse.wav` / `UPPER.WAV` を表示し、配置済み `notes.txt` / `fixture.json` を除外。Save `picker-saved.txt` は error のまま開き続け、`.wav` に修正すると正しい絶対 path を返した。Resonara Import から `UPPER.WAV` を取り込み、新 track / region を確認。`artifacts/native-plugin-vm/serial-extension.log`、`extension-open-picker.png`、`extension-save-invalid.png`、`extension-resonara-imported.png`。
+- 汎用 CLAP editor に既存 raster knob を再利用した rotary control と exact numeric field を併設。min/max mapping、integer stepped control、Shift+arrow fine steps、Home / double-click で opening value を復元。クリックだけで f64/text の精度を変えず、drag cancel は exact text を復元。hidden / read-only は操作 knob を付けない。Apply / Cancel の既存 state・Undo・transport contracts を維持。
+- ノブ変更後の workspace 335 tests（real Gain fixture、long stress のみ除外）が成功。パラメーターの exact no-op / numeric edit 同期 / integer step / drag cancel、実 CLAP state save / reopen / Undo、read-only / hidden の mounted editor を検証。`artifacts/clap-knob-workspace-tests.log`。
+- 最終 reset 処理の調整後、app 169 tests が成功（long stress のみ除外）。macOS / AArch64 / RISC-V64 release build と native ELF audit も成功。実 Scarlet AArch64 に最終 binary を入れ、Freeverb 5 knobs の表示、Room size の upward drag と numeric field 同期、Apply 後の reopen で値の保持を確認。`artifacts/native-plugin-vm/resonara-freeverb-knobs.png`、`resonara-knob-drag.png`、`resonara-knob-reopened.png`、`serial-knob.log`。検証 VM は正常終了。ScarletUI PR #34 の全4 CI jobs は成功。Scarlet PR #576 の fmt job は本 PR が変更していない既存 kernel files（Linux ABI / devfs / devpts / task）の formatting で失敗。変更した3 Rust files は direct rustfmt check に成功。残り OS/kernel CI は継続中。
+
+## Scarlet Files picker と OSS Freeverb CLAP の native port（同日）
+
+- 原因は ScarletUI SWS adapter が拡張子フィルター付きの要求を `Unsupported` にすること。Resonara の Open / Save / Import / Export はすべてフィルターを渡すため、必ずアプリ内 browser に戻っていた。video player の sbus `OpenFile` / `Response` と stemd activation 経路を確認した。
+- [ScarletUI PR #33](https://github.com/petitstrawberry/scarlet-ui/pull/33): `FileDialogFilterPolicy::{Required, Optional}` を追加。Required の既存動作を維持し、Optional の単一 Open / Save は native Files chooser を使う。provider は任意拡張子を絞れないため、Resonara は戻り値を既存の絶対 path / 拡張子チェックで検証してから I/O を始める。UI thread を IPC 待ちで止めない。
+- Files が明確に `ServiceNotFound` なら video player 同様の stemd `LaunchOrFocus` を使い、登録まで bounded retry。曖昧な timeout は再送しない。Response の sender / object / interface / signal / request ID 照合、early response の pending queue、owner-close / local cancel を維持。remote Cancel と multi-select は既存 protocol に無い。
+- Resonara の両 OS の pin と lock は `3d3c0d80ba8344ece782820e8f5d5d11e80a225c`。別 ScarletUI worktree のみ変更し、既存 `../scarlet-ui` の main は維持。PR #32 は merge 済み。
+- `plugins/scarlet-freeverb` は MIT の [trevyn/freeverb](https://github.com/trevyn/freeverb/tree/d89365ce8381751bea6b0e85294b7f6da3ad98ef) の DSP を移植した新しい native CLAP adapter。元ソース・license を保存し、同じ演算・tuning・sample-rate scaling を使う。fixed storage / configure / reset を追加。macOS / Linux バイナリの流用ではない。
+- Plugin ID `org.scarlet.freeverb`、名前 `Scarlet Freeverb`。Wet / Dry / Room size / Damping / Width の5 parameters、48-byte state。8〜96 kHz / stereo float32 / zero latency / 最大8 instances。Aux reverb は Wet=1、Dry=0。独自 GUI は無く、既存の汎用 CLAP editor を使う。
+- オーディオ process / flush / reset は allocation / lock / OS imports / TLS 無し。8 / 44.1 / 48 / 96 kHz で upstream reference と sample-by-sample 比較。CLAP sample-offset event、in-place、tail、reset、state partial-I/O / corrupt state の atomic rejection、capacity を含む5テストに成功。
+- 実 guest で最初のロードが `DT_FLAGS other than BIND_NOW` で失敗。`-Bsymbolic` の DF_SYMBOLIC が原因だった。共通 plugin builder を `-Bsymbolic-functions` に変更し、Scarlet loader の DT_FLAGS / DT_FLAGS_1 masks と OSABI の監査・3 regression tests を追加。Gain の native build にも適用される。
+- AArch64 / RISC-V64 Freeverb ELF は imports / NEEDED / TLS 無しで audit に合格。image wrapper は Gain / Freeverb と license を両方監査してから staging。2番目の plugin の監査失敗でも新しい app staging / image composition を行わない。wrapper mock tests 成功。macOS の temporary directory canonicalization と Linux display guard の mock も修正した。
+- Resonara workspace 332テスト成功（長時間 stress のみ除外）。macOS の実 CLAP load、wet tail energy = 2.3789181011455605、state save/reopen、WAV export、exact bypass に成功。`artifacts/freeverb-host-smoke.log`。
+- 既存 full GPT disk を APFS copy した独立 `artifacts/native-plugin-vm/validation.img` で Scarlet を起動。元 image / project / checkout の既存変更は維持。実 Scarlet loader → Resonara discovery / Engine → Freeverb DSP で同じ tail energy と state / export / bypass の成功を確認。`artifacts/native-plugin-vm/serial.log`。
+- `scarlet_native_smoke` example は CLAP / SAS / ScarletUI Files IF の guest verification 用。リンク seed / interpreter / imports を app と同じ方式にして最終 ELF を監査。`plugins/scarlet-freeverb/README.md` に build / install / verification 手順がある。
+- 実 Scarlet AArch64 で Optional filter の Open / Save が Files chooser を表示し、正しい絶対パスを返した。Resonara 本体の Import ボタンから同じ picker で WAV を選択し、2番目の track / region が追加された。汎用 Freeverb editor で Room size を 0.8 → 0.7 に変更し、再表示でも値を保持。`artifacts/native-plugin-vm/resonara-import-picker.png`、`resonara-imported.png`、`resonara-freeverb-state.png`。
+- SAS playback も成功。HVF 検証では deadline misses=1 / overruns=1（underrun 数ではない）。QEMU WAV backend の captured PCM は非ゼロ音声を確認し `audio-audit.json` に記録。VM 停止時の SIGINT で RIFF lengths が未確定だったため、元 capture を保持して PCM を `audio-finalized.wav` に封入した。実機での負荷改善や長時間安定性の保証ではない。
+- ScarletUI PR #33 の AArch64 / RISC-V64 / Scarlet-host CI は成功。upstream compiler CI は既存の並列 retained-render 比較で失敗し、修正前の base でも再現。core の直列381 tests + 23 doctests と file-dialog policy 2 tests は成功。PR body に記録済み。
+
+
 ## Send 操作の RenderError と Scarlet-UI PR（同日）
 
 - macOS SGFX / wgpu で Send destination ラックや Pre Fader 切り替え時に `UI: RenderError` で終了。mounted pipeline に SGFX と同じ nonempty damage 条件を持つ backend を接続し、`logical=Some([]), physical=Some([])` の送信で再現した。音声 graph の変更が原因ではない。
@@ -79,7 +116,7 @@
 - 作業ブランチ: `feat/scarlet-routing`（`main` へのマージ、PR 作成は行わない）
 - ルーティング、コンパクトな Insert/Send UI、最初の CLAP Gain、Scarlet 用 SWS/SAS バックエンドまで実装済み
 - Linux ホストの GUI・音声・実 CLAP の動作は検証済み。最新の M/S 中央配置もホストのビルドと回帰テストは通過
-- **クラウドでは Scarlet ゲスト未起動。手元ではユーザーが GPU 描画と音声を確認。今回の Deadline 予約の改善効果とゲストでの CLAP・ファイル操作は未検証**
+- **クラウドでは Scarlet ゲスト未起動。手元ではユーザーが GPU 描画と音声を確認。その後、独立した検証 VM で native Freeverb CLAP / SAS / Files picker / Resonara Import・汎用 editor を確認済み。Deadline 予約の実機での改善効果は未測定**
 - クラウド時点の AArch64 / RISC-V64 native ELF は M/S 配置調整前の記録。今回の最新 build の記録は上の手元の検証を参照
 - クラウドでの追加作業は停止。容量確保の承認は得ておらず、キャッシュは削除していない
 

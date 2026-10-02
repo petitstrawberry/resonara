@@ -1,0 +1,21 @@
+[package]
+name = "scarlet-freeverb"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+clap-sys = { path = "../resonara-gain/vendor/clap-sys", version = "=0.5.0" }
+[dev-dependencies]
+freeverb-reference = { package = "freeverb", path = "vendor/freeverb" }
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 3
+debug = 0
+[workspace]

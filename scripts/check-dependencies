@@ -23,7 +23,7 @@ assert 'path' not in sas, 'Native audio must use a portable Git pin'
 scheduler = platform['target']['cfg(target_os = "scarlet")']['dependencies']['scarlet-os']
 assert scheduler.get('git') == sas.get('git') and scheduler.get('rev') == sas.get('rev'), 'Scheduler and SAS must share the same Scarlet runtime'
 assert scheduler.get('features') == ['std'] and not scheduler.get('default-features', True)
-revision = '749696b9e925e8eec214ef1ae9cbf34639835237'
+revision = '4005841e514690f3328c6e09b8b2b77656fa07de'
 repository = 'https://github.com/petitstrawberry/scarlet-ui'
 assert dependency.get('git') == repository, 'ScarletUI must use its Git source'
 assert dependency.get('rev') == revision, 'Review and update the ScarletUI pin explicitly'

@@ -106,7 +106,7 @@ assert (args.output.parent / "native-host-audit.json").is_file()
 entry = {"args": ["plugin-build", *sys.argv[1:]], "rootfs_exists": (args.output.parent / "rootfs").exists()}
 with open(os.environ["FIXTURE_LOG"], "a") as handle:
     handle.write(json.dumps(entry) + "\\n")
-if os.getenv("FIXTURE_FAIL_PLUGIN_BUILD"):
+if os.getenv("FIXTURE_FAIL_PLUGIN_BUILD") or os.getenv("FIXTURE_FAIL_PLUGIN_NAME") == pathlib.Path(__file__).parent.name:
     raise SystemExit("mock native plugin ELF audit rejected output")
 staging = args.output / "staging/system/plugins"
 staging.mkdir(parents=True, exist_ok=True)
@@ -114,6 +114,9 @@ staging.mkdir(parents=True, exist_ok=True)
 (staging / "resonara-gain.LICENSE.txt").write_bytes(b"MOCK LICENSE NOTICES")
 (args.output / "build.json").write_text(json.dumps({"fixture_only": True, "audited": True}))
 ''')
+        freeverb_dir = self.app / "plugins/scarlet-freeverb"
+        freeverb_dir.mkdir(parents=True)
+        (freeverb_dir / "build.py").write_text((plugin_dir / "build.py").read_text().replace("resonara-gain", "scarlet-freeverb"))
         (self.tools / "cargo").write_text('''#!/usr/bin/env python3
 import json, os, pathlib, struct, sys, time
 args = sys.argv[1:]
@@ -136,6 +139,9 @@ elif args[:2] == ["scarlet", "image"]:
     artifacts = app / ("artifacts/scarlet-native" if native else "artifacts/scarlet")
     assert (artifacts / "native-host-audit.json").is_file()
     assert (artifacts / "gain-aarch64/build.json").is_file()
+    assert (artifacts / "freeverb-aarch64/build.json").is_file()
+    assert (artifacts / "rootfs/system/plugins/scarlet-freeverb.clap").read_bytes() == b"MOCK NATIVE CLAP PLUGIN"
+    assert (artifacts / "rootfs/system/plugins/scarlet-freeverb.LICENSE.txt").read_bytes() == b"MOCK LICENSE NOTICES"
     assert (artifacts / "rootfs/bin/resonara").is_file()
     assert (artifacts / "rootfs/system/plugins/resonara-gain.clap").read_bytes() == b"MOCK NATIVE CLAP PLUGIN"
     assert (artifacts / "rootfs/system/plugins/resonara-gain.LICENSE.txt").read_bytes() == b"MOCK LICENSE NOTICES"
@@ -160,6 +166,8 @@ with open(os.environ["FIXTURE_NIX_LOG"], "a") as handle:
 command = args[args.index("-c") + 1:]
 os.execvp(command[0], command)
 ''')
+        # Exercise Linux display guards consistently, also on macOS hosts.
+        (self.tools / "uname").write_text("#!/bin/sh\nprintf 'Linux\\n'\n")
         for tool in self.tools.iterdir():
             tool.chmod(0o755)
         self.env = os.environ.copy()
@@ -198,16 +206,16 @@ def success(result):
 
 
 with tempfile.TemporaryDirectory(prefix="resonara-wrapper-tests-") as temporary:
-    root = pathlib.Path(temporary)
+    root = pathlib.Path(temporary).resolve()
     fixture = Fixture(root / "main")
 
     # A fresh default run builds while holding the same inherited lock, then boots.
     success(fixture.run("scarlet-run", inside=False))
     calls = fixture.calls()
-    assert [call["args"][0] for call in calls] == ["build", "audit-host", "plugin-build", "scarlet", "scarlet"]
-    assert calls[3]["args"][:2] == ["scarlet", "image"]
-    assert calls[4]["args"][:2] == ["scarlet", "run"]
-    assert not calls[1]["rootfs_exists"] and not calls[2]["rootfs_exists"]
+    assert [call["args"][0] for call in calls] == ["build", "audit-host", "plugin-build", "plugin-build", "scarlet", "scarlet"]
+    assert calls[4]["args"][:2] == ["scarlet", "image"]
+    assert calls[5]["args"][:2] == ["scarlet", "run"]
+    assert all(not call["rootfs_exists"] for call in calls[1:4])
     nix_call = json.loads(fixture.nix_path.read_text().splitlines()[-1])
     assert nix_call["cwd"] == str(fixture.checkout)
     assert "--no-write-lock-file" in nix_call["args"]
@@ -236,6 +244,14 @@ with tempfile.TemporaryDirectory(prefix="resonara-wrapper-tests-") as temporary:
     assert [call["args"][0] for call in bad_plugin.calls()] == ["build", "audit-host", "plugin-build"]
     assert not (bad_plugin.app / "artifacts/scarlet/rootfs").exists()
     assert not bad_plugin.overlay.exists() and not bad_plugin.image.exists()
+
+    bad_freeverb = Fixture(root / "bad-freeverb")
+    bad_freeverb.env["FIXTURE_FAIL_PLUGIN_NAME"] = "scarlet-freeverb"
+    refused = bad_freeverb.run("scarlet-image")
+    assert refused.returncode and "mock native plugin ELF audit rejected" in refused.stderr
+    assert [call["args"][0] for call in bad_freeverb.calls()] == ["build", "audit-host", "plugin-build", "plugin-build"]
+    assert not (bad_freeverb.app / "artifacts/scarlet/rootfs").exists()
+    assert not bad_freeverb.overlay.exists() and not bad_freeverb.image.exists()
 
     # The explicit native profile copies the BSP and exact desktop bundle recipe
     # into a separate project. It never rewrites the original full project.
