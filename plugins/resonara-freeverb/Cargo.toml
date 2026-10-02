@@ -1,14 +1,17 @@
 [package]
-name = "scarlet-freeverb"
-version = "0.1.0"
+name = "resonara-freeverb"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 publish = false
+repository = "https://github.com/petitstrawberry/resonara"
+description = "Freestanding stereo Freeverb CLAP reverb for Resonara"
 [lib]
 crate-type = ["cdylib"]
 [dependencies]
-clap-sys = { path = "../resonara-gain/vendor/clap-sys", version = "=0.5.0" }
+clap-sys = { path = "vendor/clap-sys", version = "=0.5.0" }
 [dev-dependencies]
+clap-sys-upstream = { package = "clap-sys", version = "=0.5.0" }
 freeverb-reference = { package = "freeverb", path = "vendor/freeverb" }
 [profile.dev]
 panic = "abort"
@@ -19,3 +22,4 @@ lto = true
 opt-level = 3
 debug = 0
 [workspace]
+exclude = ["editor"]

@@ -114,9 +114,9 @@ staging.mkdir(parents=True, exist_ok=True)
 (staging / "resonara-gain.LICENSE.txt").write_bytes(b"MOCK LICENSE NOTICES")
 (args.output / "build.json").write_text(json.dumps({"fixture_only": True, "audited": True}))
 ''')
-        freeverb_dir = self.app / "plugins/scarlet-freeverb"
+        freeverb_dir = self.app / "plugins/resonara-freeverb"
         freeverb_dir.mkdir(parents=True)
-        (freeverb_dir / "build.py").write_text((plugin_dir / "build.py").read_text().replace("resonara-gain", "scarlet-freeverb"))
+        (freeverb_dir / "build.py").write_text((plugin_dir / "build.py").read_text().replace("resonara-gain", "resonara-freeverb"))
         (self.tools / "cargo").write_text('''#!/usr/bin/env python3
 import json, os, pathlib, struct, sys, time
 args = sys.argv[1:]
@@ -139,9 +139,9 @@ elif args[:2] == ["scarlet", "image"]:
     artifacts = app / ("artifacts/scarlet-native" if native else "artifacts/scarlet")
     assert (artifacts / "native-host-audit.json").is_file()
     assert (artifacts / "gain-aarch64/build.json").is_file()
-    assert (artifacts / "freeverb-aarch64/build.json").is_file()
-    assert (artifacts / "rootfs/system/plugins/scarlet-freeverb.clap").read_bytes() == b"MOCK NATIVE CLAP PLUGIN"
-    assert (artifacts / "rootfs/system/plugins/scarlet-freeverb.LICENSE.txt").read_bytes() == b"MOCK LICENSE NOTICES"
+    assert (artifacts / "resonara-freeverb-aarch64/build.json").is_file()
+    assert (artifacts / "rootfs/system/plugins/resonara-freeverb.clap").read_bytes() == b"MOCK NATIVE CLAP PLUGIN"
+    assert (artifacts / "rootfs/system/plugins/resonara-freeverb.LICENSE.txt").read_bytes() == b"MOCK LICENSE NOTICES"
     assert (artifacts / "rootfs/bin/resonara").is_file()
     assert (artifacts / "rootfs/system/plugins/resonara-gain.clap").read_bytes() == b"MOCK NATIVE CLAP PLUGIN"
     assert (artifacts / "rootfs/system/plugins/resonara-gain.LICENSE.txt").read_bytes() == b"MOCK LICENSE NOTICES"
@@ -246,7 +246,7 @@ with tempfile.TemporaryDirectory(prefix="resonara-wrapper-tests-") as temporary:
     assert not bad_plugin.overlay.exists() and not bad_plugin.image.exists()
 
     bad_freeverb = Fixture(root / "bad-freeverb")
-    bad_freeverb.env["FIXTURE_FAIL_PLUGIN_NAME"] = "scarlet-freeverb"
+    bad_freeverb.env["FIXTURE_FAIL_PLUGIN_NAME"] = "resonara-freeverb"
     refused = bad_freeverb.run("scarlet-image")
     assert refused.returncode and "mock native plugin ELF audit rejected" in refused.stderr
     assert [call["args"][0] for call in bad_freeverb.calls()] == ["build", "audit-host", "plugin-build", "plugin-build"]

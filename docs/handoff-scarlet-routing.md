@@ -1,5 +1,28 @@
 # Resonara / Scarlet 引き継ぎ（2026-10-02）
 
+
+## 標準 Resonara Freeverb と共通 ScarletUI editor（同日・最新）
+
+- ユーザーの最終方針は、標準 Freeverb を Resonara 内で管理し、他でも使う共通部品が必要になった場合だけクレートとして切り出すこと。正本は `plugins/resonara-freeverb/`。repo/crate/file 名の `-plugin-` は除き、表示は `Resonara Freeverb`、CLAP ID は `org.resonara.freeverb`。
+- DSP と専用 editor を同じディレクトリで管理。DSP は freestanding CLAP 用の独立 Cargo workspace、`editor/` は Resonara workspace のローカル `resonara-freeverb-editor` crate。両 OS の ScarletUI pin を共有し、Winit/SWS の platform feature は host が選ぶ。別 Freeverb repo の取得・インストールは不要。
+- 空 Insert の一覧に `Resonara Freeverb` を追加。macOS/Linux の app build.rs が同じ target の DSP を独立 target directory で build し、実行ファイル隣の `plugins/` に `.clap` と license notices を置く。Scarlet image wrapper は `/system/plugins/resonara-freeverb.clap` に native DSP を stage。移動配布では host の `plugins/` directory も同梱。
+- 専用画面は Room size / Damping / Width と Wet / Dry の5ノブ、numeric fields、Default / Room / Hall / Aux send。ユーザー指定により **小数2桁固定・0埋め**（`0.20` / `0.25` / `1.00`）。UI は 0.01 単位、arrow は0.02、Shift+arrow は0.01。Apply 時の numeric 入力も丸める。DSP の CLAP continuous metadata は変更しない。
+- Apply は既存の inactive-instance state 編集 → routing commit / Undo の経路を使い、再生は継続。Cancel / Escape / outside click は draft を破棄。schema が互換でなければ汎用 editor に戻る。独立 `clap.gui` window は実装していない。
+- workspace 全体のテストは GUI 機能追加後に成功（long stress のみ除外）。最終2桁版は editor 10 tests と実 Freeverb integration 2 tests、debug/release builds、AArch64 / RISC-V64 native builds と ELF audit を確認。integration は preset の mounted click、invalid 入力、rounding、Cancel、state/save/reopen、Undo、bypass、再生位置継続を検証。ログは `artifacts/resonara-freeverb-*-tests.log`、`*-build.log`、`native-two-decimal-verify.log`。
+- 実 Scarlet AArch64 で新 ID の dynamic load、5 params / 48-byte state、wet tail energy 2.3789181011455605、save/reopen/export/exact bypass、SAS を検証。virgl の専用画面・preset・knob drag を確認。macOS/wgpu の専用画面も確認し、ユーザーがその画面を操作・確認済み。RISC-V64 runtime は未検証。最終2桁変更は tests / native builds で検証。
+- ゲスト検証は既存 disk の隔離 copy のみ更新。`artifacts/native-plugin-vm/serial-freeverb-editor.log`、`freeverb-dedicated-editor.png`、`freeverb-rounded-draft.png`。QMP quit で終了。capture PCM は171765 nonzero samples / peak4458。QEMU が RIFF/data lengths を0のまま残したため元 capture を保持し、`freeverb-editor-audio-finalized.wav` と audit JSON を作成。
+- 先の公開指示を受けた独立 repo は `petitstrawberry/resonara-freeverb` に改名し、521476d まで既に push 済み。その後ユーザーが標準同梱の monorepo 管理へ変更したため、新 release は作らず、Resonara の source / manifest / docs を正本へ変更。既存公開 repo は削除していない。Resonara 自身は commit / push していない。
+
+
+## Freeverb Scarlet の独立公開と名前統一（同日）
+
+- ユーザーが GitHub 公開を指示し、repo 名は `freeverb-scarlet`、名称は全体で統一と指定。独立 checkout `../freeverb-scarlet` を作成し [petitstrawberry/freeverb-scarlet](https://github.com/petitstrawberry/freeverb-scarlet) の main に初版を公開。Resonara 自身は commit / push していない。
+- Resonara の同梱 source は `plugins/freeverb-scarlet` に移動。crate / `.clap` filename は `freeverb-scarlet`、表示名は `Freeverb Scarlet`、ID は `org.scarlet.freeverb-scarlet`。image wrapper、wrapper fixtures、native smoke と docs も更新。以前の `scarlet-freeverb.clap` / `org.scarlet.freeverb` は別 identity なので、旧 project は旧 plugin を保持するか更新が必要。
+- freestanding CLAP ABI と builder をこの plugin 内へ収め、Resonara/Gain への sibling path 依存を解消。元 DSP / CLAP の license notices を保持。native / host 用の pinned Nix shells、GitHub host/native CI を追加。
+- DSP/CLAP 5 tests、registry ABI 1 test、loader flags 3 tests、rename 後の image wrapper tests、host app/example check に成功。AArch64 / RISC-V64 `.clap` の build と ELF audit に成功。Nix standalone host shell でも同じ6+3 tests が成功。検証ログは `artifacts/freeverb-scarlet-*.log`。 GitHub CI [37009299375](https://github.com/petitstrawberry/freeverb-scarlet/actions/runs/37009299375) は macOS / Linux host、AArch64 / RISC-V64 native の全4 jobs が成功。
+- 0.1.0 の native binaries、license notices、source commit を含む sanitized BUILD.json、SHA256SUMS を [Release](https://github.com/petitstrawberry/freeverb-scarlet/releases/tag/v0.1.0) に公開。最新 native binaries は `artifacts/freeverb-scarlet-{aarch64,riscv64}/staging/system/plugins/freeverb-scarlet.clap`。以前の guest QA と同じ DSP / state layout だが、metadata rename 後の guest runtime は再実行していない。
+- ユーザーの狙いは Resonara の default plugin 化。ScarletUI の共通専用 editor を host に組み込む方向なら両 OS の UI code を共通化できる。独立 CLAP GUI として配布する場合は platform window/event-loop adapters が別途必要。現版は generic knobs を使用し、専用 GUI は未実装。
+
 ## 外部 PR マージ後の依存更新（同日）
 
 - ユーザーが Scarlet PR #576 / ScarletUI PR #34 をマージ。Scarlet の merge commit は `10a4a4768f745e02377a4b32e96d36cad697522f`（dev）、ScarletUI は `4005841e514690f3328c6e09b8b2b77656fa07de`（main）。
@@ -24,14 +47,14 @@
 - [ScarletUI PR #33](https://github.com/petitstrawberry/scarlet-ui/pull/33): `FileDialogFilterPolicy::{Required, Optional}` を追加。Required の既存動作を維持し、Optional の単一 Open / Save は native Files chooser を使う。provider は任意拡張子を絞れないため、Resonara は戻り値を既存の絶対 path / 拡張子チェックで検証してから I/O を始める。UI thread を IPC 待ちで止めない。
 - Files が明確に `ServiceNotFound` なら video player 同様の stemd `LaunchOrFocus` を使い、登録まで bounded retry。曖昧な timeout は再送しない。Response の sender / object / interface / signal / request ID 照合、early response の pending queue、owner-close / local cancel を維持。remote Cancel と multi-select は既存 protocol に無い。
 - Resonara の両 OS の pin と lock は `3d3c0d80ba8344ece782820e8f5d5d11e80a225c`。別 ScarletUI worktree のみ変更し、既存 `../scarlet-ui` の main は維持。PR #32 は merge 済み。
-- `plugins/scarlet-freeverb` は MIT の [trevyn/freeverb](https://github.com/trevyn/freeverb/tree/d89365ce8381751bea6b0e85294b7f6da3ad98ef) の DSP を移植した新しい native CLAP adapter。元ソース・license を保存し、同じ演算・tuning・sample-rate scaling を使う。fixed storage / configure / reset を追加。macOS / Linux バイナリの流用ではない。
-- Plugin ID `org.scarlet.freeverb`、名前 `Scarlet Freeverb`。Wet / Dry / Room size / Damping / Width の5 parameters、48-byte state。8〜96 kHz / stereo float32 / zero latency / 最大8 instances。Aux reverb は Wet=1、Dry=0。独自 GUI は無く、既存の汎用 CLAP editor を使う。
+- `plugins/freeverb-scarlet` は MIT の [trevyn/freeverb](https://github.com/trevyn/freeverb/tree/d89365ce8381751bea6b0e85294b7f6da3ad98ef) の DSP を移植した新しい native CLAP adapter。元ソース・license を保存し、同じ演算・tuning・sample-rate scaling を使う。fixed storage / configure / reset を追加。macOS / Linux バイナリの流用ではない。
+- Plugin ID `org.scarlet.freeverb-scarlet`、名前 `Freeverb Scarlet`。Wet / Dry / Room size / Damping / Width の5 parameters、48-byte state。8〜96 kHz / stereo float32 / zero latency / 最大8 instances。Aux reverb は Wet=1、Dry=0。独自 GUI は無く、既存の汎用 CLAP editor を使う。
 - オーディオ process / flush / reset は allocation / lock / OS imports / TLS 無し。8 / 44.1 / 48 / 96 kHz で upstream reference と sample-by-sample 比較。CLAP sample-offset event、in-place、tail、reset、state partial-I/O / corrupt state の atomic rejection、capacity を含む5テストに成功。
 - 実 guest で最初のロードが `DT_FLAGS other than BIND_NOW` で失敗。`-Bsymbolic` の DF_SYMBOLIC が原因だった。共通 plugin builder を `-Bsymbolic-functions` に変更し、Scarlet loader の DT_FLAGS / DT_FLAGS_1 masks と OSABI の監査・3 regression tests を追加。Gain の native build にも適用される。
 - AArch64 / RISC-V64 Freeverb ELF は imports / NEEDED / TLS 無しで audit に合格。image wrapper は Gain / Freeverb と license を両方監査してから staging。2番目の plugin の監査失敗でも新しい app staging / image composition を行わない。wrapper mock tests 成功。macOS の temporary directory canonicalization と Linux display guard の mock も修正した。
 - Resonara workspace 332テスト成功（長時間 stress のみ除外）。macOS の実 CLAP load、wet tail energy = 2.3789181011455605、state save/reopen、WAV export、exact bypass に成功。`artifacts/freeverb-host-smoke.log`。
 - 既存 full GPT disk を APFS copy した独立 `artifacts/native-plugin-vm/validation.img` で Scarlet を起動。元 image / project / checkout の既存変更は維持。実 Scarlet loader → Resonara discovery / Engine → Freeverb DSP で同じ tail energy と state / export / bypass の成功を確認。`artifacts/native-plugin-vm/serial.log`。
-- `scarlet_native_smoke` example は CLAP / SAS / ScarletUI Files IF の guest verification 用。リンク seed / interpreter / imports を app と同じ方式にして最終 ELF を監査。`plugins/scarlet-freeverb/README.md` に build / install / verification 手順がある。
+- `scarlet_native_smoke` example は CLAP / SAS / ScarletUI Files IF の guest verification 用。リンク seed / interpreter / imports を app と同じ方式にして最終 ELF を監査。`plugins/freeverb-scarlet/README.md` に build / install / verification 手順がある。
 - 実 Scarlet AArch64 で Optional filter の Open / Save が Files chooser を表示し、正しい絶対パスを返した。Resonara 本体の Import ボタンから同じ picker で WAV を選択し、2番目の track / region が追加された。汎用 Freeverb editor で Room size を 0.8 → 0.7 に変更し、再表示でも値を保持。`artifacts/native-plugin-vm/resonara-import-picker.png`、`resonara-imported.png`、`resonara-freeverb-state.png`。
 - SAS playback も成功。HVF 検証では deadline misses=1 / overruns=1（underrun 数ではない）。QEMU WAV backend の captured PCM は非ゼロ音声を確認し `audio-audit.json` に記録。VM 停止時の SIGINT で RIFF lengths が未確定だったため、元 capture を保持して PCM を `audio-finalized.wav` に封入した。実機での負荷改善や長時間安定性の保証ではない。
 - ScarletUI PR #33 の AArch64 / RISC-V64 / Scarlet-host CI は成功。upstream compiler CI は既存の並列 retained-render 比較で失敗し、修正前の base でも再現。core の直列381 tests + 23 doctests と file-dialog policy 2 tests は成功。PR body に記録済み。

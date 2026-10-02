@@ -35,8 +35,8 @@ fn clap_smoke(directory: &Path, play: bool) -> Result<()> {
     let choice = catalog
         .effects
         .iter()
-        .find(|c| c.plugin_id == "org.scarlet.freeverb")
-        .ok_or_else(|| format!("Scarlet Freeverb not discovered: {:?}", catalog.warnings))?;
+        .find(|c| c.plugin_id == "org.resonara.freeverb")
+        .ok_or_else(|| format!("Resonara Freeverb not discovered: {:?}", catalog.warnings))?;
     let plugin = plugins::load_installed(choice)?;
     println!(
         "[native-smoke] loaded {}: {} params, {} state bytes",
@@ -74,13 +74,13 @@ fn clap_smoke(directory: &Path, play: bool) -> Result<()> {
     if tail_energy < 0.00001 {
         return Err(format!("No wet tail: {tail_energy}").into());
     }
-    let saved = directory.join("freeverb.resonara.json");
+    let saved = directory.join("resonara-freeverb.resonara.json");
     project.save(&saved)?;
     let reopened = Project::load(&saved)?;
     if render(&reopened)?.0 != wet_output {
         return Err("State save/reopen changed DSP".into());
     }
-    reopened.export_wav(&directory.join("freeverb-wet.wav"))?;
+    reopened.export_wav(&directory.join("resonara-freeverb-wet.wav"))?;
     project.tracks[0].routing.inserts[0].bypass = true;
     let bypass = render(&project)?.0;
     project.tracks[0].routing.inserts.clear();
@@ -208,6 +208,6 @@ fn main() -> Result<()> {
     let directory = std::env::args_os()
         .nth(2)
         .map(PathBuf::from)
-        .unwrap_or_else(|| "artifacts/freeverb-smoke".into());
+        .unwrap_or_else(|| "artifacts/resonara-freeverb-smoke".into());
     clap_smoke(&directory, mode == "audio")
 }

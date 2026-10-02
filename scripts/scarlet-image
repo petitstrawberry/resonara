@@ -173,8 +173,8 @@ BINARY="$TARGET_DIR/aarch64-unknown-scarlet/release/resonara"
 python3 "$REPO/crates/resonara-clap/scripts/audit-scarlet-host.py" "$BINARY" \
   --arch aarch64 --json "$ARTIFACTS/native-host-audit.json"
 # Every bundled native plugin must be audited before any application is staged.
-PLUGIN_NAMES=(resonara-gain scarlet-freeverb)
-PLUGIN_BUILD_DIRS=(gain-aarch64 freeverb-aarch64)
+PLUGIN_NAMES=(resonara-gain resonara-freeverb)
+PLUGIN_BUILD_DIRS=(gain-aarch64 resonara-freeverb-aarch64)
 for i in "${!PLUGIN_NAMES[@]}"; do
   plugin="${PLUGIN_NAMES[$i]}"
   output="$ARTIFACTS/${PLUGIN_BUILD_DIRS[$i]}"

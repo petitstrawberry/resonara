@@ -21,7 +21,7 @@ use core::{
 };
 
 mod dsp;
-const PLUGIN_ID: &CStr = c"org.scarlet.freeverb";
+const PLUGIN_ID: &CStr = c"org.resonara.freeverb";
 const CAPACITY: usize = 8;
 const PARAM_COUNT: usize = 5;
 const DEFAULTS: [f64; PARAM_COUNT] = [0.3, 1.0, 0.5, 0.5, 1.0];
@@ -43,13 +43,13 @@ static FEATURES: FeatureList = FeatureList([
 static DESCRIPTOR: clap_plugin_descriptor = clap_plugin_descriptor {
     clap_version: CLAP_VERSION,
     id: PLUGIN_ID.as_ptr(),
-    name: c"Scarlet Freeverb".as_ptr(),
-    vendor: c"Scarlet / Ian Hobson".as_ptr(),
+    name: c"Resonara Freeverb".as_ptr(),
+    vendor: c"Resonara / Ian Hobson".as_ptr(),
     url: c"https://github.com/petitstrawberry/resonara".as_ptr(),
     manual_url: c"".as_ptr(),
     support_url: c"".as_ptr(),
-    version: c"0.1.0".as_ptr(),
-    description: c"MIT Freeverb stereo reverb; freestanding Scarlet CLAP port".as_ptr(),
+    version: c"0.2.0".as_ptr(),
+    description: c"MIT Freeverb stereo reverb; freestanding CLAP DSP".as_ptr(),
     features: FEATURES.0.as_ptr(),
 };
 static ENTRY_USERS: AtomicU32 = AtomicU32::new(0);

@@ -12,6 +12,8 @@ pub use catalog::{ClapCatalog, ClapChoice, scan_installed};
 
 pub const BUNDLED_GAIN_LIBRARY: &str = "resonara-gain.clap";
 pub const BUNDLED_GAIN_ID: &str = "org.resonara.gain";
+pub const BUNDLED_FREEVERB_LIBRARY: &str = "resonara-freeverb.clap";
+pub const BUNDLED_FREEVERB_ID: &str = "org.resonara.freeverb";
 pub const MAX_STATE_BYTES: usize = 1024 * 1024;
 pub const MAX_PROJECT_STATE_BYTES: usize = 16 * MAX_STATE_BYTES;
 pub const MAX_PARAMETERS: usize = 1024;
@@ -80,6 +82,9 @@ impl ClapInsert {
     pub fn is_bundled_gain(&self) -> bool {
         self.library == BUNDLED_GAIN_LIBRARY && self.plugin_id == BUNDLED_GAIN_ID
     }
+    pub fn is_bundled_freeverb(&self) -> bool {
+        self.library == BUNDLED_FREEVERB_LIBRARY && self.plugin_id == BUNDLED_FREEVERB_ID
+    }
 }
 
 fn deserialize_limited<'de, D, T>(
@@ -127,10 +132,15 @@ fn deserialize_parameters<'de, D: serde::Deserializer<'de>>(
 /// A configured path is authoritative: failure does not unexpectedly load a
 /// different installation. Relative configuration paths are rejected.
 fn bundled_gain_path() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("RESONARA_CLAP_LIBRARY") {
+    bundled_path(BUNDLED_GAIN_LIBRARY, "RESONARA_CLAP_LIBRARY")
+}
+fn bundled_path(library: &str, override_name: &str) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os(override_name) {
         let path = PathBuf::from(path);
         if !path.is_absolute() || !path.is_file() {
-            return Err("RESONARA_CLAP_LIBRARY must name an existing absolute library file".into());
+            return Err(
+                format!("{override_name} must name an existing absolute library file").into(),
+            );
         }
         return Ok(path);
     }
@@ -139,16 +149,16 @@ fn bundled_gain_path() -> Result<PathBuf> {
     if let Ok(executable) = std::env::current_exe()
         && let Some(directory) = executable.parent()
     {
-        let path = directory.join("plugins").join(BUNDLED_GAIN_LIBRARY);
+        let path = directory.join("plugins").join(library);
         if path.is_file() {
             return Ok(path);
         }
     }
-    let native = PathBuf::from("/system/plugins").join(BUNDLED_GAIN_LIBRARY);
+    let native = PathBuf::from("/system/plugins").join(library);
     if native.is_file() {
         return Ok(native);
     }
-    Err("Bundled Resonara Gain CLAP library is unavailable".into())
+    Err(format!("Bundled {library} is unavailable").into())
 }
 
 /// Cheap UI availability hint only. An existing file can still fail ABI/state
@@ -158,6 +168,13 @@ pub fn is_available(insert: &ClapInsert) -> bool {
 }
 
 fn library_path(insert: &ClapInsert) -> Result<PathBuf> {
+    if insert.library == BUNDLED_FREEVERB_LIBRARY {
+        return if insert.is_bundled_freeverb() {
+            bundled_path(BUNDLED_FREEVERB_LIBRARY, "RESONARA_FREEVERB_LIBRARY")
+        } else {
+            Err("Unknown bundled CLAP identity".into())
+        };
+    }
     // Preserve the bundled override and reject an unrelated ID masquerading as it.
     if insert.library == BUNDLED_GAIN_LIBRARY {
         return if insert.is_bundled_gain() {
@@ -213,6 +230,11 @@ fn snapshot(host: &mut HostPlugin, library: &str) -> Result<ClapInsert> {
 pub fn load_bundled_gain() -> Result<ClapInsert> {
     let mut host = HostPlugin::load(&bundled_gain_path()?, Some(BUNDLED_GAIN_ID))?;
     snapshot(&mut host, BUNDLED_GAIN_LIBRARY)
+}
+pub fn load_bundled_freeverb() -> Result<ClapInsert> {
+    let path = bundled_path(BUNDLED_FREEVERB_LIBRARY, "RESONARA_FREEVERB_LIBRARY")?;
+    let mut host = HostPlugin::load(&path, Some(BUNDLED_FREEVERB_ID))?;
+    snapshot(&mut host, BUNDLED_FREEVERB_LIBRARY)
 }
 
 /// Load a catalog identity on the owner/control thread, with default opaque state.

@@ -28,6 +28,10 @@ repository = 'https://github.com/petitstrawberry/scarlet-ui'
 assert dependency.get('git') == repository, 'ScarletUI must use its Git source'
 assert dependency.get('rev') == revision, 'Review and update the ScarletUI pin explicitly'
 assert 'path' not in dependency, 'Committed ScarletUI dependency must not require a local checkout'
+editor = tomllib.loads((root / 'plugins/resonara-freeverb/editor/Cargo.toml').read_text())['dependencies']['scarlet-ui']
+assert editor.get('git') == repository and editor.get('rev') == revision
+assert editor.get('features') == ['std'] and not editor.get('default-features', True), 'Editor must share UI identity and leave platform selection to the host'
+
 
 runtime_repository = 'https://github.com/petitstrawberry/Scarlet'
 runtime_revision = 'b3d2a55740a3d2ca49daad0ec7baba233f706f7a'

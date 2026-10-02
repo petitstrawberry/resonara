@@ -50,11 +50,76 @@ impl Daw {
             return;
         }
         self.clear_control_focus();
+        if self.open_freeverb_editor(target, slot) {
+            return;
+        }
         if self.open_native_editor(target, slot) {
             self.dialog.set(Dialog::None);
             return;
         }
         self.open_generic_editor(target, slot);
+    }
+    fn open_freeverb_editor(&self, target: RoutingTarget, slot: usize) -> bool {
+        let plugin = target
+            .get(&self.model.borrow().project)
+            .and_then(|r| r.inserts.get(slot))
+            .and_then(|i| {
+                if let InsertKind::Clap { plugin } = &i.kind {
+                    Some(plugin.clone())
+                } else {
+                    None
+                }
+            });
+        let Some(plugin) = plugin.filter(|p| p.is_bundled_freeverb()) else {
+            return false;
+        };
+        let mut values = [0.; 5];
+        // Do not apply a dedicated layout to a changed or incompatible schema.
+        if plugin.parameters.len() != 5 {
+            return false;
+        }
+        for id in 0..5 {
+            let Some(parameter) = plugin.parameters.iter().find(|p| {
+                p.id == id as u32
+                    && p.min == 0.
+                    && p.max == 1.
+                    && !p.hidden
+                    && !p.read_only
+                    && !p.stepped
+            }) else {
+                return false;
+            };
+            values[id] = parameter.value;
+        }
+        let Ok(editor) = resonara_freeverb_editor::FreeverbEditor::new(values) else {
+            return false;
+        };
+        *self.plugin_fields.borrow_mut() = editor
+            .fields()
+            .into_iter()
+            .enumerate()
+            .map(|(id, text)| (id as u32, text))
+            .collect();
+        *self.freeverb_editor.borrow_mut() = Some(editor);
+        self.dialog_error.set(String::new());
+        self.dialog.set(Dialog::FreeverbEditor(target, slot));
+        true
+    }
+    pub(super) fn freeverb_editor_dialog(&self, target: RoutingTarget, slot: usize) -> AnyView {
+        let Some(editor) = self.freeverb_editor.borrow().clone() else {
+            return self.clap_editor_dialog(target, slot);
+        };
+        let apply = self.clone();
+        let cancel = self.clone();
+        self.insert_popup(
+            AnyView::new(
+                editor
+                    .error(self.dialog_error.clone())
+                    .on_apply(move || apply.submit_clap_parameters(target, slot))
+                    .on_cancel(move || cancel.dialog.set(Dialog::None)),
+            ),
+            resonara_freeverb_editor::WIDTH,
+        )
     }
     pub(super) fn open_generic_editor(&self, target: RoutingTarget, slot: usize) {
         let kind = target
@@ -141,26 +206,27 @@ impl Daw {
     }
     pub(super) fn insert_picker_dialog(&self, target: RoutingTarget) -> AnyView {
         self.insert_popup(AnyView::new(vstack!{
-            label("Add insert").font_size(17.),caption("BUILT-IN").font_size(10.),
+            vstack! { label("Add insert").font_size(17.),caption("BUILT-IN").font_size(10.) }.spacing(4.),
             self.insert_menu_item("Gain",0,move|s|s.select_insert_kind(target,0)),
             self.insert_menu_item("Low-pass",1,move|s|s.select_insert_kind(target,1)),
             self.insert_menu_item("Delay",2,move|s|s.select_insert_kind(target,2)),
             caption("CLAP · NATIVE EFFECT").font_size(10.),
             self.insert_menu_item("Resonara Gain",3,move|s|s.select_insert_kind(target,3)),
-            self.insert_menu_item("Installed CLAP effects…",4,move|s|s.select_insert_kind(target,4)),
+            self.insert_menu_item("Resonara Freeverb",4,move|s|s.select_insert_kind(target,4)),
+            self.insert_menu_item("Installed CLAP effects…",5,move|s|s.select_insert_kind(target,5)),
             Text::from_state(self.dialog_error.clone()).font_size(11.).color(GOLD).frame_width(250.),
-            self.insert_menu_item("Cancel",5,|s|s.dialog.set(Dialog::None)),
+            self.insert_menu_item("Cancel",6,|s|s.dialog.set(Dialog::None)),
         }.alignment(Alignment::TopLeading).spacing(4.).padding(14.)),278.)
     }
     pub(super) fn select_insert_kind(&self, target: RoutingTarget, kind: usize) {
         if self.busy() {
             return;
         }
-        if kind == 4 {
+        if kind == 5 {
             self.open_clap_picker(target);
             return;
         }
-        if kind == 5 {
+        if kind == 6 {
             self.dialog.set(Dialog::None);
             return;
         }
@@ -172,6 +238,14 @@ impl Daw {
                 Ok(plugin) => InsertKind::Clap { plugin },
                 Err(error) => {
                     self.dialog_error.set(format!("CLAP unavailable: {error}"));
+                    return;
+                }
+            },
+            4 => match plugins::load_bundled_freeverb() {
+                Ok(plugin) => InsertKind::Clap { plugin },
+                Err(error) => {
+                    self.dialog_error
+                        .set(format!("Freeverb unavailable: {error}"));
                     return;
                 }
             },
@@ -224,7 +298,7 @@ impl Daw {
     }
     pub(super) fn handle_insert_popup_key(&self, key: KeyCode) -> bool {
         let count = match self.dialog.get() {
-            Dialog::InsertPicker(_) => 6,
+            Dialog::InsertPicker(_) => 7,
             Dialog::InsertActions(..) => 7,
             Dialog::ClapPicker(_) => self.plugin_catalog.borrow().effects.len() + 2,
             _ => return false,
@@ -427,6 +501,13 @@ impl Daw {
         let Some(mut plugin) = plugin else {
             return;
         };
+        if self.dialog.get() == Dialog::FreeverbEditor(target, slot)
+            && let Some(editor) = self.freeverb_editor.borrow().as_ref()
+        {
+            // The dedicated normalized editor uses 0.01 increments. Invalid
+            // input remains untouched so the normal parameter error names it.
+            let _ = editor.normalize_drafts();
+        }
         let values = self
             .plugin_fields
             .borrow()

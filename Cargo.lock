@@ -2053,6 +2053,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "resonara-core",
+ "resonara-freeverb-editor",
  "resonara-platform",
  "scarlet-ui",
 ]
@@ -2076,6 +2077,13 @@ dependencies = [
  "serde",
  "serde_json",
  "symphonia",
+]
+
+[[package]]
+name = "resonara-freeverb-editor"
+version = "0.2.0"
+dependencies = [
+ "scarlet-ui",
 ]
 
 [[package]]

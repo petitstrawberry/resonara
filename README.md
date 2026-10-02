@@ -56,12 +56,12 @@ mono/stereoのWAV（PCM 8/16/24/32bit・32bit float）、MP3、FLAC、AIFF、OGG
 
 トラック／Auxごとにインスペクターから出力先、直列insert、sendを編集できます。Logicの流れに合わせ、Busを接続経路、Auxを受け側チャンネルとして表示します。OUTPUT／SENDSで「New Bus → Aux」を選ぶと経路と受け側を同時に作成・接続し、既存の宛先は「Bus N → チャンネル名」で表示します。ミキサーの「+ Aux」から手動作成も可能です。AuxのINPUTには受信Bus番号を表示します。同じAuxをmain output接続でsubgroup、send接続でeffect returnとして使え、両方を同時に受け取れます。既存の縦型フェーダー、Pan、左右メーターは共通です。
 
-- OUTPUTでStereo Outまたは別のBusを選択。INSERTSの空スロットから内蔵DSPまたはResonara Gain CLAPを選択。専用のコンパクトなスロットには名前・電源・メニューを表示し、名前クリックでエディター、電源でbypass、右クリック／メニューから順序変更と削除を行います。Enterで編集、Spaceでbypass、Shift+F10でメニューを開けます（スロットへフォーカス後）。エディターはセッション上のポップアップです。Delayは100% wetのdevice-rate sample delayです。
+- OUTPUTでStereo Outまたは別のBusを選択。INSERTSの空スロットから内蔵DSP、Resonara Gain、Resonara Freeverb、またはインストール済みCLAPを選択。専用のコンパクトなスロットには名前・電源・メニューを表示し、名前クリックでエディター、電源でbypass、右クリック／メニューから順序変更と削除を行います。Enterで編集、Spaceでbypass、Shift+F10でメニューを開けます（スロットへフォーカス後）。エディターはセッション上のポップアップです。Delayは100% wetのdevice-rate sample delayです。
 - SENDSは空スロットをクリックして宛先を選択。各sendを1行にまとめ、宛先・dB値・小さなgainノブ・メニューだけを表示します。Pre/Post Pan、bypass、削除、正確なレベル入力はメニューで設定。send量はdB値を併記し、再生中にatomic更新、ドラッグ1回をUndo1回として扱います。メニューのShow receiverでreturnのインスペクターへ移動します。Preはinsert後・fader前、Post Panはfader/pan後。Auxにもinsert/send/outputを設定できます。
 - Bus削除では依存するmain outputをStereo Outへ戻し、そのBus宛のsendを削除。Undo/Redoで全ルーティングと選択を復元します。フィードバック循環はDelay、disabled sendを含め拒否し、失敗した変更は履歴や再生状態を変えません。
 - ルーティング・insert・send宛先／pre-post切替は再生を停止して適用し、次の再生開始時に一度だけgraphをコンパイルします。通常のgain/pan/muteとsend gainは再生中にatomic更新し、再コンパイルしません。保存・再読込・WAV書出しは同じsession routingを使用し、旧JSONは従来のtrack→masterとして読み込みます。
 
-コアの `Engine::with_graph` による明示的なDAGも使用可能です。CLAPはまず同梱Resonara Gain専用の小さなホストを実装し、汎用パラメーターとopaque stateを保存します。外部プラグイン全般、独自GUI、MIDI、PDC、エフェクトtail延長、再生中のgraph差し替えは未対応です。制限・ビルド・検証は[CLAPホスト](docs/clap-host.md)を参照してください。API、信号順序、制限、テストとスケール試験は[音声グラフ](docs/audio-graph.md)に記載しています。
+コアの `Engine::with_graph` による明示的なDAGも使用可能です。CLAPは汎用パラメーターとopaque stateを保存し、インストール済みエフェクトも読み込みます。標準リバーブ [Resonara Freeverb](plugins/resonara-freeverb/README.md) はmacOSとScarletで共通のScarletUI専用画面を使い、5つのノブ・数値入力・4プリセットを備えます。Applyで反映、Cancel／Escapeで破棄し、Undoや再生中の変更にも対応します。macOS/Linuxの通常ビルドは実行ファイルの隣の `plugins/` にDSPを生成するため、実行ファイルを移動する際はこのフォルダーも同梱してください。Scarletのimage builderは `/system/plugins/` に配置します。MIDI、PDC、エフェクトtail延長は未対応です。制限・ビルド・検証は[CLAPホスト](docs/clap-host.md)を参照してください。API、信号順序、制限、テストとスケール試験は[音声グラフ](docs/audio-graph.md)に記載しています。
 
 Scarlet版はネイティブstdターゲットでSWS UIとSAS音声アダプターを選択します。Git依存・既存vendorパッチを保持し、ネイティブstdでファイルI/Oを共有します。ビルドとQEMU実行の手順、音声の制約、検証段階は[Scarlet移植](docs/scarlet-port.md)を参照してください。クロスビルド成功と実機動作は区別します。
 

@@ -1,0 +1,10 @@
+[package]
+workspace = "../../.."
+name = "resonara-freeverb-editor"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+publish = false
+repository = "https://github.com/petitstrawberry/resonara"
+[dependencies]
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "4005841e514690f3328c6e09b8b2b77656fa07de", default-features = false, features = ["std"] }
