@@ -6752,3 +6752,83 @@ fn clap_bypass_preserves_editor_session_while_stopped_and_playing() {
     }
     assert!(!controls.error.load(Ordering::Relaxed));
 }
+
+#[test]
+fn send_popups_and_pre_fader_changes_keep_valid_gpu_damage() {
+    use scarlet_ui::renderer::{BackendFrame, PaintBackend, PaintContext};
+    struct GpuDamageProbe(Size, u32, Rc<Cell<usize>>);
+    impl PaintBackend for GpuDamageProbe {
+        fn resize(&mut self, size: Size, scale: u32) {
+            self.0 = size;
+            self.1 = scale;
+        }
+        fn render<'a>(
+            &'a mut self,
+            _: &PaintContext<'_>,
+            _: Color,
+            logical: Option<&[scarlet_ui::geometry::Rect]>,
+            physical: Option<&[scarlet_ui::compositor::DamageRect]>,
+        ) -> scarlet_ui::Result<BackendFrame<'a>> {
+            if let Some(damage) = physical {
+                let width = (self.0.width * self.1 as f32 / 1000.).ceil() as u32;
+                let height = (self.0.height * self.1 as f32 / 1000.).ceil() as u32;
+                if !damage
+                    .iter()
+                    .any(|&(x, y, w, h)| w > 0 && h > 0 && x < width && y < height)
+                {
+                    eprintln!("Empty GPU damage: logical={logical:?}, physical={physical:?}");
+                    return Err(scarlet_ui::Error::RenderError);
+                }
+            }
+            self.2.set(self.2.get() + 1);
+            Ok(BackendFrame::External)
+        }
+    }
+    wait_for_test_font();
+    let app = Daw::new(project());
+    let aux = app.model.borrow_mut().project.add_bus("Aux", BusKind::Aux);
+    let target = RoutingTarget::Track(0);
+    app.add_send(target, aux);
+    let mut pipeline = scarlet_ui::RenderingPipeline::new();
+    pipeline.set_root(
+        Window::new("Send GPU damage", app.clone())
+            .size(Size::new(1280., 850.))
+            .create_element(),
+    );
+    pipeline.layout_initial();
+    let submissions = Rc::new(Cell::new(0));
+    pipeline.set_paint_backend(Box::new(GpuDamageProbe(
+        Size::ZERO,
+        1000,
+        submissions.clone(),
+    )));
+    let settle = |pipeline: &mut scarlet_ui::RenderingPipeline, action: &str| {
+        let before = submissions.get();
+        for frame in 0..8 {
+            assert!(
+                pipeline.render_for_present().is_ok(),
+                "{action}: frame {frame}"
+            );
+        }
+        assert!(
+            submissions.get() > before,
+            "{action} must still repaint visible changes"
+        );
+    };
+    settle(&mut pipeline, "initial");
+    for scale in [1000, 2000] {
+        pipeline.set_scale_milli(scale);
+        if scale != 1000 {
+            settle(&mut pipeline, "scale change");
+        }
+        app.open_send_picker(target, Some(0));
+        settle(&mut pipeline, "open send destination");
+        app.choose_send_destination(target, Some(0), 0);
+        settle(&mut pipeline, "choose Aux");
+        app.open_send_actions(target, 0);
+        settle(&mut pipeline, "open send actions");
+        app.send_action(target, 0, 4);
+        settle(&mut pipeline, "switch pre/post");
+    }
+    pipeline.teardown();
+}

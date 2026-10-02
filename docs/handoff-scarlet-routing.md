@@ -1,5 +1,15 @@
 # Resonara / Scarlet 引き継ぎ（2026-10-02）
 
+## Send 操作の RenderError と Scarlet-UI PR（同日）
+
+- macOS SGFX / wgpu で Send destination ラックや Pre Fader 切り替え時に `UI: RenderError` で終了。mounted pipeline に SGFX と同じ nonempty damage 条件を持つ backend を接続し、`logical=Some([]), physical=Some([])` の送信で再現した。音声 graph の変更が原因ではない。
+- 共通 paint pipeline が空の physical damage を GPU に送らず `PresentedFrame::Idle` を返す修正。通常描画の cache / bounds 更新を維持し、retained-composite の一時 command context を破棄する。描画が必要なフレームの GPU エラーはそのまま伝播する。
+- ユーザーの依頼で [Scarlet-UI PR #32](https://github.com/petitstrawberry/scarlet-ui/pull/32) を作成。元の pin を base にした独立 worktree / branch で修正と回帰テストだけを commit / push。既存 `../scarlet-ui` のローカル main は変更していない。
+- Resonara の仮 `vendor/scarlet-ui-core` は削除し、両 OS の ScarletUI pin を PR commit `749696b9e925e8eec214ef1ae9cbf34639835237` に更新。PR は未 merge。SWS protocol の patch と Scarlet runtime / SGFX の pin は従来どおり。
+- upstream core は381 unit tests + 23 doctests 成功（既存1 test ignored、`--test-threads=1`）。Resonara の mounted Send picker / actions / pre-post 遷移を1×・2×で検証し、表示変更は描画されることも確認。ログは `artifacts/send-render-upstream-tests.log`、`artifacts/send-render-fixed.log`、`artifacts/send-render-tests.log`。
+- PR commit を参照する Resonara の332テストと macOS release build に成功。長時間 stress のみ除外。`cargo run --release` で修正版が起動する。build log は `artifacts/send-render-release-build.log`。
+- 同じ PR pin で Scarlet AArch64 / RISC-V64 release build と ELF 監査にも成功。`artifacts/send-render-pr-pin-native-verify.log`。既存 VM / image は変更していない。
+
 ## 無料 TAL-Reverb-4 の macOS 導入（同日）
 
 - ユーザーの選択で [公式 macOS 配布](https://tal-software.com/products/tal-reverb-4) から CLAP 4.0.4 を導入。署名・notarization・bundle signature を確認し、CLAP payload のみ `~/Library/Audio/Plug-Ins/CLAP/TAL-Reverb-4.clap` に配置した。Intel / arm64 universal binary。アプリへの vendor binary 同梱や Scarlet への配置はしていない。
