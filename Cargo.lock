@@ -340,6 +340,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a76abbdb2907f6fd97fb6bc0b7be96b77d328f2dd9669d1075cc03369ed22154"
+
+[[package]]
 name = "codespan-reporting"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1973,10 +1979,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "resonara-clap"
+version = "0.1.0"
+dependencies = [
+ "clap-sys",
+]
+
+[[package]]
 name = "resonara-core"
 version = "0.1.0"
 dependencies = [
  "hound",
+ "resonara-clap",
  "serde",
  "serde_json",
  "symphonia",
@@ -1988,6 +2002,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "resonara-core",
+ "sas-client",
 ]
 
 [[package]]
@@ -2074,6 +2089,20 @@ checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
 ]
+
+[[package]]
+name = "sas-client"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=b3d2a55740a3d2ca49daad0ec7baba233f706f7a#b3d2a55740a3d2ca49daad0ec7baba233f706f7a"
+dependencies = [
+ "sas-protocol",
+ "scarlet-os",
+]
+
+[[package]]
+name = "sas-protocol"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=b3d2a55740a3d2ca49daad0ec7baba233f706f7a#b3d2a55740a3d2ca49daad0ec7baba233f706f7a"
 
 [[package]]
 name = "sbus"

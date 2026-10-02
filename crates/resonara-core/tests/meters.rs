@@ -18,6 +18,7 @@ fn track(samples: Vec<[f32; 2]>, gain: f32, pan: f32) -> Track {
         pan,
         mute: false,
         solo: false,
+        routing: resonara_core::ChannelRouting::default(),
     }
 }
 fn take(peak: &AtomicU32) -> f32 {

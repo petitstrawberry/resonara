@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Boot the selected Scarlet project with the native Resonara application.
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INSIDE_NIX=0
+if [[ "${1:-}" == --inside-nix ]]; then INSIDE_NIX=1; shift; fi
+if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
+  cat <<'EOF'
+Usage: scripts/scarlet-run <Scarlet checkout> [--profile full|native-desktop] [--no-build]
+Reuses the selected image, or builds it only if absent. Default profile: full.
+native-desktop uses a separate exact-desktop-bundle project without Debian/Wine,
+experimental or guest Rust layers; it retains native SWS/SAS, fonts and apps.
+--no-build requires an existing image and never constructs one.
+To update the app in an existing image, export guest files first and explicitly
+run scripts/scarlet-image <Scarlet checkout> --profile <same-profile> --replace-image.
+Uses the official runner's GL-enabled GUI selection in a desktop session.
+Without a desktop session, supply an explicit supported GL display and GPU.
+Plain VNC/non-GL virtio-gpu cannot render the native ScarletUI application.
+TCG, 4 GiB memory, WAV audio capture, and no guest network device are defaults.
+Guest disk writes persist. Set SCARLET_QEMU_SNAPSHOT=1 only for disposable runs;
+that mode discards guest saves when QEMU exits. SCARLET_QEMU_* variables override defaults.
+The project advisory lock coordinates these wrappers, not independently started
+upstream runners/VMs or other tools. Stop those before building or launching.
+EOF
+  exit 0
+fi
+if [[ $# -lt 1 || ! -d "$1" ]]; then
+  printf 'Usage: scripts/scarlet-run <Scarlet checkout> [--profile full|native-desktop] [--no-build]\n' >&2
+  exit 2
+fi
+SCARLET="$(cd "$1" && pwd)"
+shift
+PROFILE=full
+NO_BUILD=""
+while (($#)); do
+  case "$1" in
+    --no-build) NO_BUILD=--no-build; shift ;;
+    --profile)
+      [[ $# -ge 2 ]] || { printf '%s\n' '--profile requires full or native-desktop' >&2; exit 2; }
+      PROFILE="$2"; shift 2 ;;
+    *) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
+  esac
+done
+case "$PROFILE" in
+  full)
+    PROJECT="$SCARLET/projects/aarch64-limine-full"
+    IMAGE="$PROJECT/.scarlet/images/limine-aarch64-full.img"
+    PROFILE_ARTIFACTS="$REPO/artifacts/scarlet"
+    ;;
+  native-desktop)
+    PROJECT="$SCARLET/projects/aarch64-limine-resonara-native"
+    IMAGE="$PROJECT/.scarlet/images/limine-aarch64-resonara-native.img"
+    PROFILE_ARTIFACTS="$REPO/artifacts/scarlet-native"
+    ;;
+  *) printf 'Unknown profile: %s\n' "$PROFILE" >&2; exit 2 ;;
+esac
+if [[ "$PROFILE" == native-desktop && -L "$PROJECT" ]]; then
+  printf 'Preserving a symlinked native project directory: %s\n' "$PROJECT" >&2
+  exit 2
+fi
+for required in flake.nix tools/qemu-display.sh projects/aarch64-limine-full/scarlet.toml projects/aarch64-limine-full/tools/run_aarch64.sh; do
+  if [[ ! -f "$SCARLET/$required" ]]; then
+    printf 'Not a supported Scarlet checkout: missing %s\n' "$required" >&2
+    exit 2
+  fi
+done
+if [[ -n "${SCARLET_QEMU_QMP:-}" ]] && test -S "$SCARLET_QEMU_QMP"; then
+  printf 'QMP socket already exists; inspect and stop the current VM before relaunching: %s\n' "$SCARLET_QEMU_QMP" >&2
+  exit 2
+fi
+if [[ -n "$NO_BUILD" && ! -f "$IMAGE" ]]; then
+  printf 'No existing image for the selected profile; --no-build never constructs one.\n' >&2
+  exit 2
+fi
+if [[ "$INSIDE_NIX" == 0 ]]; then
+  NIX="${RESONARA_NIX:-nix}"
+  if ! command -v "$NIX" >/dev/null; then
+    printf 'Nix was not found. Install Nix or set RESONARA_NIX to its executable.\n' >&2
+    exit 127
+  fi
+  cd "$SCARLET"
+  ARGS=(--inside-nix "$SCARLET" --profile "$PROFILE")
+  if [[ -n "$NO_BUILD" ]]; then ARGS+=("$NO_BUILD"); fi
+  exec "$NIX" --extra-experimental-features 'nix-command flakes' develop --accept-flake-config --no-write-lock-file -c bash "$REPO/scripts/scarlet-run" "${ARGS[@]}"
+fi
+LOCK="$PROJECT/.scarlet/resonara-vm.lock"
+mkdir -p "$PROJECT/.scarlet"
+exec 9>>"$LOCK"
+python3 - "$LOCK" <<'PY'
+import fcntl, os, sys
+path = sys.argv[1]
+try:
+    held, expected = os.fstat(9), os.stat(path)
+    if (held.st_dev, held.st_ino) != (expected.st_dev, expected.st_ino):
+        raise OSError('descriptor does not match the project lock')
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError as error:
+    raise SystemExit(f'Project is busy or its lock is unavailable: {path}: {error}')
+PY
+export RESONARA_SCARLET_LOCK_PROJECT="$PROJECT"
+# The open descriptor is inherited by the image child and then by the running
+# cargo/runner process, keeping the advisory lock for the VM's entire lifetime.
+if [[ -n "${SCARLET_QEMU_QMP:-}" ]] && test -S "$SCARLET_QEMU_QMP"; then
+  printf 'QMP socket already exists; inspect and stop the current VM before relaunching: %s\n' "$SCARLET_QEMU_QMP" >&2
+  exit 2
+fi
+if [[ -z "${SCARLET_QEMU_DISPLAY:-}" && -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" && "$(uname -s)" != Darwin ]]; then
+  printf 'No desktop display is configured. Native ScarletUI requires a GL-capable display/GPU; plain VNC is insufficient. Run from a graphical session or set a verified SCARLET_QEMU_DISPLAY and SCARLET_QEMU_GPU.\n' >&2
+  exit 2
+fi
+source "$SCARLET/tools/qemu-display.sh"
+SCARLET_QEMU_DISPLAY="$(scarlet_qemu_display qemu-system-aarch64)"
+SCARLET_QEMU_GPU="$(scarlet_qemu_gpu "$SCARLET_QEMU_DISPLAY")"
+export SCARLET_QEMU_DISPLAY SCARLET_QEMU_GPU
+case "$SCARLET_QEMU_DISPLAY" in
+  vnc=*|none|curses*|*,gl=off|*,gl=off,*)
+    printf 'The selected display does not support native ScarletUI rendering. Select a GL-enabled QEMU display and compatible GPU.\n' >&2
+    exit 2
+    ;;
+esac
+case "$SCARLET_QEMU_GPU" in
+  virtio-gpu-gl-pci|virtio-gpu-gl-pci,*) ;;
+  *)
+    printf 'The selected GPU (%s) cannot provide the native ScarletUI renderer. Use a GL-capable display with virtio-gpu-gl-pci.\n' "$SCARLET_QEMU_GPU" >&2
+    exit 2
+    ;;
+esac
+if [[ ! -f "$IMAGE" && -z "$NO_BUILD" ]]; then
+  bash "$REPO/scripts/scarlet-image" --inside-nix "$SCARLET" --profile "$PROFILE"
+fi
+if [[ ! -f "$IMAGE" ]]; then
+  printf 'Build the selected image first with scripts/scarlet-image and the same --profile.\n' >&2
+  exit 2
+fi
+if [[ -n "${SCARLET_QEMU_QMP:-}" ]] && test -S "$SCARLET_QEMU_QMP"; then
+  printf 'QMP socket appeared during image preparation; refusing launch: %s\n' "$SCARLET_QEMU_QMP" >&2
+  exit 2
+fi
+ARTIFACTS="$PROFILE_ARTIFACTS/vm"
+mkdir -p "$ARTIFACTS"
+export SCARLET_QEMU_ACCEL="${SCARLET_QEMU_ACCEL:-tcg}"
+export SCARLET_QEMU_MEMORY="${SCARLET_QEMU_MEMORY:-4G}"
+export SCARLET_QEMU_SMP="${SCARLET_QEMU_SMP:-4}"
+export SCARLET_QEMU_AUDIO="${SCARLET_QEMU_AUDIO:-1}"
+export SCARLET_QEMU_AUDIO_DRIVER="${SCARLET_QEMU_AUDIO_DRIVER:-wav,path=$ARTIFACTS/audio.wav}"
+export SCARLET_QEMU_SERIAL="${SCARLET_QEMU_SERIAL:-file:$ARTIFACTS/serial.log}"
+export SCARLET_QEMU_SNAPSHOT="${SCARLET_QEMU_SNAPSHOT:-0}"
+export SCARLET_QEMU_NET="${SCARLET_QEMU_NET:-0}"
+# When networking is explicitly enabled, prevent the upstream runner's broad
+# default forwards. This one SSH forward is loopback-only and can be overridden.
+export SCARLET_QEMU_HOSTFWD="${SCARLET_QEMU_HOSTFWD:-tcp:127.0.0.1:2222-:22}"
+printf 'Profile: %s\nDisplay: %s\nGPU: %s\nSerial output: %s\nAudio backend: %s\n' "$PROFILE" "$SCARLET_QEMU_DISPLAY" "$SCARLET_QEMU_GPU" "$SCARLET_QEMU_SERIAL" "$SCARLET_QEMU_AUDIO_DRIVER"
+cd "$SCARLET"
+exec cargo scarlet run --project "$PROJECT" --release --locked --no-image

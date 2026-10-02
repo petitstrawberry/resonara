@@ -1,10 +1,11 @@
 //! Off-thread compilation and bounded, single-pass stereo graph execution.
 //!
-//! Routing is an opt-in runtime API; it is not yet part of the serialized Project.
+//! Project routing lowers to this graph; the explicit runtime API remains supported.
 //! Every reachable node executes once per nonempty render quantum. Structural
 //! changes require stopping playback and preparing a new Engine. All cycles are
 //! rejected, including cycles containing Delay (feedback is not implemented).
-use crate::Result;
+use crate::{ClapInsert, Result};
+use resonara_clap::{PluginOwner, RealtimePlugin};
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap},
@@ -15,6 +16,10 @@ pub struct NodeId(pub u64);
 
 #[derive(Clone, Debug)]
 pub enum Processor {
+    /// External effect prepared on the control thread. Unknown identities are dry placeholders.
+    Clap {
+        plugin: ClapInsert,
+    },
     /// The clip mix before the track fader. Mute/solo gate this source, including sends.
     TrackSource {
         track: usize,
@@ -23,10 +28,26 @@ pub enum Processor {
     TrackFader {
         track: usize,
     },
+    /// Gates a post-insert pre-fader tap, including stored DSP tails.
+    TrackGate {
+        track: usize,
+    },
+    /// Sums inputs and gates a bus source/tap using its live mute control.
+    BusGate {
+        bus: usize,
+    },
+    /// Applies the referenced bus gain/pan and publishes its post-fader peak.
+    BusFader {
+        bus: usize,
+    },
     /// Sums all incoming routes. Aux returns and the master can both use this.
     Bus,
     Gain {
         gain: f32,
+    },
+    /// Applies a send level sampled from Controls once per render quantum.
+    SendGain {
+        send: usize,
     },
     /// Feed-forward sample delay. This does not permit a cyclic graph.
     Delay {
@@ -100,7 +121,8 @@ pub struct GraphLimits {
     pub quantum: usize,
     pub max_nodes: usize,
     pub max_edges: usize,
-    /// Audio arena only. Model/plan metadata and shared source assets are separate.
+    /// Audio arena and planar plug-in host buffers. Model/plan metadata and
+    /// shared source assets are separate.
     pub max_scratch_bytes: usize,
     /// Persistent audio delay buffers, separate from the scratch arena.
     pub max_delay_bytes: usize,
@@ -125,6 +147,8 @@ pub struct GraphInfo {
     pub scratch_bytes: usize,
     pub delay_bytes: usize,
     pub buffer_slots: usize,
+    /// Active reachable plug-ins that could not be loaded or activated.
+    pub unavailable_plugins: u32,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RenderCounts {
@@ -144,6 +168,8 @@ struct Input {
     gain: f32,
 }
 enum RuntimeProcessor {
+    Clap(RealtimePlugin),
+    MissingClap,
     Plain(Processor),
     Delay {
         ring: Vec<[f32; 2]>,
@@ -166,6 +192,8 @@ struct Operation {
 /// Construction and destruction must happen outside the audio callback.
 pub struct CompiledGraph {
     operations: Vec<Operation>,
+    // Field drop order matters: retire audio handles before owner-thread destroy.
+    plugin_owners: Vec<PluginOwner>,
     scratch: Vec<[f32; 2]>,
     output_slot: usize,
     info: GraphInfo,
@@ -174,6 +202,40 @@ pub struct CompiledGraph {
 impl CompiledGraph {
     /// Validate and prepare outside the audio thread. No runtime topology traversal.
     pub fn compile(graph: &RoutingGraph, tracks: usize, limits: GraphLimits) -> Result<Self> {
+        Self::compile_with_buses(graph, tracks, 0, limits)
+    }
+    /// Session-aware admission, retaining `compile` for graphs without bus controls.
+    pub fn compile_with_buses(
+        graph: &RoutingGraph,
+        tracks: usize,
+        buses: usize,
+        limits: GraphLimits,
+    ) -> Result<Self> {
+        Self::compile_with_buses_at_rate(graph, tracks, buses, limits, 48000)
+    }
+    /// Prepare external plug-ins for the actual device rate, off the audio thread.
+    pub fn compile_with_buses_at_rate(
+        graph: &RoutingGraph,
+        tracks: usize,
+        buses: usize,
+        limits: GraphLimits,
+        sample_rate: u32,
+    ) -> Result<Self> {
+        Self::compile_with_sends_at_rate(graph, tracks, buses, 0, limits, sample_rate)
+    }
+    /// Session-aware preparation with live send controls. The older compile
+    /// entry points retain their fixed-route-gain behavior and accept no sends.
+    pub fn compile_with_sends_at_rate(
+        graph: &RoutingGraph,
+        tracks: usize,
+        buses: usize,
+        sends: usize,
+        limits: GraphLimits,
+        sample_rate: u32,
+    ) -> Result<Self> {
+        if sample_rate == 0 {
+            return Err("Device sample rate must be nonzero".into());
+        }
         if limits.quantum == 0 || limits.quantum > 65536 {
             return Err("Graph quantum must be between 1 and 65536 frames".into());
         }
@@ -181,15 +243,33 @@ impl CompiledGraph {
             return Err("Graph node/route budget exceeded".into());
         }
         let mut ids = BTreeMap::new();
+        let mut plugin_state_bytes = 0usize;
         for (index, node) in graph.nodes.iter().enumerate() {
             if ids.insert(node.id, index).is_some() {
                 return Err(format!("Duplicate graph node {:?}", node.id).into());
             }
             match node.processor {
-                Processor::TrackSource { track } | Processor::TrackFader { track }
+                Processor::Clap { ref plugin } => {
+                    plugin.validate()?;
+                    plugin_state_bytes = plugin_state_bytes
+                        .checked_add(plugin.state.len())
+                        .ok_or("CLAP state size overflow")?;
+                    if plugin_state_bytes > crate::plugins::MAX_PROJECT_STATE_BYTES {
+                        return Err("Graph CLAP state storage budget exceeded".into());
+                    }
+                }
+                Processor::TrackSource { track }
+                | Processor::TrackFader { track }
+                | Processor::TrackGate { track }
                     if track >= tracks =>
                 {
                     return Err(format!("Unknown track {track}").into());
+                }
+                Processor::BusGate { bus } | Processor::BusFader { bus } if bus >= buses => {
+                    return Err(format!("Unknown bus {bus}").into());
+                }
+                Processor::SendGain { send } if send >= sends => {
+                    return Err(format!("Unknown send {send}").into());
                 }
                 Processor::Gain { gain } if !gain.is_finite() => {
                     return Err("Insert gain must be finite".into());
@@ -295,8 +375,17 @@ impl CompiledGraph {
         let scratch_frames = buffer_slots
             .checked_mul(limits.quantum)
             .ok_or("Scratch size overflow")?;
+        let plugin_count = order
+            .iter()
+            .filter(|&&index| matches!(graph.nodes[index].processor, Processor::Clap { .. }))
+            .count();
+        let plugin_scratch_bytes = plugin_count
+            .checked_mul(limits.quantum)
+            .and_then(|frames| frames.checked_mul(4 * std::mem::size_of::<f32>()))
+            .ok_or("CLAP scratch size overflow")?;
         let scratch_bytes = scratch_frames
             .checked_mul(std::mem::size_of::<[f32; 2]>())
+            .and_then(|bytes| bytes.checked_add(plugin_scratch_bytes))
             .ok_or("Scratch size overflow")?;
         if scratch_bytes > limits.max_scratch_bytes {
             return Err("Graph scratch budget exceeded".into());
@@ -314,10 +403,24 @@ impl CompiledGraph {
             }
         }
         let edges = order.iter().map(|&index| incoming[index].len()).sum();
+        let mut plugin_owners = Vec::with_capacity(plugin_count);
+        let mut unavailable_plugins = 0u32;
         let operations = order
             .iter()
             .map(|&index| {
                 let processor = match graph.nodes[index].processor {
+                    Processor::Clap { ref plugin } => {
+                        match crate::plugins::activate(plugin, sample_rate, limits.quantum) {
+                            Ok((owner, processor)) => {
+                                plugin_owners.push(owner);
+                                RuntimeProcessor::Clap(processor)
+                            }
+                            Err(_) => {
+                                unavailable_plugins = unavailable_plugins.saturating_add(1);
+                                RuntimeProcessor::MissingClap
+                            }
+                        }
+                    }
                     Processor::Delay { frames } => RuntimeProcessor::Delay {
                         ring: vec![[0.0; 2]; frames],
                         cursor: 0,
@@ -345,6 +448,7 @@ impl CompiledGraph {
             .collect();
         Ok(Self {
             operations,
+            plugin_owners,
             scratch: vec![[0.0; 2]; scratch_frames],
             output_slot: slots[output],
             info: GraphInfo {
@@ -354,9 +458,15 @@ impl CompiledGraph {
                 scratch_bytes,
                 delay_bytes,
                 buffer_slots,
+                unavailable_plugins,
             },
             counts: RenderCounts::default(),
         })
+    }
+    /// Keep these on the construction thread while transferring the render
+    /// engine. Drop them only after its realtime handles have been retired.
+    pub fn take_plugin_owners(&mut self) -> Vec<PluginOwner> {
+        std::mem::take(&mut self.plugin_owners)
     }
     pub fn info(&self) -> &GraphInfo {
         &self.info
@@ -374,8 +484,10 @@ impl CompiledGraph {
         &mut self,
         frames: usize,
         mixers: &mut [BlockMixer],
+        buses: &mut [BlockMixer],
+        send_gains: &[f32],
         mut source: impl FnMut(usize, &mut [[f32; 2]]),
-    ) {
+    ) -> bool {
         debug_assert!(frames > 0 && frames <= self.info.quantum);
         let quantum = self.info.quantum;
         for op in &mut self.operations {
@@ -403,32 +515,46 @@ impl CompiledGraph {
             }
             let block = &mut self.scratch[start..start + frames];
             match &mut op.processor {
+                RuntimeProcessor::Clap(plugin) => {
+                    if plugin.process(block).is_err() {
+                        // No allocation, logging, unloading, or further plug-in
+                        // calls after a failed process; the Engine latches it.
+                        return false;
+                    }
+                }
+                RuntimeProcessor::MissingClap => {}
                 RuntimeProcessor::Plain(Processor::TrackSource { track }) => {
                     if mixers[*track].audible {
                         source(*track, block);
                     }
                 }
-                RuntimeProcessor::Plain(Processor::TrackFader { track }) => {
-                    let mix = &mut mixers[*track];
-                    if mix.audible {
-                        let left = mix.gain * (1.0 - mix.pan.max(0.0));
-                        let right = mix.gain * (1.0 + mix.pan.min(0.0));
-                        for sample in block {
-                            sample[0] *= left;
-                            sample[1] *= right;
-                            for channel in 0..2 {
-                                mix.peak[channel] =
-                                    mix.peak[channel].max(sample[channel].abs().min(f32::MAX));
-                            }
-                        }
-                    } else {
+                RuntimeProcessor::Plain(Processor::TrackGate { track }) => {
+                    if !mixers[*track].audible {
                         block.fill([0.0; 2]);
                     }
+                }
+                RuntimeProcessor::Plain(Processor::BusGate { bus }) => {
+                    if !buses[*bus].audible {
+                        block.fill([0.0; 2]);
+                    }
+                }
+                RuntimeProcessor::Plain(Processor::TrackFader { track }) => {
+                    apply_fader(block, &mut mixers[*track]);
+                }
+                RuntimeProcessor::Plain(Processor::BusFader { bus }) => {
+                    apply_fader(block, &mut buses[*bus]);
                 }
                 RuntimeProcessor::Plain(Processor::Gain { gain }) => {
                     for sample in block {
                         sample[0] *= *gain;
                         sample[1] *= *gain;
+                    }
+                }
+                RuntimeProcessor::Plain(Processor::SendGain { send }) => {
+                    let gain = send_gains[*send];
+                    for sample in block {
+                        sample[0] *= gain;
+                        sample[1] *= gain;
                     }
                 }
                 RuntimeProcessor::Delay { ring, cursor } => {
@@ -453,7 +579,9 @@ impl CompiledGraph {
                     }
                 }
                 RuntimeProcessor::Plain(Processor::Bus) => {}
-                RuntimeProcessor::Plain(Processor::Delay { .. } | Processor::OnePole { .. }) => {
+                RuntimeProcessor::Plain(
+                    Processor::Delay { .. } | Processor::OnePole { .. } | Processor::Clap { .. },
+                ) => {
                     unreachable!("stateful processor compiled as plain")
                 }
             }
@@ -462,9 +590,26 @@ impl CompiledGraph {
         self.counts.quanta = self.counts.quanta.saturating_add(1);
         self.counts.nodes = self.counts.nodes.saturating_add(self.info.nodes as u64);
         self.counts.edges = self.counts.edges.saturating_add(self.info.edges as u64);
+        true
     }
     pub(crate) fn output(&self, frames: usize) -> &[[f32; 2]] {
         let start = self.output_slot * self.info.quantum;
         &self.scratch[start..start + frames]
+    }
+}
+
+fn apply_fader(block: &mut [[f32; 2]], mix: &mut BlockMixer) {
+    if mix.audible {
+        let left = mix.gain * (1.0 - mix.pan.max(0.0));
+        let right = mix.gain * (1.0 + mix.pan.min(0.0));
+        for sample in block {
+            sample[0] *= left;
+            sample[1] *= right;
+            for (channel, value) in sample.iter().enumerate() {
+                mix.peak[channel] = mix.peak[channel].max(value.abs().min(f32::MAX));
+            }
+        }
+    } else {
+        block.fill([0.0; 2]);
     }
 }

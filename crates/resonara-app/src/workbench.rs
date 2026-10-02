@@ -103,9 +103,11 @@ impl Daw {
                     pan: 0.,
                     mute: false,
                     solo: false,
+                    routing: Default::default(),
                 },
             );
             m.selected = at;
+            m.selected_bus = None;
             m.clip = None;
             Ok(())
         });

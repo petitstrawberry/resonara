@@ -257,6 +257,7 @@ fn legacy_projects_default_to_stereo_without_guessing_from_equal_samples() {
             pan: 0.0,
             mute: false,
             solo: false,
+            routing: resonara_core::ChannelRouting::default(),
         }],
         master: 1.0,
         ..Project::default()

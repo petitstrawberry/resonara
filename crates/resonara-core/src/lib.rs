@@ -6,6 +6,11 @@ use std::sync::{
 };
 pub mod audio;
 pub mod graph;
+pub mod plugins;
+pub use plugins::{ClapInsert, ClapParameter};
+pub use resonara_clap::PluginOwner;
+pub mod routing;
+pub use routing::{Bus, BusId, BusKind, ChannelRouting, Destination, Insert, InsertKind, Send};
 mod metronome;
 mod wav;
 
@@ -32,6 +37,8 @@ pub struct Track {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
+    #[serde(default)]
+    pub routing: ChannelRouting,
 }
 /// Display meter; tempo remains quarter notes per minute and audio stays sample based.
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -63,6 +70,8 @@ pub struct Project {
     pub version: u32,
     pub sample_rate: u32,
     pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub buses: Vec<Bus>,
     pub master: f32,
     #[serde(default = "default_tempo")]
     pub tempo: f64,
@@ -78,6 +87,7 @@ impl Default for Project {
             version: 1,
             sample_rate: 48000,
             tracks: vec![],
+            buses: vec![],
             master: 1.0,
             tempo: default_tempo(),
             time_signature: TimeSignature::default(),
@@ -96,6 +106,7 @@ impl Project {
         {
             return Err("Invalid project header".into());
         }
+        self.validate_routing()?;
         for t in &self.tracks {
             if !t.gain.is_finite()
                 || !(0.0..=2.0).contains(&t.gain)
@@ -173,6 +184,7 @@ impl Project {
             pan: 0.,
             mute: false,
             solo: false,
+            routing: ChannelRouting::default(),
         });
         Ok(())
     }
@@ -234,7 +246,12 @@ impl Project {
     pub fn export_wav(&self, path: &std::path::Path) -> Result<()> {
         self.validate()?;
         let controls = Arc::new(Controls::new(self));
-        let mut engine = Engine::new(self, controls, self.sample_rate, 0);
+        let mut engine = Engine::try_new(self, controls, self.sample_rate, 0)?;
+        if engine.graph_info().unavailable_plugins > 0 {
+            return Err(
+                "Cannot export: an active CLAP plug-in is unavailable or incompatible".into(),
+            );
+        }
         let mut writer = hound::WavWriter::create(
             path,
             hound::WavSpec {
@@ -249,6 +266,9 @@ impl Project {
         while remaining > 0 {
             let frames = remaining.min(512) as usize;
             engine.render(&mut block[..frames * 2], 2);
+            if engine.controls.error.load(Ordering::Relaxed) {
+                return Err("Export stopped after an audio processing failure".into());
+            }
             for s in &block[..frames * 2] {
                 writer.write_sample(*s)?;
             }
@@ -284,6 +304,7 @@ impl Project {
                 pan: 0.,
                 mute: false,
                 solo: false,
+                routing: ChannelRouting::default(),
             });
         }
         p
@@ -308,8 +329,28 @@ impl Mixer {
         self.solo.store(t.solo, Ordering::Relaxed);
     }
 }
+/// Live bus controls and post-fader stereo telemetry, in Project.buses order.
+pub struct BusMixer {
+    pub gain: AtomicU32,
+    pub pan: AtomicU32,
+    pub mute: AtomicBool,
+    pub peak: AtomicU32,
+    pub peak_left: AtomicU32,
+    pub peak_right: AtomicU32,
+}
+impl BusMixer {
+    pub fn set(&self, bus: &Bus) {
+        self.gain.store(bus.gain.to_bits(), Ordering::Relaxed);
+        self.pan.store(bus.pan.to_bits(), Ordering::Relaxed);
+        self.mute.store(bus.mute, Ordering::Relaxed);
+    }
+}
 pub struct Controls {
     pub tracks: Vec<Mixer>,
+    pub buses: Vec<BusMixer>,
+    /// Live send levels, as f32 bits, in track-then-bus/send-slot order.
+    /// Includes disabled slots; use Project::send_control_index off the audio thread.
+    pub send_gains: Vec<AtomicU32>,
     pub master: AtomicU32,
     /// Playback monitoring only. Exports construct disabled controls.
     pub metronome: AtomicBool,
@@ -320,6 +361,9 @@ pub struct Controls {
     pub position: AtomicU64,
     pub playing: AtomicBool,
     pub error: AtomicBool,
+    /// Active reachable CLAP inserts that could not be prepared. Playback uses
+    /// dry placeholders; export refuses to create a file in this condition.
+    pub unavailable_plugins: AtomicU32,
 }
 impl Controls {
     pub fn new(p: &Project) -> Self {
@@ -337,6 +381,23 @@ impl Controls {
                     peak_right: AtomicU32::new(0),
                 })
                 .collect(),
+            buses: p
+                .buses
+                .iter()
+                .map(|bus| BusMixer {
+                    gain: AtomicU32::new(bus.gain.to_bits()),
+                    pan: AtomicU32::new(bus.pan.to_bits()),
+                    mute: AtomicBool::new(bus.mute),
+                    peak: AtomicU32::new(0),
+                    peak_left: AtomicU32::new(0),
+                    peak_right: AtomicU32::new(0),
+                })
+                .collect(),
+            send_gains: p
+                .channel_routings()
+                .flat_map(|routing| &routing.sends)
+                .map(|send| AtomicU32::new(send.gain.to_bits()))
+                .collect(),
             master: AtomicU32::new(p.master.to_bits()),
             metronome: AtomicBool::new(false),
             master_peak_left: AtomicU32::new(0),
@@ -344,6 +405,7 @@ impl Controls {
             position: AtomicU64::new(0),
             playing: AtomicBool::new(true),
             error: AtomicBool::new(false),
+            unavailable_plugins: AtomicU32::new(0),
         }
     }
 }
@@ -361,30 +423,27 @@ pub struct Engine {
     faulted: bool,
     positions: Vec<f64>,
     block_mixers: Vec<graph::BlockMixer>,
+    block_bus_mixers: Vec<graph::BlockMixer>,
+    block_send_gains: Vec<f32>,
 }
 impl Engine {
     pub fn new(p: &Project, controls: Arc<Controls>, device_rate: u32, start: u64) -> Self {
-        let routing = graph::RoutingGraph::tracks_to_master(p.tracks.len());
-        // Keep the original constructor usable for arbitrary project sizes.
-        // Opt-in graphs use explicit admission budgets through with_graph.
-        let defaults = graph::GraphLimits::default();
-        let limits = graph::GraphLimits {
-            max_nodes: defaults.max_nodes.max(routing.nodes.len()),
-            max_edges: defaults.max_edges.max(routing.routes.len()),
-            max_scratch_bytes: defaults.max_scratch_bytes.max(
-                routing
-                    .nodes
-                    .len()
-                    .saturating_mul(defaults.quantum)
-                    .saturating_mul(8),
-            ),
-            ..defaults
-        };
-        Self::with_graph(p, controls, device_rate, start, &routing, limits)
-            .expect("the default track-to-master graph is valid")
+        Self::try_new(p, controls, device_rate, start)
+            .expect("Project routing must be valid and within engine budgets")
     }
-    /// Prepare an opt-in routing graph outside the audio callback. This does not
-    /// alter Project serialization or enable graph mutation during playback.
+    /// Prepare persistent routing outside the callback; invalid routes fail cleanly.
+    pub fn try_new(
+        p: &Project,
+        controls: Arc<Controls>,
+        device_rate: u32,
+        start: u64,
+    ) -> Result<Self> {
+        let routing = p.routing_graph()?;
+        let limits = p.routing_limits();
+        Self::with_graph(p, controls, device_rate, start, &routing, limits)
+    }
+    /// Prepare an explicit runtime graph outside the audio callback, overriding
+    /// persistent routing for this engine only. No graph mutation during playback.
     pub fn with_graph(
         p: &Project,
         controls: Arc<Controls>,
@@ -396,7 +455,24 @@ impl Engine {
         if device_rate == 0 {
             return Err("Device sample rate must be nonzero".into());
         }
-        let graph = graph::CompiledGraph::compile(routing, p.tracks.len(), limits)?;
+        let sends = p
+            .channel_routings()
+            .map(|routing| routing.sends.len())
+            .sum();
+        if controls.send_gains.len() != sends {
+            return Err("Send controls do not match project routing".into());
+        }
+        let graph = graph::CompiledGraph::compile_with_sends_at_rate(
+            routing,
+            p.tracks.len(),
+            p.buses.len(),
+            sends,
+            limits,
+            device_rate,
+        )?;
+        controls
+            .unavailable_plugins
+            .store(graph.info().unavailable_plugins, Ordering::Relaxed);
         let duration = p.duration();
         let clock_only = duration == 0 && controls.metronome.load(Ordering::Relaxed);
         // The UI may read transport state before the first device callback.
@@ -455,7 +531,15 @@ impl Engine {
             faulted: false,
             positions: vec![0.0; limits.quantum],
             block_mixers: vec![graph::BlockMixer::default(); p.tracks.len()],
+            block_bus_mixers: vec![graph::BlockMixer::default(); p.buses.len()],
+            block_send_gains: vec![0.0; sends],
         })
+    }
+    /// Transfer main-thread plug-in lifecycle guards before sending the Engine
+    /// to an audio worker. Retain and drop them on this thread after the worker
+    /// and all callbacks stop. Offline rendering can leave ownership here.
+    pub fn take_plugin_owners(&mut self) -> Vec<PluginOwner> {
+        self.graph.take_plugin_owners()
     }
     pub fn graph_info(&self) -> &graph::GraphInfo {
         self.graph.info()
@@ -514,11 +598,34 @@ impl Engine {
                         graph::BlockMixer::default()
                     };
                 }
+                for (index, mix) in self.block_bus_mixers.iter_mut().enumerate() {
+                    *mix = if let Some(control) = self.controls.buses.get(index) {
+                        graph::BlockMixer {
+                            gain: f32::from_bits(control.gain.load(Ordering::Relaxed)),
+                            pan: f32::from_bits(control.pan.load(Ordering::Relaxed)),
+                            audible: !control.mute.load(Ordering::Relaxed),
+                            peak: [0.0; 2],
+                        }
+                    } else {
+                        graph::BlockMixer::default()
+                    };
+                }
+                for (gain, control) in self
+                    .block_send_gains
+                    .iter_mut()
+                    .zip(&self.controls.send_gains)
+                {
+                    *gain = f32::from_bits(control.load(Ordering::Relaxed));
+                }
                 let tracks = &self.tracks;
                 let interpolation_ends = &self.clip_interpolation_ends;
                 let positions = &self.positions;
-                self.graph
-                    .process(active, &mut self.block_mixers, |track, block| {
+                let processed = self.graph.process(
+                    active,
+                    &mut self.block_mixers,
+                    &mut self.block_bus_mixers,
+                    &self.block_send_gains,
+                    |track, block| {
                         // Visit each clip's block intersection, retaining clip
                         // summation order and sample-by-sample transport positions.
                         let positions = &positions[..block.len()];
@@ -545,8 +652,25 @@ impl Engine {
                                 }
                             }
                         }
-                    });
+                    },
+                );
+                if !processed {
+                    self.faulted = true;
+                    self.controls.error.store(true, Ordering::Relaxed);
+                    self.controls.playing.store(false, Ordering::Relaxed);
+                }
                 for (mix, control) in self.block_mixers.iter().zip(&self.controls.tracks) {
+                    control
+                        .peak
+                        .fetch_max(mix.peak[0].max(mix.peak[1]).to_bits(), Ordering::Relaxed);
+                    control
+                        .peak_left
+                        .fetch_max(mix.peak[0].to_bits(), Ordering::Relaxed);
+                    control
+                        .peak_right
+                        .fetch_max(mix.peak[1].to_bits(), Ordering::Relaxed);
+                }
+                for (mix, control) in self.block_bus_mixers.iter().zip(&self.controls.buses) {
                     control
                         .peak
                         .fetch_max(mix.peak[0].max(mix.peak[1]).to_bits(), Ordering::Relaxed);

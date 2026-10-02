@@ -40,6 +40,7 @@ fn project() -> Project {
                 pan: if track == 0 { 0.25 } else { -0.5 },
                 mute: false,
                 solo: false,
+                routing: resonara_core::ChannelRouting::default(),
             })
             .collect(),
         master: 0.75,
@@ -109,6 +110,13 @@ struct ReferenceState {
     previous: [f32; 2],
 }
 fn oracle(p: &Project, ordered: &RoutingGraph, rate: u32, frames: usize) -> Vec<f32> {
+    let send_gains: Vec<_> = p
+        .tracks
+        .iter()
+        .map(|track| &track.routing)
+        .chain(p.buses.iter().map(|bus| &bus.routing))
+        .flat_map(|routing| routing.sends.iter().map(|send| send.gain))
+        .collect();
     let mut state: Vec<_> = ordered
         .nodes
         .iter()
@@ -167,6 +175,9 @@ fn oracle(p: &Project, ordered: &RoutingGraph, rate: u32, frames: usize) -> Vec<
                 }
             }
             match node.processor {
+                Processor::Clap { .. } => {
+                    panic!("CLAP has its own external-process reference tests")
+                }
                 Processor::TrackSource { track } => {
                     if audible(track) {
                         for clip in &p.tracks[track].clips {
@@ -194,9 +205,32 @@ fn oracle(p: &Project, ordered: &RoutingGraph, rate: u32, frames: usize) -> Vec<
                         sample = [0.; 2];
                     }
                 }
+                Processor::TrackGate { track } => {
+                    if !audible(track) {
+                        sample = [0.; 2];
+                    }
+                }
+                Processor::BusGate { bus } => {
+                    if p.buses[bus].mute {
+                        sample = [0.; 2];
+                    }
+                }
+                Processor::BusFader { bus } => {
+                    let bus = &p.buses[bus];
+                    if bus.mute {
+                        sample = [0.; 2];
+                    } else {
+                        sample[0] *= bus.gain * (1. - bus.pan.max(0.));
+                        sample[1] *= bus.gain * (1. + bus.pan.min(0.));
+                    }
+                }
                 Processor::Gain { gain } => {
                     sample[0] *= gain;
                     sample[1] *= gain;
+                }
+                Processor::SendGain { send } => {
+                    sample[0] *= send_gains[send];
+                    sample[1] *= send_gains[send];
                 }
                 Processor::Bus => {}
                 Processor::Delay { .. } => {

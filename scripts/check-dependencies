@@ -7,7 +7,18 @@ import tomllib
 
 root = Path.cwd()
 app = tomllib.loads((root / 'crates/resonara-app/Cargo.toml').read_text())
-dependency = app['dependencies']['scarlet-ui']
+host_dependency = app['target']['cfg(not(target_os = "scarlet"))']['dependencies']['scarlet-ui']
+scarlet_dependency = app['target']['cfg(target_os = "scarlet")']['dependencies']['scarlet-ui']
+dependency = host_dependency
+assert host_dependency['features'] == ['std', 'platform-winit'], 'Host must use the native desktop backend'
+assert scarlet_dependency['features'] == ['std', 'platform-sws'], 'Scarlet must use SWS'
+assert {k: v for k, v in host_dependency.items() if k != 'features'} == {k: v for k, v in scarlet_dependency.items() if k != 'features'}, 'Both targets must share the same ScarletUI pin'
+platform = tomllib.loads((root / 'crates/resonara-platform/Cargo.toml').read_text())
+assert 'cpal' not in platform['dependencies'], 'CPAL must not leak into Scarlet builds'
+assert 'cpal' in platform['target']['cfg(not(target_os = "scarlet"))']['dependencies']
+sas = platform['target']['cfg(target_os = "scarlet")']['dependencies']['sas-client']
+assert sas.get('git') == 'https://github.com/petitstrawberry/Scarlet' and sas.get('rev') == 'b3d2a55740a3d2ca49daad0ec7baba233f706f7a'
+assert 'path' not in sas, 'Native audio must use a portable Git pin'
 revision = 'cdd852eb22678b7b0d1c7e035c1f2b2ba4d057a7'
 repository = 'https://github.com/petitstrawberry/scarlet-ui'
 assert dependency.get('git') == repository, 'ScarletUI must use its Git source'

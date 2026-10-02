@@ -1,0 +1,150 @@
+# Resonara / Scarlet 引き継ぎ（2026-10-02）
+
+## まず結論
+
+- 作業ブランチ: `feat/scarlet-routing`（`main` へのマージ、PR 作成は行わない）
+- ルーティング、コンパクトな Insert/Send UI、最初の CLAP Gain、Scarlet 用 SWS/SAS バックエンドまで実装済み
+- Linux ホストの GUI・音声・実 CLAP の動作は検証済み。最新の M/S 中央配置もホストのビルドと回帰テストは通過
+- **Scarlet ゲストは未起動。Scarlet 上の GUI・音声・CLAP・ファイル操作は未検証**
+- AArch64 / RISC-V64 の native アプリはビルドと ELF 監査に合格。ただしそのバイナリは最後の M/S 配置調整前。手元では必ず現在のソースから再ビルドする
+- クラウドでの追加作業は停止。容量確保の承認は得ておらず、キャッシュは削除していない
+
+## 実装したもの
+
+### Routing と UI
+
+- Track / Aux / Group bus、Main Output、Pre/Post Pan send、Insert をプロジェクトに保存。再生と WAV export は同じグラフを使う
+- Built-in Insert: Gain、OnePole、Delay。分岐しても同じ Insert の DSP は一度だけ処理する
+- Bus の経路と Aux の受け口を分けた操作。Output または空 Send 行の `New Bus → Aux` は作成・接続を一度に行う。手動の `+Aux` も用意
+- Insert は連続したスロット。名前でエディター、電源で bypass、右クリック／矢印から並べ替え・削除。Send は連続した小さい行とノブ、空行から行き先を選ぶ
+- Inspector は左全高。リージョン情報をチャンネルの上に置き、上側だけスクロール、下の共通フェーダーは固定。Mixer と同じ channel strip を使い、M/S を中央配置
+- 音量・Pan・Send level は atomic な live control。構造変更や bypass は停止・グラフ再構築。ライブ無音切り替え／リアルタイムの無停止交換ではない
+- Undo/Redo、旧 version-1 JSON の読込、Bus 削除時の参照修復、循環・資源上限の検証を実装
+
+### 最初の CLAP
+
+- 対応するのは同梱の `org.resonara.gain`。パラメーターと opaque state を保存・復元し、汎用エディターで編集する
+- stereo float32、Gain 0〜2。custom GUI、MIDI、sidechain、PDC、automation、可変ポート構成は未対応
+- **OS/CPU が一致する native C ABI が対象。Linux `.so` を Scarlet や macOS でそのまま動かす機能ではない**
+- 不明／不足プラグインは state を残して再生時に警告つき passthrough。必要な effect が使えない export は WAV 作成前にエラーにする
+- JSON 内の library 値は識別子であり、その文字列を `dlopen` のパスにはしない。明示した `RESONARA_CLAP_LIBRARY` は既存の絶対パスが必要
+- 所有権・activate/deactivate/destroy は作成元スレッド、音声処理は realtime proxy。停止時は CPAL stream の終了／SAS worker の join 後に owner を解放する
+
+### Scarlet port
+
+- Host: ScarletUI `platform-winit` + CPAL。Scarlet: `platform-sws` + `sas-client`
+- SAS は 48 kHz / stereo S16LE、256-frame producer、1,024-frame ring。partial write、backpressure、cancel、timeout を扱う
+- 自然終了では最終 PCM を渡したあと接続を保持し、次の明示的な transport/edit 操作で閉じる。SAS の client ring が空でもハードウェア出力完了とは限らないため
+- file I/O、JSON、デコード、export は共通実装。Scarlet の file provider が拡張子 filter を満たせない場合はアプリ内 browser を使う
+
+## 手元で Host を起動する
+
+以下は **新しい作業ディレクトリ**で行う例。既存の変更がある checkout を上書きしないこと。Nix が利用できる前提。
+
+```sh
+git clone --branch feat/scarlet-routing https://github.com/petitstrawberry/resonara.git
+cd resonara
+./scripts/dev cargo run --locked --release -p resonara
+```
+
+`scripts/dev` はリポジトリの pinned Nix shell を使う。既存の適合する Rust / システム依存が揃っていれば、中の Cargo コマンドを直接実行してもよい。
+
+### Host 用 Gain を読み込む
+
+```sh
+PLUGIN_TARGET="$PWD/plugins/resonara-gain/target"
+CARGO_TARGET_DIR="$PLUGIN_TARGET" ./scripts/dev cargo build --release --locked \
+  --manifest-path plugins/resonara-gain/Cargo.toml
+
+# macOS
+export RESONARA_CLAP_LIBRARY="$PLUGIN_TARGET/release/libresonara_gain.dylib"
+# Linux では、上の export の代わりにこちら
+# export RESONARA_CLAP_LIBRARY="$PLUGIN_TARGET/release/libresonara_gain.so"
+
+./scripts/dev cargo run --locked --release -p resonara
+```
+
+空の Insert slot から `Resonara Gain` を選ぶ。macOS の上記 `.dylib` 手順はこのクラウドでは未実行。Linux の実 library ロード・DSP・state 復元は検証済み。
+
+環境変数を使わない場合は、アプリ実行ファイルの隣の `plugins/resonara-gain.clap`、次に `/system/plugins/resonara-gain.clap` を探す。一般的なプラグインフォルダーの自動スキャンは実装していない。
+
+## 手元で Scarlet を続ける
+
+### 再現に使った revision
+
+- Resonara の開始点: `7564ddfbeed6f3700579398883bd5dad9d3ce4bf`
+- Scarlet `dev`: `0639a916dfd652e9b2c1ea740cacc1c09743d9eb`
+- Scarlet Rust: `a5a166ab0ba10eaad36eb90d1e4af26eadfdec0c`、`rustc 1.94.0-nightly`、LLVM / LLD 21.1.8
+- ScarletUI: `cdd852eb22678b7b0d1c7e035c1f2b2ba4d057a7`
+- SAS/client 側 Scarlet dependency: `b3d2a55740a3d2ca49daad0ec7baba233f706f7a`
+- QEMU fork: `d94a1407ab9ccd60559bfd80182a81bb4261fb84`、version 11.1.0
+
+`Cargo.lock` と Git pins を維持。既存の `vendor/scarlet-ui-renderer-sgfx` patch は残している。Gain 側の `vendor/clap-sys` は MIT ライセンスの no_std ABI subset。マシン固有の Cargo `[patch]` やクラウドの絶対パスを入れる必要はない。
+
+### Native build → image → 起動
+
+Resonara の親ディレクトリに、再現用の新しい Scarlet checkout を作る例:
+
+```sh
+git clone --branch dev https://github.com/petitstrawberry/Scarlet.git ../Scarlet
+git -C ../Scarlet checkout 0639a916dfd652e9b2c1ea740cacc1c09743d9eb
+SCARLET="$(cd ../Scarlet && pwd)"
+RESONARA="$PWD"
+
+# 任意: 先に native 両 target の build / ELF audit を実行
+(cd "$SCARLET" &&
+  nix --extra-experimental-features 'nix-command flakes' develop \
+    --accept-flake-config --no-write-lock-file \
+    -c bash -c 'cd "$1"; bash scripts/verify-scarlet' _ "$RESONARA")
+
+# この profile を明示。省略時は従来の full Debian/Wine image
+bash scripts/scarlet-image "$SCARLET" --profile native-desktop
+bash scripts/scarlet-run "$SCARLET" --profile native-desktop --no-build
+```
+
+`SCARLET` と `RESONARA` は手元の checkout の絶対パス。別の配置でも、この2つを合わせればクラウド固有のパスは不要。
+
+- `native-desktop` は Scarlet の exact desktop bundle を使う別プロジェクト `projects/aarch64-limine-resonara-native` を生成する。元の `aarch64-limine-full` は変更しない
+- SWS/SAS、native apps、fonts、services、BSP は維持。Debian/Wine、experimental、ゲスト内 Rust toolchain は含めない。Mozc の Linux server は無いため変換不可。native SKK は残る
+- rootfs は最小 2 GiB、SDK が必要に応じて拡大。GPT は約 2.06 GiB 以上。**そのほか staging、ext2、複数 Cargo cache が必要なので、2 GiB の空きで作れるわけではない**
+- build helper は現在のアプリと Gain をビルド・監査してから `/bin/resonara` と `/system/plugins/resonara-gain.clap` に配置する
+- Native の `dl*` は resident `/bin/scarlet-ld` が供給する。別の `scarlet-dl` を静的に埋め込まない。PIE/PIC と限定した link seed を使用し、**監査なしの ELF を配置しない**
+- 通常の run は既存 disk を再利用。再生成は `--replace-image` が必要。ゲストに保存したものを先に取り出すこと。独立して起動した別 VM は自動停止しない
+- 既定は TCG、4 GiB、4 CPU、GL GPU、network off、WAV audio capture。Mac は公式 runner の Cocoa GL を選択する。通常の VNC / non-GL GPU は使わない。HVF は今回未検証
+- 音声 capture は `artifacts/scarlet-native/vm/audio.wav`、serial は同じ場所の `serial.log`。ホストのスピーカーで聞こえることは別確認
+
+詳しくは [Scarlet port](scarlet-port.md)、[native profile](../platforms/scarlet/native-desktop/README.md)、[CLAP contract](clap-host.md)。
+
+## 検証結果と残り
+
+### 通ったもの
+
+- **最新 M/S ソースで最終 aggregate: workspace 301 passed / 10 default-ignored**。そのうち fixture が必要な9ケースも明示して成功。既存の長時間 stress workload だけ未実行
+- 実 library の追加検証は host 5 / core 9 / app 1 成功（通常テストとの重複を含む）。Gain 10 ケース、ELF auditor 9 ケースも成功
+- app 単体は **153 passed**。pins、format、doc tests、host build、diff check も成功
+- Linux CPAL/ALSA: flat / routed / routed+CLAP の save-load-export-playback smoke に成功。最終 capture は flat 529,200 bytes、routed / routed+CLAP 各458,640 bytes の nonzero PCM（長さは callback のタイミングで変わる）
+- AArch64 / RISC-V64 native ELF: `dlopen/dlsym/dlclose/dlerror` の4 imports、`DT_NEEDED` / TLS なし、対応する `JUMP_SLOT` / `RELATIVE` のみで監査成功
+- クラウドの実 desktop で Nix 2.24.12 rootless store と pinned QEMU 11.1.0 をビルド・実行。40-library のローカル Mesa closure により **実際の GTK GL window** を表示
+
+Native ELF の M/S 調整前 snapshot:
+
+- AArch64: `dec6dd1c80631d8a6081c2a51958003a5a6ecde393b96b10a73489922717bb02`
+- RISC-V64: `92b05746599b6f2ae8350900329e274e12497b42cc394535296e0f25ec0270b0`
+
+最終ホスト検証ログは `artifacts/routing/final-handoff-host-verify.log`、終了コード0。これらのクラウド実行ログは Git 対象外。
+
+QEMU の画面確認は **kernel を載せていない、停止中の 128 MiB guest**。Scarlet の起動確認ではない。
+
+### 手元で次に確認する順序
+
+1. 現在のソースを native build / ELF audit し、image を作る
+2. QEMU で Scarlet を boot。SWS 上に Resonara を開き、resize、Import、Inspector/Mixer を確認
+3. Gain を load し、0.5 の DSP、parameter/state の save/reopen、bypass を確認
+4. SAS 再生と停止・seek・自然終了を確認し、captured WAV が nonzero か調べる
+5. ゲスト内で project を Save → Reopen → Export し、再起動後も保持されるか確認
+
+### クラウド側で止めた地点（手元の必須設定ではない）
+
+8 GiB memory / 32 GiB disk の環境。full devShell 評価は OOM で止まり、個別の pinned derivation を1 jobで実現した。QEMU と GL window は成功したが、その後の SDK/firmware 準備で空きが約 2 GiB まで減少したため停止した。現在の残りは SDK/firmware の6 derivations。`cargo-scarlet` の失敗時 scratch は保持した。
+
+クラウド固有の bootstrap、Mesa copy、絶対パス、未完了 Nix store は、この branch の実行条件にしていない。build logs、cross binaries、images、screenshots、toolchains は Git に含めない。小さい codec fixture は自作の合成音で、テストのため source に含める。

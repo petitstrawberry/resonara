@@ -1,0 +1,6 @@
+#!/bin/sh
+# Native desktop profile; no guest Linux or native Rust-toolchain layer is installed.
+export PATH=/system/bin:/bin:/usr/bin
+export HOME=/root
+export XDG_RUNTIME_DIR=/tmp
+echo "Welcome to Scarlet's native Resonara desktop."

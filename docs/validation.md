@@ -6,6 +6,102 @@ This records the cloud validation and subsequent user-requested Mac handoff.
 Publication uses a dedicated branch; no pull request or merge is part of this
 work. The cloud sections below retain their original environment and counts.
 
+## 2026-10-02 Scarlet port/routing checkpoint (before CLAP extension)
+
+Source baseline: Resonara `7564ddfbeed6f3700579398883bd5dad9d3ce4bf`.
+The inspected Scarlet `dev` checkout is
+`0639a916dfd652e9b2c1ea740cacc1c09743d9eb`. No push, PR or merge is part
+of this validation pass.
+
+- The host aggregate check at this checkpoint passed **247 tests**, zero failures, with one
+  existing opt-in stress test ignored. Dependency pins, formatting and build
+  checks passed. Both flat and routed CPAL/ALSA file-output smokes passed with
+  nonzero PCM. Routed smoke includes three tracks, two buses, inserts, a
+  pre-fader send and project save/load/export. Logs are
+  `artifacts/routing/aggregate-verify.log` and
+  `artifacts/routing/audio-smoke-routed.log`.
+- Native **AArch64** and **RISC-V 64** release builds passed after the EOF fix
+  for this pre-CLAP checkpoint. These binaries do not yet validate CLAP imports.
+  The compiler is Scarlet Rust commit
+  `a5a166ab0ba10eaad36eb90d1e4af26eadfdec0c` (LLVM 21.1.8), matching Scarlet's
+  pinned Nix toolchain. The compiler and linker were materialized from the
+  configured signed Nix caches into the workspace; signatures, compressed
+  SHA-256 and NAR SHA-256 were checked. Direct toolchain execution is separate
+  from a complete `nix develop` run.
+- ELF inspection confirms the intended ARM64/RISC-V64 architectures and
+  `/bin/scarlet-ld` interpreter, without external `NEEDED` libraries. The
+  AArch64 SHA-256 is
+  `1c43f815fd7c4232906bedf2cc1a7de601a3446364227922e28b64b221049da9`;
+  RISC-V64 is
+  `990c86f76a4ff9d7b5bfac4941153e4e7d1c47db4abb16cd7a91e08817a0319d`.
+  Archived logs are `artifacts/scarlet/pre-clap-build-aarch64-unknown-scarlet.log`
+  and `artifacts/scarlet/pre-clap-build-riscv64gc-unknown-scarlet.log`.
+- Six host-tested SAS pump cases cover partial/zero writes, ring backpressure,
+  final staged PCM, drain progress versus completion, cancellation, and closed
+  rings. Natural completion is separate from render completion. The app
+  retains the drained output until an explicit transport/edit action so SAS's
+  device queue can finish; it does not claim a hardware-drain acknowledgement.
+- Isolated wrapper tests pass for locked native build arguments, additive
+  image overlays, user-overlay preservation, persistent-disk reuse, explicit
+  image-replacement opt-in, advisory locking, and GL/display guards. The QMP
+  presence guard uses a marked mock in these tests. No mock test is counted
+  as an actual image, QEMU or guest runtime pass.
+
+## 2026-10-02 CLAP-enabled native artifacts (03:17 UTC snapshot)
+
+At this snapshot the host workspace check passed **300 tests** with ten opt-in cases
+ignored by default. Explicit real-library runs also passed (five host, nine
+core and one app test), including the nine fixture-dependent ignored cases;
+the stress case remains opt-in. The standalone gain effect's ten tests and
+the native ELF auditor's nine tests passed. Flat, routed and routed-plus-CLAP
+CPAL/ALSA smokes passed; both routed captures contained 493,920 bytes of
+nonzero PCM. These are host results, not SAS guest results. Evidence is in
+`artifacts/routing/final-compact-routing-verify.log` and
+`artifacts/routing/final-compact-clap-routed.log`.
+
+The CLAP-enabled native release app built and passed the mandatory ELF
+audit for both targets. Each artifact has exactly `dlopen`, `dlsym`, `dlclose`
+and `dlerror` as dynamic imports, no startup `DT_NEEDED` libraries or TLS, and
+only the architecture's `JUMP_SLOT` and `RELATIVE` dynamic relocations.
+
+- AArch64 SHA-256:
+  `dec6dd1c80631d8a6081c2a51958003a5a6ecde393b96b10a73489922717bb02`
+- RISC-V64 SHA-256:
+  `92b05746599b6f2ae8350900329e274e12497b42cc394535296e0f25ec0270b0`
+- Audits: `artifacts/audit-aarch64-unknown-scarlet.json` and
+  `artifacts/audit-riscv64gc-unknown-scarlet.json`
+- Combined build log: `artifacts/scarlet/final-native-clap-build.log`
+
+These supersede the pre-CLAP binaries above. They have not yet been executed
+inside Scarlet. The optional validation overlay includes an independently
+audited native CLAP loader/DSP/state/teardown smoke executable, a WAV import
+fixture and a routed CLAP project; their presence is not a runtime pass.
+The later M/S-control centering refinement is not included in these hashes;
+the image wrapper rebuilds and audits the current app before staging it.
+
+## 2026-10-02 desktop Nix/QEMU setup
+
+The actual cloud desktop successfully executed the official Nix 2.24.12
+rootless-store probe without security-setting changes. Full Scarlet Nix
+environment evaluation was killed under its 8 GiB memory limit. The exact
+already-evaluated QEMU derivation subsequently built successfully with one
+job/core, without changing its source revision or isolation settings.
+
+- QEMU source: `d94a1407ab9ccd60559bfd80182a81bb4261fb84`
+- Derivation: `wd90v1y5sl6xli19f6s7fi0fja5hg3m7-qemu-11.1.0-scarlet.drv`
+- Output: `z57b2753zj6f0rr7bkavlv0rip4in4vn-qemu-11.1.0-scarlet`
+- The actual desktop rootless-store execution of
+  `qemu-system-aarch64 --version` returned **11.1.0**, exit zero
+- Build evidence: `artifacts/scarlet/qemu-nix-build.log` and `.json`
+
+The selected runtime-image recipe is the separate `native-desktop` profile,
+retaining Scarlet's exact desktop bundle, SWS/SAS and native apps while leaving
+the full Debian/Wine project unchanged. Its rootfs starts at 2 GiB and grows
+under the SDK's normal sizing rules. No fitted-image claim is implied.
+Scarlet image construction, QEMU boot, SWS interaction, SAS guest audio and
+guest file I/O have **not yet been verified**. Record those stages separately
+after observation; compilation and the version check do not imply guest success.
+
 ## 2026-10-02 audio import, musical grid, metronome and saving
 
 `cargo test --locked --workspace` passed 208 tests: 91 app, 59 core and 58

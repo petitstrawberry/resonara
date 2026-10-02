@@ -49,6 +49,7 @@ fn main() -> Result<()> {
                 pan: (track % 7) as f32 / 6.0 - 0.5,
                 mute: false,
                 solo: false,
+                routing: resonara_core::ChannelRouting::default(),
             });
             let base = track as u64 * 4;
             graph.nodes.extend([

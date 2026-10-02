@@ -48,6 +48,7 @@ fn constant(value: f32, start: u64, frames: usize) -> Track {
         pan: 0.,
         mute: false,
         solo: false,
+        routing: resonara_core::ChannelRouting::default(),
     }
 }
 fn project() -> Project {
@@ -324,6 +325,7 @@ fn compiled_default_matches_independent_flat_mixer_at_multiple_rates() {
             pan: index as f32 / 3.0 - 0.8,
             mute: index == 0,
             solo: false,
+            routing: resonara_core::ChannelRouting::default(),
         });
     }
     for solo_enabled in [false, true] {

@@ -1,0 +1,6 @@
+# Native Scarlet's resident ELF loader resolves the explicitly audited CLAP
+# loader imports. PIC must apply to dependency code as well as the final app.
+# Executable-only linker arguments live in resonara-app/build.rs, so they do
+# not leak into the standalone no_std CLAP shared-object build.
+[target.'cfg(target_os = "scarlet")']
+rustflags = ["-C", "relocation-model=pic"]

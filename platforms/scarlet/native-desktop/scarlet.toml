@@ -1,0 +1,73 @@
+schema_version = 2
+
+[project]
+name = "resonara-aarch64-native-desktop"
+
+[bsp]
+path = "bsp"
+package = "scarlet"
+
+[bsp.kernel]
+source = { path = "../../kernel" }
+features = { network = true, user-fpu = true, user-vector = true, hypervisor = false, limine = true, sync-debug = true }
+
+[modules]
+"scarlet-module-prototype" = { path = "../../modules/scarlet-module-prototype", enabled = true }
+
+[images]
+
+[images.initramfs]
+format = "newc"
+output = ".scarlet/images/initramfs-aarch64-resonara-native.cpio"
+
+[[images.initramfs.layers]]
+kind = "bundle"
+path = "../../bundles/base/bundle.toml"
+
+[[images.initramfs.layers]]
+kind = "bundle"
+path = "../../bundles/cli-utils/bundle.toml"
+
+[images.rootfs]
+format = "ext2"
+output = ".scarlet/images/rootfs-aarch64-resonara-native.ext2"
+# Native application workspace; the SDK grows this if the staged desktop needs more.
+min-size-mib = 2048
+
+[[images.rootfs.layers]]
+kind = "bundle"
+path = "../../bundles/desktop/bundle.toml"
+
+[[images.rootfs.layers]]
+kind = "copy"
+source = "rootfs"
+to = "/"
+
+[images.boot]
+format = "limine-uefi"
+output = ".scarlet/images/esp-aarch64-resonara-native.img"
+cmdline = "console=ttyS0 root=/dev/vblk0p2 rootfstype=ext2"
+deps = ["initramfs"]
+
+[[images.boot.layers]]
+kind = "image"
+source = "initramfs"
+to = "/boot/initramfs"
+
+[images.disk]
+format = "gpt"
+output = ".scarlet/images/limine-aarch64-resonara-native.img"
+deps = ["boot", "rootfs"]
+
+[[images.disk.partitions]]
+source = "boot"
+name = "SCARLET_BOOT"
+type = "efi-system"
+
+[[images.disk.partitions]]
+source = "rootfs"
+name = "SCARLET_ROOT"
+type = "linux-filesystem"
+
+[runner]
+command = "tools/run_aarch64.sh"
