@@ -587,6 +587,32 @@ fn first_and_repeated_active_callbacks_neither_allocate_nor_deallocate() {
 }
 
 #[test]
+fn live_graph_swap_and_retirement_neither_allocate_nor_deallocate_in_callback() {
+    let mut p = constant([0.125, -0.25], 100_000);
+    let (mut playback, mut renderer) = live::Playback::new(&p, p.sample_rate, 0, false).unwrap();
+    let mut output = [0.; 128];
+    for i in 0..20 {
+        p.tracks[0].routing.inserts = vec![Insert {
+            kind: InsertKind::Gain {
+                gain: if i % 2 == 0 { 0.5 } else { 2. },
+            },
+            bypass: false,
+        }];
+        playback.update(&p).unwrap();
+        ALLOCS.with(|count| count.set(0));
+        FREES.with(|count| count.set(0));
+        AUDITING.with(|guard| guard.set(true));
+        renderer.render(&mut output, 2); // Includes adoption and retirement.
+        renderer.render(&mut output, 2); // Retired slot is still occupied.
+        AUDITING.with(|guard| guard.set(false));
+        assert_eq!(ALLOCS.with(Cell::get), 0, "live swap allocated");
+        assert_eq!(FREES.with(Cell::get), 0, "live swap deallocated");
+        assert!(output.iter().all(|sample| *sample != 0.));
+    }
+    drop(renderer);
+}
+
+#[test]
 fn persistent_routing_bus_controls_and_sends_do_not_allocate_in_callbacks() {
     let mut p = constant([0.125, -0.25], 100_000);
     let a = p.add_bus("Aux", BusKind::Aux);

@@ -1,12 +1,32 @@
 # Resonara / Scarlet 引き継ぎ（2026-10-02）
 
+## 手元での再生継続修正（同日、クラウド引き継ぎ後）
+
+- 名前変更、built-in bypass、通常の編集、Undo/Redo、Import、Save、Export は再生を継続する。
+- CPAL/SAS の出力を閉じず、構造変更は control thread で準備して音声 block 境界で交換する。小数を含む再生位置を引き継ぎ、古い Engine と CLAP owner は control thread で回収する。
+- built-in bypass は atomic 制御で、effect の内部状態を保持して凍結する。CLAP の bypass／parameter と構造変更は新しい DSP 状態になる。crossfade／click-free は未実装。
+- Region の選択と drag は再生位置を維持し、drag の変更は release 時に反映する。空白クリックと scissors は明示的 seek。
+- Stop、別 project の Open、自然 EOF、音声エラーでは停止する。以下のクラウド検証結果と native ELF snapshot はこの修正前の記録であり、この修正後の Scarlet ゲスト再検証は未実施。
+
+## 手元の検証と黒いリージョンの修正（同日）
+
+- macOS の実 CoreAudio で、同じ stream を保持した7回の live edit と CLAP 付き再生 smoke に成功。workspace の実 CLAP fixture を含む324テスト、Gain 10テストに成功（長時間 stress は除外）。これらは SWS dependency 更新前の記録。
+- ユーザーの Scarlet 起動では音が出たが、リージョンの色／波形／grid が表示されなかった。黒い部分は Canvas placeholder の `(6, 8, 14)` と一致。
+- 原因は旧 SWS client version 11 と実行中 server version 13 の不一致。ScarletUI の exact-match gate がアプリを CPU renderer に落とし、CPU renderer は Canvas extension を無視していた。SWS ログの GPU compositor 正常起動とは別の判定。
+- アプリの UI pin を `2e5e96a5c29086c3b555c85f7835e81ecf529290` に更新。resize 修正は upstream に取り込まれたため旧 renderer vendor を削除。
+- upstream はまだ SWS protocol version 11 を指定しているため、`vendor/sws-protocol` で Scarlet `0639a916dfd652e9b2c1ea740cacc1c09743d9eb` の version 13 に更新。SWS client と SGFX の runtime は既存の同一 pin を共有する。描画コードと exact-match 判定は変更していない。
+- 更新後の実 CLAP fixture を含む workspace 313テスト（うち protocol 47）、upstream renderer 58テストに成功。長時間 stress のみ除外。macOS CoreAudio の7 live edits smoke、pins、format、diff check も成功。
+- AArch64 / RISC-V64 の最新 release は build と ELF 監査に合格。Scarlet checkout の Rust `a5a166ab0ba10eaad36eb90d1e4af26eadfdec0c` を使用。監査 helper は macOS の `llvm-readelf` も使えるよう更新し、既存9テストも成功。
+- AArch64 Gain も build と ELF 監査に合格。native app は `target/aarch64-unknown-scarlet/release/resonara`、Gain は `artifacts/sws-update-gain-aarch64/staging/system/plugins/resonara-gain.clap`。検証ログは `artifacts/sws-update-native-verify.log`、`artifacts/sws-update-final-tests.log`、`artifacts/sws-update-renderer-tests.log`、`artifacts/sws-update-coreaudio-smoke.log`。
+- ゲストの既存 image と起動中 VM は変更していない。更新した binary での表示確認は別途必要。
+
 ## まず結論
 
 - 作業ブランチ: `feat/scarlet-routing`（`main` へのマージ、PR 作成は行わない）
 - ルーティング、コンパクトな Insert/Send UI、最初の CLAP Gain、Scarlet 用 SWS/SAS バックエンドまで実装済み
 - Linux ホストの GUI・音声・実 CLAP の動作は検証済み。最新の M/S 中央配置もホストのビルドと回帰テストは通過
-- **Scarlet ゲストは未起動。Scarlet 上の GUI・音声・CLAP・ファイル操作は未検証**
-- AArch64 / RISC-V64 の native アプリはビルドと ELF 監査に合格。ただしそのバイナリは最後の M/S 配置調整前。手元では必ず現在のソースから再ビルドする
+- **クラウドでは Scarlet ゲスト未起動。手元ではユーザーが GUI 起動と音声を確認。今回の dependency 更新後の表示と CLAP・ファイル操作は未検証**
+- クラウド時点の AArch64 / RISC-V64 native ELF は M/S 配置調整前の記録。今回の最新 build の記録は上の手元の検証を参照
 - クラウドでの追加作業は停止。容量確保の承認は得ておらず、キャッシュは削除していない
 
 ## 実装したもの
@@ -18,7 +38,7 @@
 - Bus の経路と Aux の受け口を分けた操作。Output または空 Send 行の `New Bus → Aux` は作成・接続を一度に行う。手動の `+Aux` も用意
 - Insert は連続したスロット。名前でエディター、電源で bypass、右クリック／矢印から並べ替え・削除。Send は連続した小さい行とノブ、空行から行き先を選ぶ
 - Inspector は左全高。リージョン情報をチャンネルの上に置き、上側だけスクロール、下の共通フェーダーは固定。Mixer と同じ channel strip を使い、M/S を中央配置
-- 音量・Pan・Send level は atomic な live control。構造変更や bypass は停止・グラフ再構築。ライブ無音切り替え／リアルタイムの無停止交換ではない
+- 音量・Pan・Send level と built-in bypass は atomic な live control。構造変更と CLAP bypass は出力を維持してグラフ交換する（手元での修正を参照）
 - Undo/Redo、旧 version-1 JSON の読込、Bus 削除時の参照修復、循環・資源上限の検証を実装
 
 ### 最初の CLAP
@@ -79,7 +99,7 @@ export RESONARA_CLAP_LIBRARY="$PLUGIN_TARGET/release/libresonara_gain.dylib"
 - SAS/client 側 Scarlet dependency: `b3d2a55740a3d2ca49daad0ec7baba233f706f7a`
 - QEMU fork: `d94a1407ab9ccd60559bfd80182a81bb4261fb84`、version 11.1.0
 
-`Cargo.lock` と Git pins を維持。既存の `vendor/scarlet-ui-renderer-sgfx` patch は残している。Gain 側の `vendor/clap-sys` は MIT ライセンスの no_std ABI subset。マシン固有の Cargo `[patch]` やクラウドの絶対パスを入れる必要はない。
+`Cargo.lock` と Git pins を維持。現在は upstream resize 修正を含む UI pin と、`vendor/sws-protocol` の protocol 更新 patch を使う。Gain 側の `vendor/clap-sys` は MIT ライセンスの no_std ABI subset。マシン固有の Cargo `[patch]` やクラウドの絶対パスを入れる必要はない。
 
 ### Native build → image → 起動
 

@@ -563,13 +563,12 @@ impl Daw {
             return;
         }
         self.finish_mix();
-        self.stop_audio(false);
         let mut m = self.model.borrow_mut();
         let before = Self::snapshot(&m);
-        match f(&mut m) {
+        match f(&mut m).and_then(|()| Self::sync_audio(&mut m)) {
             Ok(()) => {
                 Self::history(&mut m, before, label);
-                self.status.set(label.into());
+                self.status.set(Self::edit_status(&m, label.into()));
             }
             Err(e) => {
                 Self::restore(&mut m, before);
@@ -579,12 +578,27 @@ impl Daw {
         drop(m);
         self.refresh(true);
     }
+    fn sync_audio(m: &mut Model) -> Result<()> {
+        if let Some(audio) = &mut m.audio {
+            audio.update(&m.project)?;
+        }
+        Ok(())
+    }
+    fn edit_status(m: &Model, label: String) -> String {
+        let missing = m.audio.as_ref().map_or(0, |a| {
+            a.controls.unavailable_plugins.load(Ordering::Relaxed)
+        });
+        if missing == 0 {
+            label
+        } else {
+            format!("{label} · {missing} unavailable CLAP insert(s) bypassed")
+        }
+    }
     fn undo(&self, redo: bool) {
         if self.busy() {
             return;
         }
         self.finish_mix();
-        self.stop_audio(false);
         let mut m = self.model.borrow_mut();
         let item = if redo { m.redo.pop() } else { m.undo.pop() };
         if let Some(h) = item {
@@ -592,9 +606,27 @@ impl Daw {
             let label = h.label;
             let restore_path = h.restore_path;
             let current_path = m.current_path.clone();
+            let rejected = h.state.clone();
             Self::restore(&mut m, h.state);
             if !restore_path {
                 m.current_path = current_path;
+            }
+            if let Err(error) = Self::sync_audio(&mut m) {
+                Self::restore(&mut m, current);
+                let item = History {
+                    state: rejected,
+                    label,
+                    restore_path,
+                };
+                if redo {
+                    m.redo.push(item);
+                } else {
+                    m.undo.push(item);
+                }
+                self.status.set(format!("Could not restore edit: {error}"));
+                drop(m);
+                self.refresh(true);
+                return;
             }
             let next = History {
                 state: current,
@@ -606,8 +638,10 @@ impl Daw {
             } else {
                 m.redo.push(next);
             }
-            self.status
-                .set(format!("{}: {label}", if redo { "Redid" } else { "Undid" }));
+            self.status.set(Self::edit_status(
+                &m,
+                format!("{}: {label}", if redo { "Redid" } else { "Undid" }),
+            ));
         }
         drop(m);
         self.refresh(true);
@@ -1005,7 +1039,6 @@ impl Daw {
                 ..
             }) => {
                 self.finish_mix();
-                self.stop_audio(false);
                 self.focus.set(true);
                 let at = seconds(*x as f32).max(0.);
                 let mut m = self.model.borrow_mut();
@@ -1013,6 +1046,7 @@ impl Daw {
                     return false;
                 }
                 let rate = m.project.sample_rate;
+                let was_playing = m.audio.is_some();
                 let frame = (at * rate as f64) as u64;
                 let hit = m.project.tracks[index]
                     .clips
@@ -1053,7 +1087,11 @@ impl Daw {
                     });
                 }
                 drop(m);
-                self.seek(self.snap_position(at));
+                // Selecting/dragging a region preserves transport. A click in
+                // empty space (or the scissors tool) explicitly seeks instead.
+                if !was_playing || hit.is_none() || self.tool.get() == 1 {
+                    self.seek(self.snap_position(at));
+                }
                 if self.tool.get() == 1 && hit.is_some() {
                     self.model.borrow_mut().drag = None;
                     self.split();
@@ -1132,15 +1170,21 @@ impl Daw {
                 let mut m = self.model.borrow_mut();
                 if let Some(d) = m.drag.take() {
                     if d.moved {
-                        Self::history(
-                            &mut m,
-                            d.before,
-                            if d.mode == DragMode::Move {
-                                "Move region"
-                            } else {
-                                "Trim region"
-                            },
-                        );
+                        match Self::sync_audio(&mut m) {
+                            Ok(()) => Self::history(
+                                &mut m,
+                                d.before,
+                                if d.mode == DragMode::Move {
+                                    "Move region"
+                                } else {
+                                    "Trim region"
+                                },
+                            ),
+                            Err(error) => {
+                                Self::restore(&mut m, d.before);
+                                self.status.set(format!("Could not edit region: {error}"));
+                            }
+                        }
                     }
                 }
                 drop(m);
@@ -1401,7 +1445,9 @@ impl Daw {
             return;
         }
         self.finish_mix();
-        self.stop_audio(false);
+        if action == FileAction::Open {
+            self.stop_audio(false);
+        }
         let mut m = self.model.borrow_mut();
         if m.io.is_some() || m.picker.is_some() {
             return;
@@ -1463,6 +1509,14 @@ impl Daw {
                 if let Some(project) = project {
                     let before = Self::snapshot(&m);
                     m.project = project;
+                    if let Err(error) = Self::sync_audio(&mut m) {
+                        Self::restore(&mut m, before);
+                        self.status
+                            .set(format!("Could not apply audio import: {error}"));
+                        drop(m);
+                        self.refresh(true);
+                        return;
+                    }
                     m.selected_bus = None;
                     m.selected = if out.action == FileAction::Import {
                         m.project.tracks.len().saturating_sub(1)
@@ -2324,6 +2378,9 @@ impl Application for Daw {
         }
     }
     fn on_idle(&mut self) {
+        if let Some(audio) = &mut self.model.borrow_mut().audio {
+            audio.collect_retired();
+        }
         if self.profiler.borrow().expired() {
             self.finish_profile();
         }
@@ -2442,6 +2499,13 @@ fn smoke() -> Result<()> {
     let dir = std::path::Path::new(&path);
     std::fs::create_dir_all(dir)?;
     let mut p = Project::demo();
+    let live_edits = std::env::var_os("RESONARA_SMOKE_LIVE_EDITS").is_some();
+    if live_edits {
+        p.tracks[0].routing.inserts.push(resonara_core::Insert {
+            kind: resonara_core::InsertKind::Gain { gain: 0.5 },
+            bypass: false,
+        });
+    }
     p.split(0, 48000)?;
     p.trim(1, 24000, 96000)?;
     if std::env::var_os("RESONARA_SMOKE_ROUTING").is_some() {
@@ -2478,11 +2542,44 @@ fn smoke() -> Result<()> {
         });
     }
     p.save(&dir.join("smoke.resonara.json"))?;
-    let p = Project::load(&dir.join("smoke.resonara.json"))?;
+    let mut p = Project::load(&dir.join("smoke.resonara.json"))?;
     p.export_wav(&dir.join("smoke.wav"))?;
-    let a = Audio::start(&p, 0)?;
+    let mut a = Audio::start(&p, 0)?;
+    let transport = a.controls.position.clone();
+    let mut edits = 0;
     let start = Instant::now();
     while start.elapsed().as_secs_f32() < 2. {
+        a.collect_retired();
+        if live_edits && edits < 7 && start.elapsed().as_millis() >= (edits + 1) * 100 {
+            match edits {
+                0 => p.tracks[0].name = "Live rename".into(),
+                1 | 2 => p.tracks[0].routing.inserts[0].bypass = edits == 1,
+                3 | 4 => {
+                    for insert in &mut p.tracks[0].routing.inserts {
+                        if matches!(insert.kind, resonara_core::InsertKind::Clap { .. }) {
+                            insert.bypass = edits == 3;
+                        }
+                    }
+                }
+                5 => {
+                    let bus = p.add_bus("Live routing", BusKind::Aux);
+                    p.tracks[0].routing.output = resonara_core::Destination::Bus(bus);
+                }
+                _ => p.tracks[0].routing.inserts.push(resonara_core::Insert {
+                    kind: resonara_core::InsertKind::Gain { gain: 0.8 },
+                    bypass: false,
+                }),
+            }
+            let position = transport.load(Ordering::Relaxed);
+            a.update(&p)?;
+            if !Arc::ptr_eq(&transport, &a.controls.position)
+                || transport.load(Ordering::Relaxed) < position
+                || !a.controls.playing.load(Ordering::Relaxed)
+            {
+                return Err("Live edit interrupted or rewound transport".into());
+            }
+            edits += 1;
+        }
         if a.controls.position.load(Ordering::Relaxed) >= p.sample_rate as u64 {
             break;
         }
@@ -2490,13 +2587,15 @@ fn smoke() -> Result<()> {
     }
     if a.controls.error.load(Ordering::Relaxed)
         || a.controls.position.load(Ordering::Relaxed) < p.sample_rate as u64
+        || (live_edits && edits != 7)
     {
         return Err("Audio callback did not advance successfully".into());
     }
     println!(
-        "Smoke passed: {} tracks, {} buses, save/load/export, audio device {}, callback position {}",
+        "Smoke passed: {} tracks, {} buses, save/load/export, {} live edits, audio device {}, callback position {}",
         p.tracks.len(),
         p.buses.len(),
+        edits,
         a.device,
         a.controls.position.load(Ordering::Relaxed)
     );

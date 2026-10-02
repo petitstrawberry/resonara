@@ -174,6 +174,49 @@ mod tests {
         assert_eq!(ring.bytes, expected);
     }
     #[test]
+    fn live_swap_preserves_partially_staged_pcm_before_rendering_the_new_graph() {
+        use resonara_core::{Clip, Insert, InsertKind, live::Playback};
+        let mut project = Project::demo();
+        project.tracks.truncate(1);
+        project.tracks[0].gain = 1.;
+        project.tracks[0].pan = 0.;
+        project.master = 1.;
+        project.tracks[0].clips = vec![Clip {
+            source_channels: 2,
+            start: 0,
+            source_offset: 0,
+            frames: 1024,
+            samples: Arc::new(vec![[0.125, -0.25]; 1024]),
+        }];
+        let (mut playback, mut renderer) =
+            Playback::new(&project, project.sample_rate, 0, false).unwrap();
+        let (_, _, _, mut ring) = setup();
+        ring.accept = 17;
+        let mut pump = Pump::new();
+        pump.step(renderer.engine_mut(), &mut ring, false).unwrap();
+        assert_eq!(playback.controls.position.load(Ordering::Relaxed), 256);
+        project.tracks[0].routing.inserts.push(Insert {
+            kind: InsertKind::Gain { gain: 0.5 },
+            bypass: false,
+        });
+        playback.update(&project).unwrap();
+        renderer.apply_pending();
+        while ring.bytes.len() < 2 * PERIOD_FRAMES * FRAME_BYTES {
+            pump.step(renderer.engine_mut(), &mut ring, false).unwrap();
+        }
+        let mut expected = [4096i16, -8192].repeat(PERIOD_FRAMES);
+        expected.extend([2048i16, -4096].repeat(PERIOD_FRAMES));
+        assert_eq!(
+            ring.bytes,
+            expected
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(playback.controls.position.load(Ordering::Relaxed), 512);
+        drop(renderer);
+    }
+    #[test]
     fn full_or_closed_ring_does_not_advance_the_engine() {
         let (mut pump, mut engine, controls, mut ring) = setup();
         ring.writable = 0;

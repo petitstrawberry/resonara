@@ -12,7 +12,7 @@ cd resonara
 ./scripts/dev cargo run --locked --release -p resonara
 ```
 
-ScarletUIはGit revision `cdd852eb22678b7b0d1c7e035c1f2b2ba4d057a7` に固定しています。SGFXもScarletUIが指定する固定Git revisionを使い、推移的依存の正確な解決結果を`Cargo.lock`に記録しています。依存先のローカル変更やパッチは不要です。
+ScarletUIはGit revision `2e5e96a5c29086c3b555c85f7835e81ecf529290` に固定しています。SGFXもScarletUIが指定する固定Git revisionを使い、推移的依存の正確な解決結果を`Cargo.lock`に記録しています。SWS protocol の依存更新はリポジトリ内の portable vendor patch に含めています。隣接 checkout の変更は不要です。
 
 ```sh
 # 空の新規プロジェクト（Master 0 dB）
@@ -69,7 +69,7 @@ Open／Save As／Audio Import／ExportはScarletUIの共通`file_dialog::FileDia
 
 Linuxのnative backendは今回未実装で`Unsupported`を返し、既存のアプリ内ブラウザーを使用します。ScarletUIのSWS backendは既存Files/sbusのsingle open/save request/replyを再利用しますが、providerに複数選択・任意extension filter・caller window・remote cancelがありません。Resonaraが要求する拡張子filterには`Unsupported`を返してbrowserへフォールバックします。Scarlet上のResonara本体の音声・クロスビルド対応を意味しません。
 
-ScarletUIの固定Git revは`cdd852eb22678b7b0d1c7e035c1f2b2ba4d057a7`です。ローカル統合検証用path/patchはmanifestに含めず、lockfileのScarletUI関連7crateを同一Git sourceへ固定し、main既存のportable vendor renderer patchとそのcore依存も同じrevに揃えています。このrevをScarletUI側で公開してからResonara側の変更を公開・統合してください。
+ScarletUIの固定Git revは`2e5e96a5c29086c3b555c85f7835e81ecf529290`です。Canvas resize 修正はこの公開済み revision に含まれています。SWS protocol は`vendor/sws-protocol`で Scarlet `0639a916dfd652e9b2c1ea740cacc1c09743d9eb` の version 13 に更新し、実行中 server に揃えています。SWS client と SGFX の runtime は同じ既存 pin を共有し、型とリンクの二重化を避けています。全 UI crate は同じ Git source です。`scripts/check-dependencies` が lockfile の protocol、UI、runtime pins を確認します。
 
 ## 検証
 

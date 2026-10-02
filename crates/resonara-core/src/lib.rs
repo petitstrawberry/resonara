@@ -6,6 +6,7 @@ use std::sync::{
 };
 pub mod audio;
 pub mod graph;
+pub mod live;
 pub mod plugins;
 pub use plugins::{ClapInsert, ClapParameter};
 pub use resonara_clap::PluginOwner;
@@ -351,16 +352,18 @@ pub struct Controls {
     /// Live send levels, as f32 bits, in track-then-bus/send-slot order.
     /// Includes disabled slots; use Project::send_control_index off the audio thread.
     pub send_gains: Vec<AtomicU32>,
+    /// Live insert bypass, in track-then-bus/insert-slot order.
+    pub insert_bypasses: Vec<AtomicBool>,
     pub master: AtomicU32,
     /// Playback monitoring only. Exports construct disabled controls.
-    pub metronome: AtomicBool,
+    pub metronome: Arc<AtomicBool>,
     /// Actual stereo master sum after master gain, before clipping/device mapping.
     /// Positive f32 bits, accumulated until consumed with swap(0).
     pub master_peak_left: AtomicU32,
     pub master_peak_right: AtomicU32,
-    pub position: AtomicU64,
-    pub playing: AtomicBool,
-    pub error: AtomicBool,
+    pub position: Arc<AtomicU64>,
+    pub playing: Arc<AtomicBool>,
+    pub error: Arc<AtomicBool>,
     /// Active reachable CLAP inserts that could not be prepared. Playback uses
     /// dry placeholders; export refuses to create a file in this condition.
     pub unavailable_plugins: AtomicU32,
@@ -398,18 +401,23 @@ impl Controls {
                 .flat_map(|routing| &routing.sends)
                 .map(|send| AtomicU32::new(send.gain.to_bits()))
                 .collect(),
+            insert_bypasses: p
+                .channel_routings()
+                .flat_map(|routing| &routing.inserts)
+                .map(|insert| AtomicBool::new(insert.bypass))
+                .collect(),
             master: AtomicU32::new(p.master.to_bits()),
-            metronome: AtomicBool::new(false),
+            metronome: Arc::new(AtomicBool::new(false)),
             master_peak_left: AtomicU32::new(0),
             master_peak_right: AtomicU32::new(0),
-            position: AtomicU64::new(0),
-            playing: AtomicBool::new(true),
-            error: AtomicBool::new(false),
+            position: Arc::new(AtomicU64::new(0)),
+            playing: Arc::new(AtomicBool::new(true)),
+            error: Arc::new(AtomicBool::new(false)),
             unavailable_plugins: AtomicU32::new(0),
         }
     }
 }
-/// Holds its snapshot for the entire stream lifetime; no swaps, locks, allocation or destruction in render.
+/// Owns one prepared snapshot; render does not lock, allocate or destroy graphs.
 pub struct Engine {
     tracks: Vec<Track>,
     clip_interpolation_ends: Vec<Vec<usize>>,
@@ -425,6 +433,7 @@ pub struct Engine {
     block_mixers: Vec<graph::BlockMixer>,
     block_bus_mixers: Vec<graph::BlockMixer>,
     block_send_gains: Vec<f32>,
+    block_insert_bypasses: Vec<bool>,
 }
 impl Engine {
     pub fn new(p: &Project, controls: Arc<Controls>, device_rate: u32, start: u64) -> Self {
@@ -438,9 +447,11 @@ impl Engine {
         device_rate: u32,
         start: u64,
     ) -> Result<Self> {
-        let routing = p.routing_graph()?;
+        let (routing, insert_controls) = p.routing_graph_with_insert_controls()?;
         let limits = p.routing_limits();
-        Self::with_graph(p, controls, device_rate, start, &routing, limits)
+        let mut engine = Self::with_graph(p, controls, device_rate, start, &routing, limits)?;
+        engine.graph.set_insert_controls(&insert_controls);
+        Ok(engine)
     }
     /// Prepare an explicit runtime graph outside the audio callback, overriding
     /// persistent routing for this engine only. No graph mutation during playback.
@@ -475,6 +486,7 @@ impl Engine {
             .store(graph.info().unavailable_plugins, Ordering::Relaxed);
         let duration = p.duration();
         let clock_only = duration == 0 && controls.metronome.load(Ordering::Relaxed);
+        let inserts = controls.insert_bypasses.len();
         // The UI may read transport state before the first device callback.
         // Publish the requested start immediately rather than briefly jumping
         // to zero (which can be outside a panned arrangement viewport).
@@ -533,6 +545,7 @@ impl Engine {
             block_mixers: vec![graph::BlockMixer::default(); p.tracks.len()],
             block_bus_mixers: vec![graph::BlockMixer::default(); p.buses.len()],
             block_send_gains: vec![0.0; sends],
+            block_insert_bypasses: vec![false; inserts],
         })
     }
     /// Transfer main-thread plug-in lifecycle guards before sending the Engine
@@ -540,6 +553,19 @@ impl Engine {
     /// and all callbacks stop. Offline rendering can leave ownership here.
     pub fn take_plugin_owners(&mut self) -> Vec<PluginOwner> {
         self.graph.take_plugin_owners()
+    }
+    /// Adopt the exact next sample at a live graph boundary, including the
+    /// fractional project-frame position when device and project rates differ.
+    pub(crate) fn continue_from(&mut self, previous: &Self) {
+        self.position = if self.step == previous.step {
+            previous.position
+        } else {
+            previous.position * self.step / previous.step
+        };
+        self.faulted = previous.faulted;
+        self.controls
+            .position
+            .store(self.position as u64, Ordering::Relaxed);
     }
     pub fn graph_info(&self) -> &graph::GraphInfo {
         self.graph.info()
@@ -618,6 +644,13 @@ impl Engine {
                     *gain = f32::from_bits(control.load(Ordering::Relaxed));
                 }
                 let tracks = &self.tracks;
+                for (bypass, control) in self
+                    .block_insert_bypasses
+                    .iter_mut()
+                    .zip(&self.controls.insert_bypasses)
+                {
+                    *bypass = control.load(Ordering::Relaxed);
+                }
                 let interpolation_ends = &self.clip_interpolation_ends;
                 let positions = &self.positions;
                 let processed = self.graph.process(
@@ -625,6 +658,7 @@ impl Engine {
                     &mut self.block_mixers,
                     &mut self.block_bus_mixers,
                     &self.block_send_gains,
+                    &self.block_insert_bypasses,
                     |track, block| {
                         // Visit each clip's block intersection, retaining clip
                         // summation order and sample-by-sample transport positions.

@@ -337,7 +337,20 @@ impl Project {
     /// of fan-out; pre-fader sends tap after inserts, post-fader sends after pan.
     /// This only builds graph metadata. Engine setup compiles/allocates it once.
     pub fn routing_graph(&self) -> Result<RoutingGraph> {
+        self.lower_routing_graph(false).map(|(graph, _)| graph)
+    }
+    pub(crate) fn routing_graph_with_insert_controls(
+        &self,
+    ) -> Result<(RoutingGraph, Vec<(NodeId, usize)>)> {
+        self.lower_routing_graph(true)
+    }
+    fn lower_routing_graph(
+        &self,
+        live_bypass: bool,
+    ) -> Result<(RoutingGraph, Vec<(NodeId, usize)>)> {
         self.validate_routing()?;
+        let mut insert_controls = Vec::new();
+        let mut insert_offset = 0;
         let mut graph = RoutingGraph {
             nodes: Vec::new(),
             routes: Vec::new(),
@@ -378,8 +391,15 @@ impl Project {
             let source = NodeId(channel as u64 * 2);
             let fader = NodeId(source.0 + 1);
             let mut tap = source;
-            for insert in routing.inserts.iter().filter(|insert| !insert.bypass) {
+            for (slot, insert) in routing.inserts.iter().enumerate() {
+                // A bypassed external plugin need not be loaded. Enabling it
+                // prepares a replacement graph; built-ins stay allocated live.
+                if insert.bypass && (!live_bypass || matches!(insert.kind, InsertKind::Clap { .. }))
+                {
+                    continue;
+                }
                 let id = NodeId(graph.nodes.len() as u64);
+                insert_controls.push((id, insert_offset + slot));
                 let processor = match insert.kind {
                     InsertKind::Clap { ref plugin } => Processor::Clap {
                         plugin: plugin.clone(),
@@ -455,7 +475,8 @@ impl Project {
                 });
             }
             send_offset += routing.sends.len();
+            insert_offset += routing.inserts.len();
         }
-        Ok(graph)
+        Ok((graph, insert_controls))
     }
 }

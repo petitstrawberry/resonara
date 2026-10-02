@@ -10,6 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
 import struct
 import subprocess
 
@@ -21,7 +22,8 @@ ARCHES = {
 
 
 def readelf(path, *args):
-    return subprocess.check_output(["readelf", "-W", *args, str(path)], text=True)
+    tool = shutil.which("readelf") or shutil.which("llvm-readelf") or "readelf"
+    return subprocess.check_output([tool, "-W", *args, str(path)], text=True)
 
 
 def undefined(text):

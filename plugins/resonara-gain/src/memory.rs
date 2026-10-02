@@ -1,10 +1,17 @@
 //! Compiler-generated struct copies/zeroing use these freestanding primitives.
 //! Volatile byte operations prevent LLVM from rewriting them into calls to
-//! themselves. No platform libc, allocator, locks, or TLS are involved.
+//! themselves. No allocator, locks, or TLS are involved. Darwin also links its
+//! mandatory libSystem; native Scarlet/Linux builds remain freestanding.
 use core::{
     ffi::{c_int, c_void},
     ptr,
 };
+
+// Darwin requires this dependency for every dylib, even with freestanding
+// compiler primitives. Native Scarlet/Linux builds remain libc-free.
+#[cfg(target_os = "macos")]
+#[link(name = "System")]
+unsafe extern "C" {}
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn memcpy(dst: *mut c_void, src: *const c_void, size: usize) -> *mut c_void {

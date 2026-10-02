@@ -48,7 +48,7 @@ responsibility. Fixed-size compiler-generated copies use local freestanding
 
 ## Build and test on Linux
 
-Use an installed Rust toolchain and `readelf`:
+Use an installed Rust toolchain and `readelf` (or `llvm-readelf` on macOS):
 
 ```sh
 cd plugins/resonara-gain

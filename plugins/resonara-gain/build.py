@@ -17,10 +17,11 @@ def audit(path, machine):
     data = path.read_bytes()
     if len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01" or struct.unpack_from("<HH", data, 16) != (3, machine):
         raise RuntimeError("expected a little-endian ELF64 ET_DYN for the selected architecture")
-    dynamic = subprocess.check_output(["readelf", "-Wd", str(path)], text=True)
-    symbols = subprocess.check_output(["readelf", "-W", "--dyn-syms", str(path)], text=True)
-    program = subprocess.check_output(["readelf", "-Wl", str(path)], text=True)
-    relocations = subprocess.check_output(["readelf", "-Wr", str(path)], text=True)
+    readelf = shutil.which("readelf") or shutil.which("llvm-readelf") or "readelf"
+    dynamic = subprocess.check_output([readelf, "-Wd", str(path)], text=True)
+    symbols = subprocess.check_output([readelf, "-W", "--dyn-syms", str(path)], text=True)
+    program = subprocess.check_output([readelf, "-Wl", str(path)], text=True)
+    relocations = subprocess.check_output([readelf, "-Wr", str(path)], text=True)
     forbidden = ("NEEDED", "RPATH", "RUNPATH", "VERNEED", "VERSYM", "VERDEF", "TEXTREL")
     if any(f"({tag})" in dynamic for tag in forbidden):
         raise RuntimeError("unsupported dynamic tag:\n" + dynamic)

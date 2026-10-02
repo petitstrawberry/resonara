@@ -46,14 +46,18 @@ An empty insert slot opens the effect picker. `Resonara Gain` loads the bundled
 CLAP effect; its slot opens a generic parameter popup. Custom plugin GUI windows
 are not part of this phase. The dedicated native slot separates name, bypass,
 and context hit areas; context actions reorder or remove without permanent
-button clutter. Edits and bypass still use stop/rebuild, not crackle-free live
-switching. Keyboard operation after focus uses Enter, Space, and Shift-F10;
+button clutter. Edits and CLAP bypass prepare a replacement graph and switch at
+an audio block boundary, preserving transport and the open output device.
+Replaced processors are retired outside rendering before their owners are
+destroyed on the creating thread. Structural swaps initialize fresh DSP state;
+crossfades and crackle-free switching are not guaranteed.
+Keyboard operation after focus uses Enter, Space, and Shift-F10;
 ScarletUI does not currently provide general Tab traversal.
 
 The slot workflow was checked against [Logic’s plugin controls](https://support.apple.com/guide/logicpro/add-remove-move-and-copy-plug-ins-lgcpbc218a22/mac)
 and [Cubase’s insert controls](https://www.steinberg.help/r/cubase-pro/15.0/en/cubase_nuendo/topics/mixconsole/mixconsole_bypassing_insert_effects_c.html).
-Cubase’s live bypass keeps DSP running; Resonara’s current structural bypass
-is deliberately not presented as equivalent real-time behavior.
+Cubase's live bypass keeps DSP running. Resonara's CLAP bypass replaces the
+prepared graph; its built-in bypass retains and freezes the effect's state.
 
 ## Build and run on Linux
 

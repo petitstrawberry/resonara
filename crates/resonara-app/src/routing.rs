@@ -1,4 +1,4 @@
-//! Native channel-strip routing editor. Structural edits stop audio; faders stay live.
+//! Native channel-strip routing editor. Accepted edits keep the output running.
 use super::*;
 use resonara_core::{Bus, ChannelRouting, Destination, Insert, InsertKind, Send};
 
@@ -197,7 +197,7 @@ impl Daw {
         if self.busy() {
             return;
         }
-        // Build and validate a candidate before stopping playback. No-op and
+        // Build and validate a candidate before replacing the graph. No-op and
         // rejected edits leave the live stream, history and effect state alone.
         let mut candidate = self.model.borrow().project.clone();
         let Some(routing) = target.get_mut(&mut candidate) else {

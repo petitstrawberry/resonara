@@ -152,11 +152,18 @@ separate latched audio-fault behavior below still stops playback.
 
 ## Lifecycle and explicit limits
 
-- Structural edits retain the existing stop/rebuild/start lifecycle. There is no
-  live graph mutation, atomic graph replacement or audio-thread reclamation
-- Routing and inserts are persistent session edits. The app's structural
-  stop/rebuild/start lifecycle also applies to destination, send, insert,
-  bypass, and bus edits. Bus gain/pan/mute can use prepared atomic controls
+- Editing, Undo/Redo, Import, Save and Export keep playback running. Names and
+  mixer values retain the current engine. Built-in bypass uses atomic controls
+  sampled once per quantum; bypassed DSP state is retained and frozen.
+- `live::Playback` prepares structural changes on the control thread, then hands
+  them to CPAL/SAS at a render block boundary. Transport atomics remain shared;
+  the new engine inherits the exact fractional next-sample position. The device
+  stays open. A one-slot pending/retired mailbox coalesces rapid edits; occupied
+  retirement storage defers a swap while the old graph keeps rendering. Replaced
+  engines and CLAP owners are reclaimed on the control thread, never in render.
+- Structural replacements (including CLAP bypass/parameters) initialize fresh
+  DSP state. They have no crossfade or click-free guarantee. Natural EOF and
+  processing/device faults still end playback; opening another project stops it.
 - Pause outputs silence and freezes both transport and effect state
 - EOF remains the existing hard boundary at `Project::duration()`. Delay/reverb
   tails beyond it are not rendered or exported. A caller can supply a longer
@@ -267,9 +274,9 @@ only as mixer channels.
   the receiving Aux, whose Inspector lists upstream output/send connections
 - Routing candidates are validated before touching the live stream. Rejected
   cycles, resource limits, stale targets, and unchanged edits do not create
-  history entries or reset running DSP. Successful routing edits stop playback;
-  playback preparation compiles the new graph, rather than ordinary repaint,
-  selection, or mixer-level changes doing so
+  history entries or reset running DSP. Successful structural edits prepare and
+  hand off a complete graph while playback continues; ordinary repaint,
+  selection, names and mixer-level changes do not compile a graph
 - Track and bus levels/pan/mute and send gains remain live atomic controls. Their drag gestures
   coalesce into one undo entry. Undo/Redo retain bus identities, routing, insert
   parameters and bypass, sends, and the selected channel

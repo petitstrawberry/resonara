@@ -1,6 +1,9 @@
 //! CPAL adapter for Linux and macOS.
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use resonara_core::{Controls, Engine, PluginOwner, Project, Result};
+use resonara_core::{
+    Controls, Project, Result,
+    live::{Playback, PlaybackRenderer},
+};
 use std::{
     marker::PhantomData,
     rc::Rc,
@@ -8,13 +11,21 @@ use std::{
 };
 pub struct Audio {
     stream: Option<cpal::Stream>,
-    plugin_owners: Vec<PluginOwner>,
+    playback: Playback,
     // CLAP activation/deactivation belongs to this adapter's creating thread.
     _owner_thread: PhantomData<Rc<()>>,
     pub controls: Arc<Controls>,
     pub device: String,
 }
 impl Audio {
+    pub fn update(&mut self, project: &Project) -> Result<()> {
+        self.playback.update(project)?;
+        self.controls = self.playback.controls.clone();
+        Ok(())
+    }
+    pub fn collect_retired(&mut self) {
+        self.playback.collect_retired();
+    }
     pub fn is_finished(&self) -> bool {
         !self.controls.playing.load(Ordering::Relaxed)
     }
@@ -30,11 +41,9 @@ impl Audio {
         let name = device.name()?;
         let supported = device.default_output_config()?;
         let config: cpal::StreamConfig = supported.clone().into();
-        let controls = Arc::new(Controls::new(project));
-        controls.metronome.store(metronome, Ordering::Relaxed);
+        let (playback, engine) = Playback::new(project, config.sample_rate.0, start, metronome)?;
+        let controls = playback.controls.clone();
         let error = controls.clone();
-        let mut engine = Engine::try_new(project, controls.clone(), config.sample_rate.0, start)?;
-        let plugin_owners = engine.take_plugin_owners();
         let channels = config.channels as usize;
         let stream = match supported.sample_format() {
             cpal::SampleFormat::F32 => build::<f32>(&device, &config, engine, error, channels)?,
@@ -48,7 +57,7 @@ impl Audio {
         stream.play()?;
         Ok(Self {
             stream: Some(stream),
-            plugin_owners,
+            playback,
             _owner_thread: PhantomData,
             controls,
             device: name,
@@ -61,13 +70,12 @@ impl Drop for Audio {
         // stream releases its AudioUnit/callback before this returns. No plugin
         // owner may be released while its realtime proxy is still in a callback.
         drop(self.stream.take());
-        self.plugin_owners.clear();
     }
 }
 fn build<T: cpal::SizedSample + resonara_core::OutputSample>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    mut engine: Engine,
+    mut engine: PlaybackRenderer,
     error: Arc<Controls>,
     channels: usize,
 ) -> Result<cpal::Stream> {

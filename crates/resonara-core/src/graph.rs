@@ -2,7 +2,8 @@
 //!
 //! Project routing lowers to this graph; the explicit runtime API remains supported.
 //! Every reachable node executes once per nonempty render quantum. Structural
-//! changes require stopping playback and preparing a new Engine. All cycles are
+//! changes prepare a new Engine outside rendering; live playback can hand it
+//! off at a block boundary without closing the device. All cycles are
 //! rejected, including cycles containing Delay (feedback is not implemented).
 use crate::{ClapInsert, Result};
 use resonara_clap::{PluginOwner, RealtimePlugin};
@@ -186,6 +187,7 @@ struct Operation {
     inputs: Vec<Input>,
     slot: usize,
     calls: u64,
+    insert_control: Option<usize>,
 }
 
 /// Owns its immutable schedule, scratch storage and audio-thread-exclusive DSP state.
@@ -443,6 +445,7 @@ impl CompiledGraph {
                         .collect(),
                     slot: slots[index],
                     calls: 0,
+                    insert_control: None,
                 }
             })
             .collect();
@@ -468,6 +471,14 @@ impl CompiledGraph {
     pub fn take_plugin_owners(&mut self) -> Vec<PluginOwner> {
         std::mem::take(&mut self.plugin_owners)
     }
+    pub(crate) fn set_insert_controls(&mut self, controls: &[(NodeId, usize)]) {
+        for op in &mut self.operations {
+            op.insert_control = controls
+                .iter()
+                .find(|(id, _)| *id == op.id)
+                .map(|(_, slot)| *slot);
+        }
+    }
     pub fn info(&self) -> &GraphInfo {
         &self.info
     }
@@ -486,6 +497,7 @@ impl CompiledGraph {
         mixers: &mut [BlockMixer],
         buses: &mut [BlockMixer],
         send_gains: &[f32],
+        insert_bypasses: &[bool],
         mut source: impl FnMut(usize, &mut [[f32; 2]]),
     ) -> bool {
         debug_assert!(frames > 0 && frames <= self.info.quantum);
@@ -514,6 +526,11 @@ impl CompiledGraph {
                 }
             }
             let block = &mut self.scratch[start..start + frames];
+            if op.insert_control.is_some_and(|slot| insert_bypasses[slot]) {
+                // Dry passthrough, retaining the prepared effect's DSP state.
+                op.calls = op.calls.saturating_add(1);
+                continue;
+            }
             match &mut op.processor {
                 RuntimeProcessor::Clap(plugin) => {
                     if plugin.process(block).is_err() {

@@ -223,6 +223,51 @@ fn require_effect() {
 
 #[test]
 #[ignore = "requires built bundled CLAP effect; run with RESONARA_CLAP_LIBRARY and --include-ignored"]
+fn live_clap_bypass_parameter_and_removal_keep_transport_and_retire_off_callback() {
+    require_effect();
+    let mut p = project(saved_gain(0.5), false);
+    let (mut playback, mut renderer) = live::Playback::new(&p, 48000, 0, false).unwrap();
+    let mut output = [0.; 2];
+    renderer.render(&mut output, 2);
+    assert_eq!(output, [0.0625, -0.125]);
+    for (bypass, gain) in [(true, 0.5), (false, 0.5), (false, 2.), (true, 2.)] {
+        p.tracks[0].routing.inserts[0] = Insert {
+            kind: InsertKind::Clap {
+                plugin: saved_gain(gain),
+            },
+            bypass,
+        };
+        playback.update(&p).unwrap();
+        ALLOCS.with(|n| n.set(0));
+        FREES.with(|n| n.set(0));
+        AUDITING.with(|a| a.set(true));
+        renderer.render(&mut output, 2);
+        AUDITING.with(|a| a.set(false));
+        let gain = if bypass { 1. } else { gain as f32 };
+        assert_eq!(output, [0.125 * gain, -0.25 * gain]);
+        assert_eq!(ALLOCS.with(Cell::get), 0);
+        assert_eq!(FREES.with(Cell::get), 0);
+        assert!(playback.controls.playing.load(Ordering::Relaxed));
+        assert_eq!(
+            playback
+                .controls
+                .unavailable_plugins
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+    p.tracks[0].routing.inserts.clear();
+    playback.update(&p).unwrap();
+    renderer.render(&mut output, 2);
+    assert_eq!(output, [0.125, -0.25]);
+    assert_eq!(playback.controls.position.load(Ordering::Relaxed), 6);
+    // The backend destroys its render endpoint before the plugin lifecycle owner.
+    drop(renderer);
+    playback.collect_retired();
+}
+
+#[test]
+#[ignore = "requires built bundled CLAP effect; run with RESONARA_CLAP_LIBRARY and --include-ignored"]
 fn bundled_gain_parameter_and_opaque_state_roundtrip_render_and_export() {
     require_effect();
     let default = plugins::load_bundled_gain().unwrap();

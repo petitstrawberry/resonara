@@ -5,11 +5,21 @@ use std::{sync::atomic::AtomicU64, time::Duration};
 
 // Exercise the real render engine and transport state without opening a device.
 pub(super) struct TestAudio {
+    // Renderer is destroyed before its control-thread plugin owners.
+    engine: RefCell<resonara_core::live::PlaybackRenderer>,
+    playback: resonara_core::live::Playback,
     pub controls: Arc<resonara_core::Controls>,
     pub device: String,
-    engine: RefCell<resonara_core::Engine>,
 }
 impl TestAudio {
+    pub fn update(&mut self, project: &Project) -> Result<()> {
+        self.playback.update(project)?;
+        self.controls = self.playback.controls.clone();
+        Ok(())
+    }
+    pub fn collect_retired(&mut self) {
+        self.playback.collect_retired();
+    }
     pub fn is_finished(&self) -> bool {
         !self.controls.playing.load(Ordering::Relaxed)
     }
@@ -18,11 +28,11 @@ impl TestAudio {
     }
     pub fn start_with_metronome(project: &Project, start: u64, metronome: bool) -> Result<Self> {
         project.validate()?;
-        let controls = Arc::new(resonara_core::Controls::new(project));
-        controls.metronome.store(metronome, Ordering::Relaxed);
-        let engine =
-            resonara_core::Engine::try_new(project, controls.clone(), project.sample_rate, start)?;
+        let (playback, engine) =
+            resonara_core::live::Playback::new(project, project.sample_rate, start, metronome)?;
+        let controls = playback.controls.clone();
         Ok(Self {
+            playback,
             controls,
             device: "Test output".into(),
             engine: RefCell::new(engine),
@@ -57,6 +67,232 @@ fn project() -> Project {
             .collect(),
         ..Project::default()
     }
+}
+
+fn assert_playback_advances(s: &Daw, frames: usize) {
+    let m = s.model.borrow();
+    let audio = m.audio.as_ref().expect("edit stopped playback");
+    let before = audio.controls.position.load(Ordering::Relaxed);
+    audio.render(frames);
+    assert_eq!(
+        audio.controls.position.load(Ordering::Relaxed),
+        before + frames as u64
+    );
+    assert!(audio.controls.playing.load(Ordering::Relaxed));
+}
+
+#[test]
+fn playing_channel_rename_and_builtin_bypass_keep_engine_and_undo_live() {
+    let s = Daw::new(project());
+    s.add_insert(
+        RoutingTarget::Track(0),
+        resonara_core::InsertKind::Gain { gain: 0.5 },
+    );
+    s.play();
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    assert_playback_advances(&s, 1700);
+    s.edit("Rename channel", |m| {
+        m.project.tracks[0].name = "Live rename".into();
+        Ok(())
+    });
+    assert_playback_advances(&s, 17);
+    s.toggle_insert(RoutingTarget::Track(0), 0);
+    assert_playback_advances(&s, 17);
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    s.undo(false);
+    assert!(!s.model.borrow().project.tracks[0].routing.inserts[0].bypass);
+    assert_playback_advances(&s, 17);
+    s.undo(false);
+    assert_eq!(s.model.borrow().project.tracks[0].name, "Track 0");
+    s.undo(true);
+    s.undo(true);
+    assert!(s.model.borrow().project.tracks[0].routing.inserts[0].bypass);
+    assert_playback_advances(&s, 17);
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+}
+
+#[test]
+fn playing_structural_edits_inserts_routes_tracks_and_history_keep_transport() {
+    use resonara_core::{Destination, InsertKind};
+    let s = Daw::new(project());
+    s.play();
+    assert_playback_advances(&s, 1700);
+    let transport = s
+        .model
+        .borrow()
+        .audio
+        .as_ref()
+        .unwrap()
+        .controls
+        .position
+        .clone();
+    s.add_bus();
+    let bus = s.model.borrow().selected_bus.unwrap();
+    assert_playback_advances(&s, 31);
+    s.set_output(RoutingTarget::Track(0), Destination::Bus(bus));
+    s.add_send(RoutingTarget::Track(1), bus);
+    s.add_insert(RoutingTarget::Track(0), InsertKind::Gain { gain: 0.5 });
+    assert_playback_advances(&s, 31);
+    s.add_insert(RoutingTarget::Track(0), InsertKind::Delay { frames: 8 });
+    s.move_insert(RoutingTarget::Track(0), 1, -1);
+    s.remove_insert(RoutingTarget::Track(0), 0);
+    s.delete_bus(bus);
+    assert_playback_advances(&s, 31);
+    s.choose(0, None);
+    s.duplicate();
+    assert_playback_advances(&s, 31);
+    s.delete(true);
+    s.add_track(None);
+    assert_playback_advances(&s, 31);
+    s.undo(false);
+    s.undo(true);
+    assert_playback_advances(&s, 31);
+    assert!(Arc::ptr_eq(
+        &transport,
+        &s.model.borrow().audio.as_ref().unwrap().controls.position
+    ));
+}
+
+#[test]
+fn playing_region_drag_commits_or_cancels_without_stopping_or_seeking() {
+    for cancel in [false, true] {
+        let s = Daw::new(project());
+        s.snap.set(false);
+        s.play();
+        assert_playback_advances(&s, 2000);
+        let start = s.model.borrow().project.tracks[0].clips[0].start;
+        s.timeline_event(0, &press(100));
+        assert_eq!(
+            s.model
+                .borrow()
+                .audio
+                .as_ref()
+                .unwrap()
+                .controls
+                .position
+                .load(Ordering::Relaxed),
+            2000
+        );
+        s.timeline_event(0, &Event::Mouse(MouseEvent::Moved { x: 125, y: 40 }));
+        assert_playback_advances(&s, 31);
+        if cancel {
+            s.cancel_drag();
+        } else {
+            s.timeline_event(
+                0,
+                &Event::Mouse(MouseEvent::ButtonReleased {
+                    button: MouseButton::Left,
+                    x: 125,
+                    y: 40,
+                    click_count: 1,
+                }),
+            );
+        }
+        assert_playback_advances(&s, 31);
+        assert_eq!(s.model.borrow().undo.len(), usize::from(!cancel));
+        assert_eq!(
+            s.model.borrow().project.tracks[0].clips[0].start == start,
+            cancel
+        );
+    }
+}
+
+#[test]
+fn playing_save_export_and_import_keep_transport_running_during_io() {
+    let temp = Temp::new();
+    for action in [FileAction::Save, FileAction::Export, FileAction::Import] {
+        let s = Daw::new(project());
+        let path = temp.0.join(match action {
+            FileAction::Save => "live.json",
+            FileAction::Export => "live.wav",
+            _ => "import.wav",
+        });
+        if action == FileAction::Import {
+            project().export_wav(&path).unwrap();
+        }
+        s.play();
+        assert_playback_advances(&s, 1700);
+        s.start_io(action, path.clone());
+        assert_playback_advances(&s, 31);
+        finish_io(&s);
+        assert_playback_advances(&s, 31);
+        assert!(path.is_file());
+        if action == FileAction::Import {
+            assert_eq!(s.model.borrow().project.tracks.len(), 3);
+        }
+    }
+}
+
+#[test]
+fn playing_failed_edits_and_empty_history_leave_audio_untouched() {
+    let s = Daw::new(project());
+    s.play();
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    s.undo(false);
+    s.undo(true);
+    s.edit("Rejected rename", |_| Err("Empty name".into()));
+    s.edit("Rejected graph", |m| {
+        m.project.tracks[0]
+            .routing
+            .inserts
+            .push(resonara_core::Insert {
+                kind: resonara_core::InsertKind::Delay { frames: 0 },
+                bypass: false,
+            });
+        Ok(())
+    });
+    assert!(
+        s.model.borrow().project.tracks[0]
+            .routing
+            .inserts
+            .is_empty()
+    );
+    assert!(s.model.borrow().undo.is_empty());
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    assert_playback_advances(&s, 2000);
+}
+
+#[test]
+fn playing_missing_plugin_edit_warns_and_bypass_keeps_audio_running() {
+    let s = Daw::new(project());
+    s.play();
+    s.add_insert(
+        RoutingTarget::Track(0),
+        resonara_core::InsertKind::Clap {
+            plugin: resonara_core::ClapInsert {
+                library: "missing.clap".into(),
+                plugin_id: "org.example.missing".into(),
+                name: "Missing effect".into(),
+                parameters: vec![],
+                state: vec![],
+            },
+        },
+    );
+    assert!(
+        s.status
+            .get()
+            .contains("1 unavailable CLAP insert(s) bypassed")
+    );
+    assert_playback_advances(&s, 1700);
+    s.toggle_insert(RoutingTarget::Track(0), 0);
+    assert!(!s.status.get().contains("unavailable"));
+    assert_playback_advances(&s, 31);
+    s.undo(false);
+    assert!(
+        s.status
+            .get()
+            .contains("1 unavailable CLAP insert(s) bypassed")
+    );
+    assert_playback_advances(&s, 31);
 }
 
 fn assert_project(actual: &Project, expected: &Project) {

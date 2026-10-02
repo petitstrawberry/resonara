@@ -14,18 +14,31 @@ the existing in-app browser is used on Scarlet.
 
 ## Dependencies and build
 
-ScarletUI remains pinned to `cdd852eb22678b7b0d1c7e035c1f2b2ba4d057a7`.
-The portable renderer patch under `vendor/` is retained. Native audio uses
-`sas-client` from Scarlet `b3d2a55740a3d2ca49daad0ec7baba233f706f7a`, matching
-ScarletUI's native dependency source; that client and its SAS protocol are
-unchanged in the inspected Scarlet dev revision
-`0639a916dfd652e9b2c1ea740cacc1c09743d9eb`.
+ScarletUI is pinned to `2e5e96a5c29086c3b555c85f7835e81ecf529290`, including
+its merged Canvas resize fix. The former renderer patch is removed. The SWS
+protocol package under `vendor/sws-protocol` is updated to library
+sources from Scarlet `0639a916dfd652e9b2c1ea740cacc1c09743d9eb` (version 13).
+Both ScarletUI and its SWS client resolve to that one protocol package.
 
-The pinned SWS client defines capability-protocol version 11; that server reports
-13. Source comparison found only additive scene/GPU-extension messages and
-capability bits, with existing wire fields unchanged. Capability discovery
-accepts the server's reported version. This supports retaining the upstream UI
-pin, but is not a substitute for testing the actual SWS connection and renderer.
+The old SWS protocol dependency used capability version 11 while the inspected
+server reports 13. Although the wire changes are additive, ScarletUI requires
+exact version equality to enable its application SGFX renderer. The mismatch
+silently selected CPU painting, which ignores Canvas extensions; region text
+and playhead still appeared over the Canvas placeholder, but waveform, grid and
+region color did not. The provided screenshot's region pixels were `(6, 8, 14)`,
+exactly the placeholder color. Server-side GPU composition does not establish
+that the application selected its GPU paint backend.
+
+Updating the protocol supplies version 13 and preserves the upstream exact-match
+check and SGFX Canvas path. `sws-client`, `sas-client` and SGFX retain the shared
+Scarlet runtime pin `b3d2a55740a3d2ca49daad0ec7baba233f706f7a`: their connection
+and audio implementations are unchanged in the inspected revision. Updating
+only the client runtime would duplicate `scarlet-os` identities and its global
+event-return trampoline. The protocol has no runtime dependency with normal
+`std`, so it can be updated independently. Its optional legacy facade retains
+the shared runtime pin. `scripts/check-dependencies` checks the protocol, UI and
+runtime identities. Remove this protocol patch when upstream ScarletUI and SGFX
+update their dependencies together.
 
 Enter the inspected Scarlet checkout's pinned development shell, then run:
 
