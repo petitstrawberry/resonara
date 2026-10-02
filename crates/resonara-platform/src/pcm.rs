@@ -182,6 +182,7 @@ mod tests {
         project.tracks[0].pan = 0.;
         project.master = 1.;
         project.tracks[0].clips = vec![Clip {
+            edit: Default::default(),
             source_channels: 2,
             start: 0,
             source_offset: 0,

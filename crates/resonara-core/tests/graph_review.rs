@@ -22,6 +22,7 @@ fn project() -> Project {
                 name: format!("review {track}"),
                 clips: vec![Clip {
                     source_channels: 2,
+                    edit: Default::default(),
                     start: 3 * track as u64,
                     source_offset: 2,
                     frames: 143,

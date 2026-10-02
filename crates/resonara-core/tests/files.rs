@@ -80,6 +80,52 @@ fn save_load_and_export_preserve_edited_mix() {
         .unwrap();
     assert_eq!(got, expected);
 }
+
+#[test]
+fn non_destructive_region_edits_survive_save_load_and_wav_export() {
+    let d = Temp::new();
+    let mut p = Project::demo();
+    p.tracks.truncate(1);
+    p.master = 1.;
+    p.tracks[0].gain = 1.;
+    p.tracks[0].pan = 0.;
+    let region = &mut p.tracks[0].clips[0];
+    let source = region.samples.clone();
+    region.edit.reversed = true;
+    region.edit.gain_db = -3.;
+    region.set_fades(8_000, 6_000).unwrap();
+    region.trim_relative(2_000, 16_000).unwrap();
+    let right = region.split_relative(5_000).unwrap();
+    p.tracks[0].clips.push(right);
+    let expected = p.tracks[0]
+        .clips
+        .iter()
+        .flat_map(|region| (0..region.frames).flat_map(move |frame| region.sample_at(frame as f64)))
+        .collect::<Vec<_>>();
+    assert!(
+        p.tracks[0]
+            .clips
+            .iter()
+            .all(|region| Arc::ptr_eq(&region.samples, &source))
+    );
+    let session = d.0.join("region-edits.json");
+    p.save(&session).unwrap();
+    let loaded = Project::load(&session).unwrap();
+    assert_eq!(loaded.tracks[0].clips[0].samples, source);
+    assert_eq!(
+        serde_json::to_value(&loaded).unwrap(),
+        serde_json::to_value(&p).unwrap()
+    );
+    let exported = d.0.join("region-edits.wav");
+    loaded.export_wav(&exported).unwrap();
+    let mut wav = hound::WavReader::open(exported).unwrap();
+    let samples = wav
+        .samples::<f32>()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(&samples[..4_000], &[0.; 4_000]);
+    assert_eq!(&samples[4_000..], expected);
+}
 #[test]
 fn imports_mono_pcm_and_resamples() {
     let d = Temp::new();
@@ -248,6 +294,7 @@ fn legacy_projects_default_to_stereo_without_guessing_from_equal_samples() {
             name: "known mono".into(),
             clips: vec![Clip {
                 source_channels: 1,
+                edit: Default::default(),
                 start: 0,
                 source_offset: 0,
                 frames: 3,

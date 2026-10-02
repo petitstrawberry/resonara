@@ -46,6 +46,9 @@ macro_rules! row { ($($v:expr),* $(,)?) => { HStack::new(Children(vec![$(Box::ne
 mod channel_strip;
 mod insert_editor;
 mod inspector;
+mod lower_panel;
+mod region_editor;
+mod region_processing;
 mod routing;
 mod send_editor;
 
@@ -199,8 +202,11 @@ struct Daw {
     inspector_fader_focus: State<bool>,
     inspector_pan_focus: State<bool>,
     inspector_fraction: State<f32>,
-    mixer_fraction: State<f32>,
-    mixer_visible: State<bool>,
+    panel_fraction: State<f32>,
+    panel_visible: State<bool>,
+    panel_tab: State<usize>,
+    region_editor: Rc<region_editor::RegionEditor>,
+    region_job: Rc<RefCell<Option<region_processing::RegionJob>>>,
     snap: State<bool>,
     tool: State<usize>,
     view_start: State<f64>,
@@ -290,8 +296,11 @@ impl Daw {
             inspector_fader_focus: state(40, false),
             inspector_pan_focus: state(41, false),
             inspector_fraction: state(26, 0.185),
-            mixer_fraction: state(27, 0.),
-            mixer_visible: state(18, true),
+            panel_fraction: state(27, 0.),
+            panel_visible: state(18, true),
+            panel_tab: state(42, lower_panel::PanelTab::Mixer as usize),
+            region_editor: Rc::new(region_editor::RegionEditor::new()),
+            region_job: Rc::new(RefCell::new(None)),
             snap: state(19, true),
             tool: state(20, 0),
             view_start: state(21, 0.),
@@ -493,6 +502,7 @@ impl Daw {
         }
         drop(m);
         self.update_frames();
+        self.refresh_region_editor();
         self.changed();
     }
     fn animate_playhead(&self, position: f64) {
@@ -1135,6 +1145,20 @@ impl Daw {
                 m.selected_bus = None;
                 self.routing_menu.set(None);
                 m.clip = hit;
+                if matches!(
+                    e,
+                    Event::Mouse(MouseEvent::ButtonPressed {
+                        click_count: 2..,
+                        ..
+                    })
+                ) && hit.is_some()
+                {
+                    m.drag = None;
+                    drop(m);
+                    self.open_editor_panel();
+                    self.refresh(true);
+                    return true;
+                }
                 if let Some(ci) = hit {
                     let c = m.project.tracks[index].clips[ci].clone();
                     let start = (c.start as f64 / rate as f64 - self.view_start.get())
@@ -1207,22 +1231,33 @@ impl Daw {
                     DragMode::Left => {
                         let wanted = (quantize(c.start as f64 / rate as f64 + delta) * rate as f64)
                             .round() as i64;
+                        let available = if c.edit.reversed {
+                            c.samples.len() - c.source_offset - c.frames
+                        } else {
+                            c.source_offset
+                        };
                         let diff = (wanted - c.start as i64).clamp(
-                            -(c.source_offset as i64).min(c.start as i64),
+                            -(available as i64).min(c.start as i64),
                             c.frames.saturating_sub(1) as i64,
                         );
-                        c.start = (c.start as i64 + diff) as u64;
-                        c.source_offset = (c.source_offset as i64 + diff) as usize;
-                        c.frames = (c.frames as i64 - diff) as usize;
+                        if let Err(error) = c.resize_relative(diff, c.frames as i64) {
+                            self.status.set(format!("Could not trim region: {error}"));
+                        }
                     }
                     DragMode::Right => {
                         let wanted =
                             (quantize((c.start + c.frames as u64) as f64 / rate as f64 + delta)
                                 * rate as f64)
                                 .round() as i64;
-                        let length = (wanted - c.start as i64)
-                            .clamp(1, (c.samples.len() - c.source_offset) as i64);
-                        c.frames = length as usize;
+                        let maximum = if c.edit.reversed {
+                            c.source_offset + c.frames
+                        } else {
+                            c.samples.len() - c.source_offset
+                        };
+                        let length = (wanted - c.start as i64).clamp(1, maximum as i64);
+                        if let Err(error) = c.resize_relative(0, length) {
+                            self.status.set(format!("Could not trim region: {error}"));
+                        }
                     }
                 }
                 self.status.set(format!(
@@ -1769,7 +1804,8 @@ impl Daw {
                     self.mix(i, None, None, Some(false));
                 }
             }
-            KeyCode::Char('x' | 'X') => self.mixer_visible.set(!self.mixer_visible.get()),
+            KeyCode::Char('x' | 'X') => self.toggle_panel(lower_panel::PanelTab::Mixer),
+            KeyCode::Char('e' | 'E') => self.toggle_panel(lower_panel::PanelTab::Editor),
             KeyCode::Char('i' | 'I') => self.inspector.set(!self.inspector.get()),
             KeyCode::Char('1') => self.tool.set(0),
             KeyCode::Char('2') => self.tool.set(1),
@@ -1958,7 +1994,7 @@ impl Daw {
                     .frame(size.width, (size.height - 60.).max(100.)),
             )
         };
-        let layout=AnyView::new(vstack!{self.ruler(),TrackArea(content,None),row!{self.icon(Icon::ChevronLeft,"Scroll timeline left",false,|s|{s.scroll_timeline(-s.view_span.get()*0.5);}),caption(format!("{:.2}s — {:.2}s",self.view_start.get(),self.view_start.get()+self.view_span.get())),Spacer::new(),caption("Drag region • edge = trim • S = split"),self.icon(Icon::ChevronRight,"Scroll timeline right",false,|s|{s.scroll_timeline(s.view_span.get()*0.5);})}.spacing(6.).padding_insets(EdgeInsets::new(8.,0.,8.,0.)).frame_height(30.).background(PANEL)}.spacing(0.).background(BG).on_geometry_change(|g|g.size(),move|size|{let old=resize.arrangement_size.get();if(old.width-size.width).abs()>1.||(old.height-size.height).abs()>1.{resize.arrangement_size.set(size);if resize.mixer_visible.get(){let full=(resize.size.get().height-44.-66.-36.-28.-4.).max(1.);resize.mixer_fraction.set((size.height/full).clamp(0.1,0.9));}resize.refresh(true);}}));
+        let layout=AnyView::new(vstack!{self.ruler(),TrackArea(content,None),row!{self.icon(Icon::ChevronLeft,"Scroll timeline left",false,|s|{s.scroll_timeline(-s.view_span.get()*0.5);}),caption(format!("{:.2}s — {:.2}s",self.view_start.get(),self.view_start.get()+self.view_span.get())),Spacer::new(),caption("Drag region • edge = trim • S = split"),self.icon(Icon::ChevronRight,"Scroll timeline right",false,|s|{s.scroll_timeline(s.view_span.get()*0.5);})}.spacing(6.).padding_insets(EdgeInsets::new(8.,0.,8.,0.)).frame_height(30.).background(PANEL)}.spacing(0.).background(BG).on_geometry_change(|g|g.size(),move|size|{let old=resize.arrangement_size.get();if(old.width-size.width).abs()>1.||(old.height-size.height).abs()>1.{resize.arrangement_size.set(size);if resize.panel_visible.get(){let full=(resize.size.get().height-44.-66.-36.-28.-4.).max(1.);resize.panel_fraction.set((size.height/full).clamp(0.1,0.9));}resize.refresh(true);}}));
         let wheel = self.clone();
         AnyView::new(HorizontalWheel(
             layout,
@@ -1975,7 +2011,7 @@ impl Daw {
         let available = (self.size.get().height - 174.).max(320.) - 4.;
         let max_first = (available - MIXER_MIN_HEIGHT).max(0.);
         let min_first = (available - MIXER_MAX_HEIGHT).max(230.).min(max_first);
-        let first = (available * self.mixer_fraction.get()).clamp(min_first, max_first);
+        let first = (available * self.panel_fraction.get()).clamp(min_first, max_first);
         (available - first - MIXER_HEADER_HEIGHT - MIXER_STRIP_OVERHEAD)
             .clamp(112., MIXER_FADER_MAX_HEIGHT)
     }
@@ -2013,7 +2049,7 @@ impl Daw {
             label(format!("Gain {}",ui::db(m.project.master))).font_size(10.).alignment(Alignment::Center).frame(90.,14.),animation::Readout::new(self.master_meter.clone(),9.,ACCENT,Size::new(90.,12.)).on_hover(move||master_status.set(master_peak.get().detail(true)))
         }.spacing(2.).padding(4.).frame(100.,strip_height - 2.).background(RAISED).border(LINE,1.)));
         let width = channels.len() as f32 * 100.;
-        AnyView::new(vstack!{row!{caption("MIXER"),caption(format!("{} audio · {} aux",m.project.tracks.len(),m.project.buses.len())),self.header_button("+ Aux", "Create an aux channel and its input bus", |s|s.add_bus()),Spacer::new(),self.icon(Icon::X,"Hide mixer · X",false,|s|s.mixer_visible.set(false))}.spacing(12.).padding_insets(EdgeInsets::new(12.,0.,8.,0.)).frame_height(MIXER_HEADER_HEIGHT).background(PANEL),ScrollView::new(HStack::new(Children(channels)).spacing(0.).alignment(Alignment::TopLeading)).both_axes().content_size(width,strip_height).frame_height(strip_height)}.spacing(0.).background(BG))
+        AnyView::new(vstack!{self.lower_panel_header(),ScrollView::new(HStack::new(Children(channels)).spacing(0.).alignment(Alignment::TopLeading)).both_axes().content_size(width,strip_height).frame_height(strip_height)}.spacing(0.).background(BG))
     }
     fn toolbar(&self) -> AnyView {
         let m = self.model.borrow();
@@ -2065,7 +2101,7 @@ impl Daw {
             self.header_button(if self.tool.get()==0{"• Pointer  1"}else{"Pointer  1"},"Pointer: select, move, trim edges · 1",|s|s.tool.set(0)),self.header_button(if self.tool.get()==1{"• Split  2"}else{"Split  2"},"Scissors: click a region to split · 2",|s|s.tool.set(1)),
             self.header_button(&snap,"Toggle snapping to the displayed musical/time/sample grid",|s|s.snap.set(!s.snap.get())),Spacer::new(),
             self.header_button(if self.follow_playhead.get(){"Follow"}else{"Fixed"},"Toggle playhead-follow scrolling",|s|s.toggle_follow()),self.header_icon(Icon::ZoomOut,"Zoom out · −",false,|s|s.zoom(2.)),self.header_icon(Icon::ZoomIn,"Zoom in · +",false,|s|s.zoom(0.5)),self.header_button("Fit","Fit project to timeline · F",|s|s.fit()),Rectangle::new().fill(LINE).frame(1.,20.),
-            self.header_icon(Icon::List,"Toggle inspector · I",self.inspector.get(),|s|s.inspector.set(!s.inspector.get())),self.header_icon(Icon::Adjustments,"Toggle mixer · X",self.mixer_visible.get(),|s|s.mixer_visible.set(!s.mixer_visible.get()))
+            self.header_icon(Icon::List,"Toggle inspector · I",self.inspector.get(),|s|s.inspector.set(!s.inspector.get())),self.header_icon(Icon::Adjustments,"Mixer · X",self.panel_visible.get() && self.panel_mode()==lower_panel::PanelTab::Mixer,|s|s.toggle_panel(lower_panel::PanelTab::Mixer)),self.header_icon(Icon::Pencil,"Selected-region editor · E",self.panel_visible.get() && self.panel_mode()==lower_panel::PanelTab::Editor,|s|s.toggle_panel(lower_panel::PanelTab::Editor))
         }.spacing(6.).padding_insets(EdgeInsets::new(10.,3.,10.,3.)).frame_height(36.).background(PANEL))
     }
     fn workspace(&self) -> AnyView {
@@ -2073,13 +2109,21 @@ impl Daw {
         let height = (size.height - 44. - 66. - 36. - 28.).max(320.);
         // The inspector owns the full work-area height. Only the right pane
         // splits vertically, so mixer channels never extend under the inspector.
-        let right = if self.mixer_visible.get() {
+        let right = if self.panel_visible.get() {
             AnyView::new(
-                SplitView::new(self.arrangement(), self.mixer())
+                SplitView::new(self.arrangement(), self.lower_panel())
                     .axis(SplitAxis::Vertical)
-                    .fraction(self.mixer_fraction.get())
-                    .min_first((height - 4. - MIXER_MAX_HEIGHT).max(230.))
-                    .min_second(MIXER_MIN_HEIGHT)
+                    .fraction(self.panel_fraction.get())
+                    .min_first(if self.panel_mode() == lower_panel::PanelTab::Mixer {
+                        (height - 4. - MIXER_MAX_HEIGHT).max(230.)
+                    } else {
+                        160.
+                    })
+                    .min_second(if self.panel_mode() == lower_panel::PanelTab::Mixer {
+                        MIXER_MIN_HEIGHT
+                    } else {
+                        260.
+                    })
                     .divider_thickness(4.)
                     .divider_colors(LINE, ACCENT)
                     .frame_height(height),
@@ -2207,7 +2251,7 @@ impl Daw {
                     "1   Pointer       2   Scissors       S   Split at playhead",
                     "Drag a region to move it. Drag either edge to trim it.",
                     "Snap follows the display: musical notes/bars, 100 ms, or one sample. C toggles the metronome.",
-                    "+ / −   Zoom       F   Fit project       I   Inspector       X   Mixer",
+                    "+ / −   Zoom       F   Fit project       I   Inspector       X   Mixer       E   Editor",
                     "↑ / ↓   Select track       M   Mute       Delete   Delete region",
                     "Ctrl/Cmd + Z   Undo       Shift + Ctrl/Cmd + Z   Redo",
                     "Ctrl/Cmd + D   Duplicate track       Ctrl/Cmd + I   Import audio",
@@ -2389,8 +2433,9 @@ impl View for Daw {
             &self.inspector,
             &self.inspector_details,
             &self.inspector_fraction,
-            &self.mixer_fraction,
-            &self.mixer_visible,
+            &self.panel_fraction,
+            &self.panel_visible,
+            &self.panel_tab,
             &self.snap,
             &self.tool,
             &self.view_start,
@@ -2475,6 +2520,7 @@ impl Application for Daw {
         }
         self.poll_picker();
         self.poll_io();
+        self.poll_region_processing();
         let dragging = {
             let m = self.model.borrow();
             self.master_dragging.get()

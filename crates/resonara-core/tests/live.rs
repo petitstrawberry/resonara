@@ -8,6 +8,7 @@ fn source() -> Project {
     p.tracks[0].pan = 0.;
     p.tracks[0].clips = vec![Clip {
         source_channels: 2,
+        edit: Default::default(),
         start: 0,
         source_offset: 0,
         frames: 100_000,

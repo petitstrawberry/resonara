@@ -83,6 +83,7 @@ fn project(plugin: ClapInsert, bypass: bool) -> Project {
             name: "CLAP source".into(),
             clips: vec![Clip {
                 source_channels: 2,
+                edit: Default::default(),
                 start: 0,
                 source_offset: 0,
                 frames: 512,

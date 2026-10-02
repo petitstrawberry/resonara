@@ -1,5 +1,5 @@
 //! Control-thread preparation and bounded, lock-free audio graph handoff.
-use crate::{Controls, Engine, OutputSample, PluginOwner, Project, Result};
+use crate::{Controls, Engine, OutputSample, PluginOwner, Project, RegionSources, Result};
 use std::{
     collections::HashMap,
     marker::PhantomData,
@@ -11,9 +11,18 @@ use std::{
     },
 };
 
+enum PreparedUpdate {
+    Graph(Box<Engine>),
+    Sources {
+        /// The Engine allocation identifies the exact routing generation.
+        generation: usize,
+        sources: RegionSources,
+    },
+}
+
 struct Slots {
-    pending: AtomicPtr<Engine>,
-    retired: AtomicPtr<Engine>,
+    pending: AtomicPtr<PreparedUpdate>,
+    retired: AtomicPtr<PreparedUpdate>,
 }
 impl Drop for Slots {
     fn drop(&mut self) {
@@ -97,6 +106,12 @@ impl Playback {
         project.validate_routing()?;
         self.collect_retired();
         if same_structure(&self.project, project) {
+            // Prepare all fallible source work before changing live controls.
+            let sources = if same_sources(&self.project, project) {
+                None
+            } else {
+                Some(RegionSources::prepare(project)?)
+            };
             for (control, track) in self.controls.tracks.iter().zip(&project.tracks) {
                 control.set(track);
             }
@@ -136,6 +151,9 @@ impl Playback {
             self.controls
                 .unavailable_plugins
                 .store(missing, Ordering::Relaxed);
+            if let Some(sources) = sources {
+                self.publish_sources(sources);
+            }
             self.project = project.clone();
             return Ok(());
         }
@@ -162,16 +180,45 @@ impl Playback {
         let next_controls = engine.controls.clone();
         self.close_editors()?;
         let owners = engine.take_keyed_plugin_owners();
-        let pointer = Box::into_raw(engine);
-        self.owners.insert(pointer as usize, owners);
+        let generation = (&*engine as *const Engine) as usize;
+        self.owners.insert(generation, owners);
+        let pointer = Box::into_raw(Box::new(PreparedUpdate::Graph(engine)));
         // swap transfers sole ownership of the old pending box to this thread;
         // a concurrent consumer either takes it first or takes the new box.
-        self.current = pointer as usize;
+        self.current = generation;
         let superseded = self.slots.pending.swap(pointer, Ordering::AcqRel);
         self.dispose(superseded);
         self.controls = next_controls;
         self.project = project.clone();
         Ok(())
+    }
+
+    fn publish_sources(&mut self, mut sources: RegionSources) {
+        // There is one producer. Taking the pending command gives this thread
+        // exclusive ownership; a racing callback either took it first or sees
+        // an empty mailbox for this block. A pending graph must survive newer
+        // region edits so the source data can never target the wrong layout.
+        let pending = self.slots.pending.swap(ptr::null_mut(), Ordering::AcqRel);
+        if !pending.is_null() {
+            let update = unsafe { &mut *pending };
+            if let PreparedUpdate::Graph(engine) = update
+                && (&**engine as *const Engine) as usize == self.current
+            {
+                engine.swap_sources(&mut sources);
+                self.slots.pending.store(pending, Ordering::Release);
+                // `sources` now holds the replaced, unpublished snapshot and
+                // is destroyed here on the control thread.
+                return;
+            }
+            self.dispose(pending);
+        }
+        let update = Box::new(PreparedUpdate::Sources {
+            generation: self.current,
+            sources,
+        });
+        self.slots
+            .pending
+            .store(Box::into_raw(update), Ordering::Release);
     }
 
     /// Slot is the flattened track-then-bus insert index in this generation.
@@ -255,13 +302,18 @@ impl Playback {
         self.dispose(retired);
     }
 
-    fn dispose(&mut self, pointer: *mut Engine) {
+    fn dispose(&mut self, pointer: *mut PreparedUpdate) {
         if !pointer.is_null() {
             // Removed atomically from a mailbox; no renderer can access it.
-            unsafe {
-                drop(Box::from_raw(pointer));
+            let update = unsafe { Box::from_raw(pointer) };
+            let generation = match &*update {
+                PreparedUpdate::Graph(engine) => Some((&**engine as *const Engine) as usize),
+                PreparedUpdate::Sources { .. } => None,
+            };
+            drop(update);
+            if let Some(generation) = generation {
+                self.owners.remove(&generation);
             }
-            self.owners.remove(&(pointer as usize));
         }
     }
 }
@@ -286,12 +338,28 @@ impl PlaybackRenderer {
             return;
         }
         // The mailbox grants this endpoint exclusive ownership of the box.
-        let mut next = unsafe { Box::from_raw(next) };
-        next.continue_from(&self.active);
-        let old = std::mem::replace(&mut self.active, next);
+        let mut update = unsafe { Box::from_raw(next) };
+        match &mut *update {
+            PreparedUpdate::Graph(next) => {
+                next.continue_from(&self.active);
+                std::mem::swap(&mut self.active, next);
+            }
+            PreparedUpdate::Sources {
+                generation,
+                sources,
+            } => {
+                if *generation == (&*self.active as *const Engine) as usize {
+                    self.active.swap_sources(sources);
+                }
+                // A mismatched snapshot is retired intact, never dropped in
+                // the callback. Publication normally prevents this case.
+            }
+        }
+        // Reuse the prepared command allocation to retire the old graph or
+        // sources. Adopting either kind performs neither allocation nor free.
         self.slots
             .retired
-            .store(Box::into_raw(old), Ordering::Release);
+            .store(Box::into_raw(update), Ordering::Release);
     }
     pub fn engine_mut(&mut self) -> &mut Engine {
         &mut self.active
@@ -309,20 +377,28 @@ fn same_structure(a: &Project, b: &Project) -> bool {
         && a.time_signature == b.time_signature
         && a.tracks.len() == b.tracks.len()
         && a.buses.len() == b.buses.len()
-        && a.tracks.iter().zip(&b.tracks).all(|(a, b)| {
-            same_routing(&a.routing, &b.routing)
-                && a.clips.len() == b.clips.len()
-                && a.clips.iter().zip(&b.clips).all(|(a, b)| {
-                    a.start == b.start
-                        && a.frames == b.frames
-                        && a.source_offset == b.source_offset
-                        && Arc::ptr_eq(&a.samples, &b.samples)
-                })
-        })
+        && a.tracks
+            .iter()
+            .zip(&b.tracks)
+            .all(|(a, b)| same_routing(&a.routing, &b.routing))
         && a.buses
             .iter()
             .zip(&b.buses)
             .all(|(a, b)| a.id == b.id && same_routing(&a.routing, &b.routing))
+}
+fn same_sources(a: &Project, b: &Project) -> bool {
+    a.tracks.len() == b.tracks.len()
+        && a.tracks.iter().zip(&b.tracks).all(|(a, b)| {
+            a.clips.len() == b.clips.len()
+                && a.clips.iter().zip(&b.clips).all(|(a, b)| {
+                    a.start == b.start
+                        && a.frames == b.frames
+                        && a.source_offset == b.source_offset
+                        && a.source_channels == b.source_channels
+                        && a.edit == b.edit
+                        && Arc::ptr_eq(&a.samples, &b.samples)
+                })
+        })
 }
 fn same_routing(a: &crate::ChannelRouting, b: &crate::ChannelRouting) -> bool {
     a.output == b.output
@@ -335,4 +411,66 @@ fn same_routing(a: &crate::ChannelRouting, b: &crate::ChannelRouting) -> bool {
         && a.sends.iter().zip(&b.sends).all(|(a, b)| {
             a.target == b.target && a.pre_fader == b.pre_fader && a.enabled == b.enabled
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires built bundled CLAP effect; set RESONARA_CLAP_LIBRARY"]
+    fn region_snapshots_keep_the_exact_live_clap_owner_and_proxy() {
+        let plugin = crate::plugins::load_bundled_gain().unwrap();
+        let mut project = Project::demo();
+        project.tracks.truncate(1);
+        project.tracks[0].routing.inserts.push(crate::Insert {
+            kind: crate::InsertKind::Clap { plugin },
+            bypass: false,
+        });
+        let (mut playback, mut renderer) = Playback::new(&project, 48_000, 0, false).unwrap();
+        let generation = playback.current;
+        assert_eq!(playback.owners[&generation].len(), 1);
+        let owner = &playback.owners[&generation][0].1 as *const PluginOwner;
+        let engine = renderer.engine_mut() as *const Engine;
+        let controls = playback.controls.clone();
+        let mut samples = [0.; 16];
+        for change in 0..6 {
+            let clip = &mut project.tracks[0].clips[0];
+            match change {
+                0 => clip.set_gain_db(-3.).unwrap(),
+                1 => clip.set_reversed(true),
+                2 => clip.set_fades(1000, 2000).unwrap(),
+                3 => clip.trim_relative(100, clip.frames - 100).unwrap(),
+                4 => {
+                    clip.samples = Arc::new(vec![[0.125; 2]; clip.frames]);
+                    clip.source_offset = 0;
+                }
+                _ => {
+                    let right = clip.split_relative(clip.frames / 2).unwrap();
+                    project.tracks[0].clips.push(right);
+                }
+            }
+            playback.update(&project).unwrap();
+            renderer.render(&mut samples, 2);
+            assert_eq!(playback.current, generation);
+            assert_eq!(renderer.engine_mut() as *const Engine, engine);
+            assert!(Arc::ptr_eq(&controls, &playback.controls));
+            assert_eq!(
+                &playback.owners[&generation][0].1 as *const PluginOwner,
+                owner
+            );
+            assert!(playback.owners[&generation][0].1.realtime_alive());
+            assert!(
+                playback.owners[&generation][0]
+                    .1
+                    .editor_snapshot(true)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(!controls.error.load(Ordering::Relaxed));
+            assert!(controls.playing.load(Ordering::Relaxed));
+        }
+        drop(renderer);
+        playback.collect_retired();
+    }
 }

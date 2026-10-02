@@ -7,6 +7,7 @@ fn project(samples: Vec<[f32; 2]>) -> Project {
             name: "Source".into(),
             clips: vec![Clip {
                 source_channels: 2,
+                edit: Default::default(),
                 start: 0,
                 source_offset: 0,
                 frames: samples.len(),

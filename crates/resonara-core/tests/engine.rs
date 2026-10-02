@@ -39,6 +39,7 @@ fn constant(value: f32, start: u64, frames: usize) -> Track {
         name: "test".into(),
         clips: vec![Clip {
             source_channels: 2,
+            edit: Default::default(),
             start,
             source_offset: 0,
             frames,
@@ -257,6 +258,9 @@ fn initial_transport_position_is_published_before_first_callback() {
 #[test]
 fn callback_never_allocates_or_frees() {
     let mut p = Project::demo();
+    p.tracks[0].clips[0].edit.reversed = true;
+    p.tracks[0].clips[0].edit.gain_db = -3.;
+    p.tracks[0].clips[0].set_fades(24_000, 24_000).unwrap();
     p.split(0, 12345).unwrap();
     p.split(0, 48000).unwrap();
     let c = Arc::new(Controls::new(&p));
@@ -315,6 +319,7 @@ fn compiled_default_matches_independent_flat_mixer_at_multiple_rates() {
                 .rev()
                 .map(|part| Clip {
                     source_channels: 2,
+                    edit: Default::default(),
                     start: part * 14 + index * 3,
                     source_offset: part as usize * 7,
                     frames: 20,

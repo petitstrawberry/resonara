@@ -74,7 +74,7 @@ impl TestAudio {
             engine: RefCell::new(engine),
         })
     }
-    fn render(&self, frames: usize) {
+    pub(super) fn render(&self, frames: usize) {
         self.engine
             .borrow_mut()
             .render(&mut vec![0f32; frames * 2], 2);
@@ -88,6 +88,7 @@ fn project() -> Project {
             .map(|i| Track {
                 name: format!("Track {i}"),
                 clips: vec![Clip {
+                    edit: Default::default(),
                     source_channels: 2,
                     start: 1600,
                     source_offset: 400,
@@ -2573,6 +2574,7 @@ fn stereo_meter_project() -> Project {
     p.master = 2.;
     for (track, sample) in p.tracks.iter_mut().zip([[0.75, -0.25], [0.25, 0.125]]) {
         track.clips = vec![Clip {
+            edit: Default::default(),
             source_channels: 2,
             start: 0,
             source_offset: 0,
@@ -2937,6 +2939,7 @@ fn expected_wave_rect(
 fn waveform_vertices_draw_true_stereo_lanes_and_one_mono_lane_at_each_height() {
     let mut track = project().tracks.remove(0);
     track.clips = vec![Clip {
+        edit: Default::default(),
         source_channels: 2,
         start: 0,
         source_offset: 0,
@@ -3040,6 +3043,7 @@ fn waveform_vertices_draw_true_stereo_lanes_and_one_mono_lane_at_each_height() {
 #[test]
 fn waveform_projection_clamps_viewport_and_source_trim_without_exposing_neighbor_samples() {
     let clip = Clip {
+        edit: Default::default(),
         source_channels: 2,
         start: 64,
         source_offset: 30,
@@ -3333,6 +3337,7 @@ fn region_native_labels_follow_source_lanes_and_waveform_clicks_preserve_selecti
 fn selected_waveform_draws_trim_handles_only_at_real_visible_clip_endpoints() {
     let mut track = project().tracks.remove(0);
     track.clips = vec![Clip {
+        edit: Default::default(),
         source_channels: 2,
         start: 8000,
         source_offset: 0,
@@ -3474,7 +3479,7 @@ fn playback_only_updates_do_not_notify_root_dependencies_after_layout_settles() 
         .collect::<Vec<_>>();
     assert!(
         counts.iter().all(|count| *count == 0),
-        "playback notified root dependencies [revision,size,arrangement,dialog,inspector,inspector_fraction,mixer_fraction,mixer_visible,snap,tool,view_start,view_span,dialog_error]: {counts:?}"
+        "playback notified root dependencies [revision,size,arrangement,dialog,inspector,inspector_fraction,panel_fraction,panel_visible,snap,tool,view_start,view_span,dialog_error]: {counts:?}"
     );
     tree.clear_root();
 }
@@ -3905,9 +3910,9 @@ fn hiding_mixer_fills_arrangement_and_restores_split_after_resize() {
             for _ in 0..8 {
                 let _ = pipeline.render();
             }
-            let split = s.mixer_fraction.get();
+            let split = s.panel_fraction.get();
             let before = s.arrangement_size.get().height;
-            s.mixer_visible.set(false);
+            s.panel_visible.set(false);
             for _ in 0..8 {
                 let _ = pipeline.render();
             }
@@ -3918,7 +3923,7 @@ fn hiding_mixer_fills_arrangement_and_restores_split_after_resize() {
                 s.arrangement_size.get()
             );
             assert!(s.arrangement_size.get().height > before + 280.);
-            assert_eq!(s.mixer_fraction.get(), split);
+            assert_eq!(s.panel_fraction.get(), split);
 
             s.sync_content_size(Size::new(1280., 1032.));
             pipeline.resize(Size::new(1280., 1032.));
@@ -3926,8 +3931,8 @@ fn hiding_mixer_fills_arrangement_and_restores_split_after_resize() {
                 let _ = pipeline.render();
             }
             assert!((s.arrangement_size.get().height - 826.).abs() <= 1.);
-            assert_eq!(s.mixer_fraction.get(), split);
-            s.mixer_visible.set(true);
+            assert_eq!(s.panel_fraction.get(), split);
+            s.panel_visible.set(true);
             for _ in 0..8 {
                 let _ = pipeline.render();
             }
@@ -3936,7 +3941,7 @@ fn hiding_mixer_fills_arrangement_and_restores_split_after_resize() {
             assert!(mixer_height <= MIXER_MAX_HEIGHT + 1.);
             assert!(mixer_height >= MIXER_MIN_HEIGHT - 1.);
             assert!(
-                (s.mixer_fraction.get() - s.arrangement_size.get().height / available).abs()
+                (s.panel_fraction.get() - s.arrangement_size.get().height / available).abs()
                     < 0.002
             );
             assert_eq!(s.view_start.get(), 0.25);
@@ -4152,7 +4157,7 @@ fn gain_scale_targets_ignore_meter_and_gaps_and_cancel_restores_gain() {
 fn context_tree(s: &Daw) -> scarlet_ui::ElementTree {
     s.size.set(Size::new(1000., 790.));
     s.inspector.set(false);
-    s.mixer_visible.set(false);
+    s.panel_visible.set(false);
     let mut tree = scarlet_ui::ElementTree::new();
     tree.set_root(s.create_element());
     tree.layout(scarlet_ui::LayoutConstraints::tight(1000., 790.));
@@ -4598,7 +4603,7 @@ fn mixer_divider_resizes_meter_and_fader_within_the_content_limits() {
     }
     let available = s.size.get().height - 174. - 4.;
     for requested in [0., 1., 0.55, 0.65] {
-        s.mixer_fraction.set(requested);
+        s.panel_fraction.set(requested);
         for _ in 0..8 {
             let _ = pipeline.render();
         }
@@ -5994,7 +5999,7 @@ fn full_height_inspector_is_outside_right_mixer_and_has_one_editable_name() {
     wait_for_test_font();
     let s = Daw::new(project());
     for mixer in [true, false] {
-        s.mixer_visible.set(mixer);
+        s.panel_visible.set(mixer);
         let mut tree = scarlet_ui::ElementTree::new();
         tree.set_root(s.create_element());
         tree.layout(scarlet_ui::LayoutConstraints::tight(1280., 790.));
@@ -6084,7 +6089,7 @@ fn inspector_and_mixer_faders_have_identical_travel_at_all_layout_sizes() {
         let s = Daw::new(project());
         s.size.set(Size::new(width, height));
         for fraction in [0., 0.5, 0.9] {
-            s.mixer_fraction.set(fraction);
+            s.panel_fraction.set(fraction);
             let mut tree = scarlet_ui::ElementTree::new();
             for _ in 0..4 {
                 tree.set_root(s.create_element());
@@ -6840,4 +6845,179 @@ fn send_popups_and_pre_fader_changes_keep_valid_gpu_damage() {
         settle(&mut pipeline, "switch pre/post");
     }
     pipeline.teardown();
+}
+
+#[test]
+fn lower_tabs_and_double_click_keep_selection_and_transport() {
+    use lower_panel::PanelTab;
+    let s = Daw::new(project());
+    s.choose(0, Some(0));
+    s.play();
+    assert_playback_advances(&s, 1800);
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    s.panel_fraction.set(0.4);
+    s.show_panel(PanelTab::Editor);
+    assert_eq!(s.panel_mode(), PanelTab::Editor);
+    assert!(s.panel_visible.get());
+    assert_eq!(s.model.borrow().clip, Some(0));
+    s.toggle_panel(PanelTab::Editor);
+    assert!(!s.panel_visible.get());
+    s.toggle_panel(PanelTab::Mixer);
+    assert!(s.panel_visible.get());
+    assert_eq!(s.panel_mode(), PanelTab::Mixer);
+    assert_eq!(s.panel_fraction.get(), 0.4);
+    let position = controls.position.load(Ordering::Relaxed);
+    s.timeline_event(
+        0,
+        &Event::Mouse(MouseEvent::ButtonPressed {
+            button: MouseButton::Left,
+            x: 100,
+            y: 40,
+            click_count: 2,
+        }),
+    );
+    assert_eq!(s.panel_mode(), PanelTab::Editor);
+    assert!(s.model.borrow().drag.is_none());
+    assert!(s.model.borrow().undo.is_empty());
+    assert_eq!(controls.position.load(Ordering::Relaxed), position);
+    assert_playback_advances(&s, 32);
+}
+
+#[test]
+fn lower_editor_layout_fills_pane_and_can_return_to_mixer() {
+    use lower_panel::PanelTab;
+    wait_for_test_font();
+    for size in [Size::new(1000., 720.), Size::new(1440., 1000.)] {
+        let s = Daw::new(project());
+        s.choose(0, Some(0));
+        s.show_panel(PanelTab::Editor);
+        let mut pipeline = scarlet_ui::RenderingPipeline::new();
+        pipeline.set_root(
+            Window::new("Editor workspace", s.clone())
+                .size(size)
+                .create_element(),
+        );
+        pipeline.layout_initial();
+        for _ in 0..8 {
+            let _ = pipeline.render();
+        }
+        let full = s.size.get().height - 174. - 4.;
+        let arrangement = s.arrangement_size.get();
+        assert!(arrangement.height >= 159.);
+        assert!(full - arrangement.height >= 259.);
+        let cursor = s.cursor.get();
+        s.panel_visible.set(false);
+        for _ in 0..8 {
+            let _ = pipeline.render();
+        }
+        assert!((s.arrangement_size.get().height - full - 4.).abs() < 2.);
+        s.show_panel(PanelTab::Mixer);
+        for _ in 0..8 {
+            let _ = pipeline.render();
+        }
+        let mixer_height = full - s.arrangement_size.get().height;
+        assert!((MIXER_MIN_HEIGHT - 1. ..=MIXER_MAX_HEIGHT + 1.).contains(&mixer_height));
+        assert_eq!(s.cursor.get(), cursor);
+        assert_eq!(s.model.borrow().clip, Some(0));
+        pipeline.teardown();
+    }
+}
+
+#[test]
+fn arrangement_edge_trim_preserves_reversed_mapping_and_fades() {
+    for (x, moved, side) in [(34, 64, DragMode::Left), (200, 170, DragMode::Right)] {
+        let mut p = project();
+        p.tracks[0].clips[0].set_reversed(true);
+        p.tracks[0].clips[0].set_fades(3000, 3000).unwrap();
+        let original = p.tracks[0].clips[0].clone();
+        let s = Daw::new(p);
+        s.snap.set(false);
+        s.choose(0, Some(0));
+        s.timeline_event(0, &press(x));
+        assert!(
+            s.model
+                .borrow()
+                .drag
+                .as_ref()
+                .is_some_and(|d| d.mode == side)
+        );
+        s.timeline_event(0, &Event::Mouse(MouseEvent::Moved { x: moved, y: 40 }));
+        s.timeline_event(
+            0,
+            &Event::Mouse(MouseEvent::ButtonReleased {
+                button: MouseButton::Left,
+                x: moved,
+                y: 40,
+                click_count: 1,
+            }),
+        );
+        let m = s.model.borrow();
+        let clip = &m.project.tracks[0].clips[0];
+        m.project.validate().unwrap();
+        let relative_start = (clip.start - original.start) as usize;
+        for i in 0..clip.frames {
+            assert_eq!(
+                clip.sample_at(i as f64),
+                original.sample_at((i + relative_start) as f64)
+            );
+        }
+        drop(m);
+        s.undo(false);
+        assert_eq!(
+            s.model.borrow().project.tracks[0].clips[0].edit,
+            original.edit
+        );
+    }
+}
+
+#[test]
+fn scarlet_tab_strip_switches_workspace_with_shared_selection_and_accent() {
+    use scarlet_ui::renderer::{PaintCommand, PaintContext};
+    fn tab_label(element: &dyn scarlet_ui::Element, parent: Point, label: &str) -> Option<Point> {
+        let origin = Point::new(
+            parent.x + element.position().x,
+            parent.y + element.position().y,
+        );
+        if let Some(render) = element
+            .render_object()
+            .filter(|r| r.as_any().is::<scarlet_ui::views::TabViewRenderObject>())
+        {
+            let mut paint = PaintContext::new();
+            render.paint(&mut paint, origin);
+            return paint.commands().iter().find_map(|command| match command {
+                PaintCommand::DrawText { text, position, .. } if text == label => Some(Point::new(
+                    position.x + 4.,
+                    origin.y + MIXER_HEADER_HEIGHT / 2.,
+                )),
+                _ => None,
+            });
+        }
+        element
+            .children()
+            .iter()
+            .find_map(|child| tab_label(child.as_ref(), origin, label))
+    }
+    wait_for_test_font();
+    let s = Daw::new(project());
+    s.choose(0, Some(0));
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.create_element());
+    for _ in 0..4 {
+        tree.root_mut().unwrap().rebuild();
+        tree.layout(scarlet_ui::LayoutConstraints::tight(1280., 790.));
+    }
+    let editor =
+        tab_label(tree.root().unwrap(), Point::ZERO, "Editor").expect("native ScarletUI tab");
+    dispatched_click(&mut tree, editor.x as i32, editor.y as i32);
+    assert_eq!(s.panel_mode(), lower_panel::PanelTab::Editor);
+    for _ in 0..4 {
+        tree.root_mut().unwrap().rebuild();
+        tree.layout(scarlet_ui::LayoutConstraints::tight(1280., 790.));
+    }
+    assert_eq!(s.model.borrow().clip, Some(0));
+    let mixer = tab_label(tree.root().unwrap(), Point::ZERO, "Mixer").unwrap();
+    dispatched_click(&mut tree, mixer.x as i32, mixer.y as i32);
+    assert_eq!(s.panel_mode(), lower_panel::PanelTab::Mixer);
+    assert!(s.model.borrow().undo.is_empty());
+    tree.clear_root();
 }

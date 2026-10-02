@@ -56,6 +56,7 @@ fn clap_smoke(directory: &Path, play: bool) -> Result<()> {
             mute: false,
             solo: false,
             clips: vec![Clip {
+                edit: Default::default(),
                 source_channels: 2,
                 start: 0,
                 source_offset: 0,

@@ -38,6 +38,7 @@ fn main() -> Result<()> {
                 name: format!("Track {track}"),
                 clips: (0..4)
                     .map(|part| Clip {
+                        edit: Default::default(),
                         source_channels: 2,
                         start: (part * FRAMES / 4) as u64,
                         source_offset: part * FRAMES / 4,

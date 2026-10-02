@@ -1,3 +1,16 @@
+## 2026-10-03: Mixer / Editor 共通ペインとリージョン編集
+
+- 下部を Mixer / Editor の切替に変更。X / E、リージョンダブルクリック、閉じる／サイズ変更に対応。将来の素材別Editorを追加できる共通ペインで、現在は音声編集。
+- ScarletUI `TabView` と追加した `TabStyle` を使用。丸いボタンを並べる表示をやめ、既存の暗い背景と2pxの青緑の選択線を使用。[ScarletUI PR #35](https://github.com/petitstrawberry/scarlet-ui/pull/35) はユーザーがmerge済み。アプリ・CLAP bridge・Freeverb editor・lockfileをmerge commit `8468af9bcc977153259a82203962b84f9b78700a` に統一。
+- 拡大したモノ／ステレオ波形、独立ズーム・横移動、範囲選択、サンプル位置、Trim / Split、Gain / Fade / Reverse、Normalize、固定長の±12半音Transpose。ノート検出・フォルマント保持・MIDIは未実装。[使い方](region-editor.md)を参照。
+- `Clip.edit` はserde default付き。元音声は不変Arc共有で、分割・トリムが継承フェードと逆順参照を維持する。アレンジメントの端ドラッグも同じresize APIへ変更。各編集はUndo / Redo / save / exportへ接続。
+- Normalize / Transposeはキャンセル可能なworker。世代・対象・Arcの照合後、制御スレッドで1編集として反映。変更済みprojectへ古い結果を適用しない。
+- region-only更新はprepared source snapshotだけをcallback境界で交換。routing graph / DSP / CLAP ownerを維持し、旧snapshotは制御スレッドで解放。Graph / Sources共通mailboxで連続操作を集約する。routingそのものの変更は引き続きgraph再構築。
+- Auxの大きなDeleteボタンは撤去し、名前横24pxの「⋯」から操作。削除時のrouting修復とUndoは従来経路。Editorのボタン高は共通28px、同用途の幅を揃え、ズーム／横移動は共通の虫眼鏡／矢印アイコン。
+- 初回表示／リサイズ時に波形だけ古い幅が残る問題も再現して修正。Editorのローカルlayout境界から子を更新し、ルーラー・波形・選択の座標を揃えた。実pipelineの初回表示／縮小／拡大／全Window選択テストを追加。
+- 検証: workspace直列実行388 passed / 21 ignored（`artifacts/editor-workspace-serial-tests.log`）。並列実行では既存font discoveryの5秒待機が9件timeoutしたが、同じ実行の後続font testsは成功。font設定の変更はなく、直列で全件成功。Editor重点14件、依存pin／fmt／差分チェック成功。実CLAP owner保持とcallback確保・解放ゼロも検証。
+- macOS release、Scarlet AArch64 / RISC-V64 releaseとELF auditが成功（`artifacts/editor-release-build.log`、`artifacts/editor-native-verify.log`）。macOS実画面でタブ／アイコン／選択波形の幅追従を確認。今回の新EditorはScarlet実機runtime未確認。UI寸法の回帰は `artifacts/region-editor-resize-tests.log`、依存は `artifacts/editor-dependencies.log`。
+
 ## 2026-10-03: Scarlet CLAP の配置漏れと検索パス
 
 - `../Scarlet/projects/aarch64-limine-full` の rootfs staging は `/bin/resonara` のみで、標準 CLAP が未配置だった。experimental bundle が executable-only Cargo layer を取り込んでいたのが原因。
