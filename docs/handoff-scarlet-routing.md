@@ -1,3 +1,9 @@
+## 2026-10-03: SWS CLAP ウィンドウの影が黒くなる問題
+
+- CLAP hostの `gui_sws.rs` が `WindowCreateRequest.opaque = true` を固定していた。custom chromeの角丸・影はalphaを持つため、この指定ではSWSへの `set_window_has_alpha_content(true)` が省かれていた。
+- メインWindowと同じ `WindowInfo::platform_surface_is_opaque()` の結果を渡すよう修正。SWS backendが初回present前に透過フラグを送る。Freeverb側はoffscreen描画のみでSWS Windowを所有せず、変更不要。resizeは同じsurfaceとフラグを維持する。
+- 修正後のAArch64 / RISC-V64 app release buildとELF audit成功（`artifacts/editor-native-verify.log`）。影の修正結果はScarlet実機で未確認。
+
 ## 2026-10-03: Mixer / Editor 共通ペインとリージョン編集
 
 - 下部を Mixer / Editor の切替に変更。X / E、リージョンダブルクリック、閉じる／サイズ変更に対応。将来の素材別Editorを追加できる共通ペインで、現在は音声編集。

@@ -300,6 +300,9 @@ pub(crate) fn open(i: &Instance) -> Result<bool> {
             max: Some(info.size),
             resizable: false,
         };
+        // Custom chrome paints translucent corners and shadows around the
+        // opaque plugin content. SWS must blend alpha for the whole surface.
+        let opaque = info.platform_surface_is_opaque();
         let mut window = backend
             .create_window(WindowCreateRequest {
                 app_id: info.app_id,
@@ -310,7 +313,7 @@ pub(crate) fn open(i: &Instance) -> Result<bool> {
                 menu_titles: String::new(),
                 focus_on_create: true,
                 active_on_focus: true,
-                opaque: true,
+                opaque,
                 decoration: info.decoration,
                 placement: info.placement,
                 window_geometry_insets: info.window_geometry_insets,
