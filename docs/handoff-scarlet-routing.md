@@ -6,6 +6,7 @@
 - 最初から bypass の insert も live graph には用意し、停止中 GUI は enabled / bypass 共に同じ paused CPAL session を使う。bypass の Undo / Redo でも editor を閉じない。plugin state の変更や削除など、実際の graph rebuild は引き続き editor を閉じる。
 - missing CLAP の placeholder は保持するが、bypass 中は unavailable 警告や export の必須 effect に数えない。警告は control thread で編集直後に更新する。
 - 実 Gain fixture で initially bypassed の owner 保持、繰り返す dry / wet 切り替え、callback の allocation / deallocation なしを確認。app の editor pin 回帰テストで停止中・再生中の bypass と Undo / Redo を確認。331テスト成功（長時間 stress のみ除外）、`artifacts/plugin-bypass-tests.log`。この変更後の実 GUI 操作は未再確認。
+- macOS debug build、Scarlet AArch64 / RISC-V64 release build と ELF 監査に成功。ログは `artifacts/plugin-bypass-build.log`、`artifacts/plugin-bypass-native-verify.log`。既存 macOS app bundle の実行ファイルも更新済み。起動中 VM / image は変更していない。
 
 ## macOS CLAP GUI の transport 寿命修正（同日）
 
