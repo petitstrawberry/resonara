@@ -9,6 +9,9 @@ pub struct Audio {
 }
 impl Audio {
     pub fn start(project: &Project, start: u64) -> Result<Self> {
+        Self::start_with_metronome(project, start, false)
+    }
+    pub fn start_with_metronome(project: &Project, start: u64, metronome: bool) -> Result<Self> {
         project.validate()?;
         let device = cpal::default_host()
             .default_output_device()
@@ -17,6 +20,7 @@ impl Audio {
         let supported = device.default_output_config()?;
         let config: cpal::StreamConfig = supported.clone().into();
         let controls = Arc::new(Controls::new(project));
+        controls.metronome.store(metronome, Ordering::Relaxed);
         let error = controls.clone();
         let engine = Engine::new(project, controls.clone(), config.sample_rate.0, start);
         let channels = config.channels as usize;

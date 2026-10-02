@@ -4,7 +4,9 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
+pub mod audio;
 pub mod graph;
+mod metronome;
 mod wav;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -76,7 +78,7 @@ impl Default for Project {
             version: 1,
             sample_rate: 48000,
             tracks: vec![],
-            master: 0.8,
+            master: 1.0,
             tempo: default_tempo(),
             time_signature: TimeSignature::default(),
         }
@@ -129,34 +131,22 @@ impl Project {
             .unwrap_or(0)
     }
     pub fn import_wav(&mut self, path: &std::path::Path) -> Result<()> {
-        let mut r = wav::open(path)?;
-        let spec = r.spec();
-        if !(1..=2).contains(&spec.channels) || spec.sample_rate == 0 {
-            return Err("Only mono/stereo WAV is supported".into());
+        let decoded = audio::read_wav(path)?;
+        self.insert_audio(path, decoded)
+    }
+    pub fn import_audio(&mut self, path: &std::path::Path) -> Result<()> {
+        let decoded = audio::read(path)?;
+        self.insert_audio(path, decoded)
+    }
+    fn insert_audio(&mut self, path: &std::path::Path, decoded: audio::Decoded) -> Result<()> {
+        if !(8000..=192000).contains(&self.sample_rate) {
+            return Err("Invalid project sample rate".into());
         }
-        let raw: Vec<f32> = match spec.sample_format {
-            hound::SampleFormat::Float => {
-                r.samples::<f32>().collect::<std::result::Result<_, _>>()?
-            }
-            hound::SampleFormat::Int => {
-                let scale = 2f32.powi(i32::from(spec.bits_per_sample) - 1);
-                r.samples::<i32>()
-                    .map(|s| s.map(|v| v as f32 / scale))
-                    .collect::<std::result::Result<_, _>>()?
-            }
-        };
-        if raw.len() % spec.channels as usize != 0 || raw.iter().any(|s| !s.is_finite()) {
-            return Err("Invalid WAV samples".into());
-        }
-        let source: Vec<[f32; 2]> = raw
-            .chunks_exact(spec.channels as usize)
-            .map(|s| [s[0], *s.get(1).unwrap_or(&s[0])])
-            .collect();
-        let length =
-            (source.len() as u64 * self.sample_rate as u64 / spec.sample_rate as u64) as usize;
+        let source = decoded.samples;
+        let length = (source.len() as u64 * self.sample_rate as u64 / decoded.rate as u64) as usize;
         let samples = (0..length)
             .map(|i| {
-                let x = i as f64 * spec.sample_rate as f64 / self.sample_rate as f64;
+                let x = i as f64 * decoded.rate as f64 / self.sample_rate as f64;
                 let a = x as usize;
                 let b = (a + 1).min(source.len() - 1);
                 let f = x.fract() as f32;
@@ -173,7 +163,7 @@ impl Project {
                 .to_string_lossy()
                 .into(),
             clips: vec![Clip {
-                source_channels: spec.channels,
+                source_channels: decoded.channels,
                 start: 0,
                 source_offset: 0,
                 frames: length,
@@ -221,16 +211,23 @@ impl Project {
         Ok(())
     }
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::{BufWriter, Write};
         self.validate()?;
         let tmp = path.with_extension("resonara.tmp");
-        let mut file = std::fs::File::create(&tmp)?;
+        // JSON emits tiny writes for embedded samples; batch them before file I/O.
+        let mut file = BufWriter::with_capacity(256 * 1024, std::fs::File::create(&tmp)?);
         serde_json::to_writer(&mut file, self)?;
-        file.sync_all()?;
+        file.flush()?;
+        file.get_ref().sync_all()?;
+        drop(file);
         std::fs::rename(tmp, path)?;
         Ok(())
     }
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let p: Self = serde_json::from_reader(std::fs::File::open(path)?)?;
+        let p: Self = serde_json::from_reader(std::io::BufReader::with_capacity(
+            256 * 1024,
+            std::fs::File::open(path)?,
+        ))?;
         p.validate()?;
         Ok(p)
     }
@@ -314,6 +311,8 @@ impl Mixer {
 pub struct Controls {
     pub tracks: Vec<Mixer>,
     pub master: AtomicU32,
+    /// Playback monitoring only. Exports construct disabled controls.
+    pub metronome: AtomicBool,
     /// Actual stereo master sum after master gain, before clipping/device mapping.
     /// Positive f32 bits, accumulated until consumed with swap(0).
     pub master_peak_left: AtomicU32,
@@ -339,6 +338,7 @@ impl Controls {
                 })
                 .collect(),
             master: AtomicU32::new(p.master.to_bits()),
+            metronome: AtomicBool::new(false),
             master_peak_left: AtomicU32::new(0),
             master_peak_right: AtomicU32::new(0),
             position: AtomicU64::new(0),
@@ -355,6 +355,8 @@ pub struct Engine {
     position: f64,
     step: f64,
     duration: u64,
+    clock_only: bool,
+    metronome: metronome::Metronome,
     graph: graph::CompiledGraph,
     faulted: bool,
     positions: Vec<f64>,
@@ -396,12 +398,18 @@ impl Engine {
         }
         let graph = graph::CompiledGraph::compile(routing, p.tracks.len(), limits)?;
         let duration = p.duration();
+        let clock_only = duration == 0 && controls.metronome.load(Ordering::Relaxed);
         // The UI may read transport state before the first device callback.
         // Publish the requested start immediately rather than briefly jumping
         // to zero (which can be outside a panned arrangement viewport).
-        controls
-            .position
-            .store(start.min(duration), Ordering::Relaxed);
+        controls.position.store(
+            if clock_only {
+                start
+            } else {
+                start.min(duration)
+            },
+            Ordering::Relaxed,
+        );
         Ok(Self {
             tracks: p.tracks.clone(),
             // Splitting a clip must not change the interpolation at the cut.
@@ -441,6 +449,8 @@ impl Engine {
             position: start as f64,
             step: p.sample_rate as f64 / device_rate as f64,
             duration,
+            clock_only,
+            metronome: metronome::Metronome::new(p, device_rate),
             graph,
             faulted: false,
             positions: vec![0.0; limits.quantum],
@@ -472,13 +482,14 @@ impl Engine {
             .iter()
             .any(|m| m.solo.load(Ordering::Relaxed));
         let master = f32::from_bits(self.controls.master.load(Ordering::Relaxed));
+        let metronome_enabled = self.controls.metronome.load(Ordering::Relaxed);
         let quantum = self.graph.info().quantum;
         for chunk in out.chunks_mut(channels.saturating_mul(quantum)) {
             let frames = chunk.len().div_ceil(channels);
             let mut active = 0;
             if !self.faulted && self.controls.playing.load(Ordering::Relaxed) {
                 for position in &mut self.positions[..frames] {
-                    if self.position >= self.duration as f64 {
+                    if !self.clock_only && self.position >= self.duration as f64 {
                         break;
                     }
                     *position = self.position;
@@ -552,7 +563,12 @@ impl Engine {
             let output = self.graph.output(active);
             let mut master_peak = [0.0f32; 2];
             for (index, frame) in chunk.chunks_mut(channels).enumerate() {
-                let sum = output.get(index).copied().unwrap_or([0.0; 2]);
+                let mut sum = output.get(index).copied().unwrap_or([0.0; 2]);
+                if metronome_enabled && index < active {
+                    let click = self.metronome.sample(self.positions[index]);
+                    sum[0] += click;
+                    sum[1] += click;
+                }
                 if !self.faulted {
                     for channel in 0..2 {
                         // Keep overrange peaks visible. Nonfinite faults saturate
@@ -594,9 +610,14 @@ impl Engine {
                 .master_peak_right
                 .fetch_max(master_peak[1].to_bits(), Ordering::Relaxed);
         }
-        self.controls
-            .position
-            .store((self.position as u64).min(self.duration), Ordering::Relaxed);
+        self.controls.position.store(
+            if self.clock_only {
+                self.position as u64
+            } else {
+                (self.position as u64).min(self.duration)
+            },
+            Ordering::Relaxed,
+        );
     }
 }
 pub trait OutputSample: Copy {

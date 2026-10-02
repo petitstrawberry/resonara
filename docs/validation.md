@@ -6,6 +6,53 @@ This records the cloud validation and subsequent user-requested Mac handoff.
 Publication uses a dedicated branch; no pull request or merge is part of this
 work. The cloud sections below retain their original environment and counts.
 
+## 2026-10-02 audio import, musical grid, metronome and saving
+
+`cargo test --locked --workspace` passed 208 tests: 91 app, 59 core and 58
+vendored renderer tests; the opt-in long-audio stress test remained ignored.
+Formatting, dependency-pin verification and the release build passed. The
+release application started with the winit/SGFX/wgpu backend. Native GUI
+automation was unavailable (`Sky Computer Use native pipe startup failed`),
+so the save panel was not manually exercised in this pass. Async save success,
+failure, retry, history and file-dialog result delivery were covered by tests.
+
+New coverage checks zoom-dependent 1/4, 1/8 and 1/16 ruler lines and their painted
+lengths; snap units, odd-bar boundaries, pointer seeking, clip move/trim/split
+and undo; empty-session clicks, live switching, tempo/meter/device-rate and seek
+synchronization, callback partitioning and click-free exports. The callback
+allocator audit passed with the metronome enabled. Generated checked-in fixtures
+exercise FLAC, AIFF, CAF, ALAC/M4A, AAC/M4A, ADTS/AAC, MP3 and OGG/Vorbis;
+lossless round trips match WAV samples, and failed imports preserve the project.
+
+Saving previously gave each tiny JSON write directly to `File`; embedded audio
+therefore generated millions of writes. Save/load now use 256 KiB buffers, with
+save flush and synchronization before replacement. On the Mac release build,
+576,000 stereo frames (12 seconds, 14,372,889 JSON bytes) saved in 3.884 seconds
+with the old direct writer and 0.0303 seconds with buffering (128.2×); loading
+took 0.0436 seconds. Both writers produced identical files and audio round trips.
+The user-provided 10.411-second mono WAV also saved/reloaded successfully:
+13,077,504 JSON bytes, save 0.0335 seconds, load 0.0384 seconds, identical samples.
+These are local file-I/O timings, not GUI latency measurements or a general
+performance guarantee. The existing embedded-per-clip JSON size limitation
+remains. Evidence is in `artifacts/audio-grid-metronome-tests.log`,
+`artifacts/audio-grid-metronome-release.log`, `artifacts/save-buffering-benchmark.rs`,
+`artifacts/save-buffering-benchmark.log` and `artifacts/user-audio-save-roundtrip.log`.
+
+### Native audio-selection follow-up
+
+The initial format tests exercised the decoder and fallback browser, but native
+dialog result validation still accepted only `.wav` for Import. This rejected
+MP3 and other newly supported files before their decoding worker could start.
+Import validation now shares `audio::supported_path` with the browser and dialog
+filter; project and WAV export filters retain their respective extensions.
+Two regression tests check native selected-result delivery through actual async
+decoding and undo for all ten audio fixtures (including uppercase `.MP3` and a
+Unicode filename), and invalid paths/extensions for all four file actions.
+The updated app suite passed 93 tests with one optional stress test ignored;
+the release build also passed. Logs are `artifacts/native-audio-import-tests.log`
+and `artifacts/native-audio-import-release.log`. OS-panel interactions remain
+unverified due to the native automation startup failure above.
+
 ## Mac handoff and transport corrections
 
 The independent Mac clone checked both remote and checkout commit

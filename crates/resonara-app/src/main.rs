@@ -4,6 +4,7 @@ mod fader;
 mod knob;
 mod meter;
 mod profiling;
+mod ruler;
 #[cfg(test)]
 mod tests;
 mod timeline;
@@ -142,6 +143,7 @@ struct Daw {
     follow_playhead: State<bool>,
     follow_suspended: Rc<Cell<bool>>,
     ruler_drag: Rc<RefCell<Option<RulerDrag>>>,
+    metronome: State<bool>,
     cursor: State<String>,
     range_end: State<String>,
     track_name: State<String>,
@@ -180,6 +182,7 @@ fn state<T: 'static>(id: u64, value: T) -> State<T> {
 impl Daw {
     fn new(project: Project) -> Self {
         let span = (project.duration() as f64 / project.sample_rate as f64 * 1.20).max(5.);
+        let master = project.master;
         let s = Self {
             model: Rc::new(RefCell::new(Model {
                 project,
@@ -215,10 +218,11 @@ impl Daw {
             follow_playhead: state(34, false),
             follow_suspended: Rc::new(Cell::new(false)),
             ruler_drag: Rc::new(RefCell::new(None)),
+            metronome: state(36, false),
             cursor: state(6, "0.000".into()),
             range_end: state(7, "1.000".into()),
             track_name: state(8, String::new()),
-            master: state(9, 0.8),
+            master: state(9, master),
             master_dragging: state(10, false),
             master_focus: state(24, false),
             master_peak: state(25, meter::StereoMeter::default()),
@@ -635,15 +639,15 @@ impl Daw {
         self.reset_meters();
         let result = self.seconds(&self.cursor.get()).and_then(|start| {
             let mut m = self.model.borrow_mut();
-            if m.project.duration() == 0 {
-                return Err("Import an audio file first".into());
+            if m.project.duration() == 0 && !self.metronome.get() {
+                return Err("Import an audio file first, or enable the metronome".into());
             }
-            let start = if start >= m.project.duration() {
+            let start = if m.project.duration() > 0 && start >= m.project.duration() {
                 0
             } else {
                 start
             };
-            let a = Audio::start(&m.project, start)?;
+            let a = Audio::start_with_metronome(&m.project, start, self.metronome.get())?;
             self.status.set(format!("Playing · {}", a.device));
             m.audio = Some(a);
             self.playhead
@@ -659,13 +663,39 @@ impl Daw {
         }
         self.changed();
     }
+    fn toggle_metronome(&self) {
+        let enabled = !self.metronome.get();
+        self.metronome.set(enabled);
+        if let Some(audio) = &self.model.borrow().audio {
+            audio.controls.metronome.store(enabled, Ordering::Relaxed);
+        }
+        self.changed();
+    }
+    fn snap_grid_for(&self, project: &Project) -> timeline::SnapGrid {
+        timeline::snap_grid(
+            self.time_format.get(),
+            self.view_span.get(),
+            (self.arrangement_size.get().width - HEADER).max(200.),
+            project.tempo,
+            project.sample_rate,
+            project.time_signature,
+        )
+    }
+    fn snap_position(&self, seconds: f64) -> f64 {
+        if self.snap.get() {
+            self.snap_grid_for(&self.model.borrow().project)
+                .position(seconds)
+        } else {
+            seconds
+        }
+    }
     fn stop_audio(&self, message: bool) {
         let mut m = self.model.borrow_mut();
         if let Some(a) = m.audio.take() {
             let pos =
                 a.controls.position.load(Ordering::Relaxed) as f64 / m.project.sample_rate as f64;
             self.playhead.set(pos);
-            self.cursor.set(format!("{pos:.3}"));
+            self.cursor.set(timeline::seconds_input(pos));
             self.clock.set(self.time_format.get().position(
                 pos,
                 m.project.tempo,
@@ -734,7 +764,7 @@ impl Daw {
         self.stop_audio(false);
         let seconds = seconds.max(0.);
         self.playhead.set(seconds);
-        self.cursor.set(format!("{seconds:.3}"));
+        self.cursor.set(timeline::seconds_input(seconds));
         self.animate_playhead(seconds);
         self.update_frames();
         if was_playing {
@@ -912,7 +942,7 @@ impl Daw {
                     });
                 }
                 drop(m);
-                self.seek(at);
+                self.seek(self.snap_position(at));
                 if self.tool.get() == 1 && hit.is_some() {
                     self.model.borrow_mut().drag = None;
                     self.split();
@@ -933,12 +963,14 @@ impl Daw {
                 drag.moved = true;
                 let rate = m.project.sample_rate;
                 let delta = (*x as f32 - drag.x) as f64 / width as f64 * self.view_span.get();
-                let grid = if self.snap.get() {
-                    0.1
-                } else {
-                    1. / rate as f64
+                let grid = self.snap_grid_for(&m.project);
+                let quantize = |s: f64| {
+                    if self.snap.get() {
+                        grid.position(s)
+                    } else {
+                        (s * rate as f64).round() / rate as f64
+                    }
                 };
-                let quantize = |s: f64| (s / grid).round() * grid;
                 let c = &mut m.project.tracks[drag.track].clips[drag.clip];
                 *c = drag.original.clone();
                 match drag.mode {
@@ -1082,27 +1114,29 @@ impl Daw {
             options.title = match action {
                 FileAction::Open => "Open Resonara project",
                 FileAction::Save => "Save Resonara project",
-                FileAction::Import => "Import WAV",
+                FileAction::Import => "Import audio",
                 FileAction::Export => "Export stereo WAV",
             }
             .into();
             options.initial_directory = folder.is_absolute().then(|| folder.into());
             options.default_name = (!name.is_empty()).then_some(name);
             options.filters = vec![FileDialogFilter {
-                name: if matches!(action, FileAction::Import | FileAction::Export) {
+                name: if action == FileAction::Import {
+                    "Audio files"
+                } else if action == FileAction::Export {
                     "WAV audio"
                 } else {
                     "Resonara project"
                 }
                 .into(),
-                extensions: vec![
-                    if matches!(action, FileAction::Import | FileAction::Export) {
-                        "wav"
-                    } else {
-                        "json"
-                    }
-                    .into(),
-                ],
+                extensions: match action {
+                    FileAction::Import => resonara_core::audio::EXTENSIONS
+                        .iter()
+                        .map(|e| (*e).into())
+                        .collect(),
+                    FileAction::Export => vec!["wav".into()],
+                    _ => vec!["json".into()],
+                },
             }];
             self.model.borrow_mut().picker = Some((action, options.show(owner)));
             self.dialog.set(Dialog::Native(action));
@@ -1138,18 +1172,24 @@ impl Daw {
         match result {
             Ok(FileDialogOutcome::Selected(paths)) if paths.len() == 1 => {
                 let path: PathBuf = paths.into_iter().next().unwrap().into();
-                let expected = if matches!(action, FileAction::Import | FileAction::Export) {
-                    "wav"
-                } else {
-                    "json"
+                let (supported, kind) = match action {
+                    FileAction::Import => (
+                        resonara_core::audio::supported_path(&path),
+                        "supported audio",
+                    ),
+                    FileAction::Export => (
+                        path.extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("wav")),
+                        ".wav",
+                    ),
+                    _ => (
+                        path.extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("json")),
+                        ".json",
+                    ),
                 };
-                if !path.is_absolute()
-                    || path.is_dir()
-                    || !path
-                        .extension()
-                        .is_some_and(|e| e.eq_ignore_ascii_case(expected))
-                {
-                    self.picker_failed(format!("Choose an absolute .{expected} file path"));
+                if !path.is_absolute() || path.is_dir() || !supported {
+                    self.picker_failed(format!("Choose an absolute {kind} file path"));
                 } else {
                     self.start_io(action, path);
                 }
@@ -1185,7 +1225,9 @@ impl Daw {
                         let name = e.file_name().to_string_lossy().into_owned();
                         let allowed = directory
                             || match action {
-                                FileAction::Import => name.to_lowercase().ends_with(".wav"),
+                                FileAction::Import => {
+                                    resonara_core::audio::supported_path(&e.path())
+                                }
                                 FileAction::Open => name.ends_with(".json"),
                                 _ => true,
                             };
@@ -1259,7 +1301,7 @@ impl Daw {
         m.io = Some(rx);
         self.status.set(
             match action {
-                FileAction::Import => "Importing WAV…",
+                FileAction::Import => "Importing audio…",
                 FileAction::Open => "Opening project…",
                 FileAction::Save => "Saving project…",
                 FileAction::Export => "Exporting stereo WAV…",
@@ -1273,7 +1315,7 @@ impl Daw {
             let r: Result<Option<Project>> = (|| match action {
                 FileAction::Import => {
                     let mut p = project;
-                    p.import_wav(&path)?;
+                    p.import_audio(&path)?;
                     Ok(Some(p))
                 }
                 FileAction::Open => Ok(Some(Project::load(&path)?)),
@@ -1320,7 +1362,7 @@ impl Daw {
                         &mut m,
                         before,
                         if out.action == FileAction::Import {
-                            "Import WAV"
+                            "Import audio"
                         } else {
                             "Open project"
                         },
@@ -1340,7 +1382,7 @@ impl Daw {
                 self.status.set(format!(
                     "{} · {}",
                     match out.action {
-                        FileAction::Import => "WAV imported",
+                        FileAction::Import => "Audio imported",
                         FileAction::Open => "Project opened",
                         FileAction::Save => "Project saved",
                         FileAction::Export => "Stereo 32-bit float WAV exported",
@@ -1464,6 +1506,7 @@ impl Daw {
             KeyCode::Up => self.select(-1),
             KeyCode::Down => self.select(1),
             KeyCode::Char('s' | 'S') => self.split(),
+            KeyCode::Char('c' | 'C') => self.toggle_metronome(),
             KeyCode::Char('m' | 'M') => {
                 let i = self.model.borrow().selected;
                 self.mix(i, None, None, Some(false));
@@ -1605,14 +1648,23 @@ impl Daw {
         let span = self.view_span.get();
         let m = self.model.borrow();
         let format = self.time_format.get();
-        let step = format.step(
+        let grid = timeline::ruler_grid(
+            format,
+            start,
             span,
+            width,
             m.project.tempo,
             m.project.sample_rate,
             m.project.time_signature,
         );
+        let step = grid.label_step;
         let first = (start / step).floor() as i64;
-        let mut labels: Vec<Box<dyn View>> = vec![];
+        let mut labels: Vec<Box<dyn View>> = vec![Box::new(ruler::Marks {
+            ticks: grid.ticks,
+            start,
+            span,
+            size: Size::new(width, 30.),
+        })];
         for i in first..=first + 12 {
             let seconds = i as f64 * step;
             let x = ((seconds - start) / span) as f32 * width;
@@ -1625,7 +1677,7 @@ impl Daw {
                         m.project.time_signature,
                     ))
                     .font_size(10.)
-                    .frame(90., 26.)
+                    .frame(90., 16.)
                     .padding_insets(EdgeInsets::new(x + 5., 0., 0., 0.)),
                 ));
             }
@@ -1639,7 +1691,7 @@ impl Daw {
         let rows = self.clone();
         let resize = self.clone();
         let content = if count == 0 {
-            AnyView::new(vstack!{Text::new("Your arrangement starts here").font_size(20.).color(TEXT),caption("Import a mono or stereo WAV, then arrange it on the timeline."),self.button("Import WAV…","Import an audio file · Ctrl/Cmd+I",|s|s.open_dialog(FileAction::Import))}.spacing(12.).frame(size.width,(size.height-58.).max(150.)))
+            AnyView::new(vstack!{Text::new("Your arrangement starts here").font_size(20.).color(TEXT),caption("Import an audio file, then arrange it on the timeline."),self.button("Import audio…","Import an audio file · Ctrl/Cmd+I",|s|s.open_dialog(FileAction::Import))}.spacing(12.).frame(size.width,(size.height-58.).max(150.)))
         } else {
             AnyView::new(
                 ScrollView::new(LazyVStack::new(count, ROW, move |i| rows.track_row(i)))
@@ -1801,7 +1853,7 @@ impl Daw {
             .unwrap_or_else(|| "Untitled session".into());
         let dirty = m.version != m.saved_version;
         let busy = m.io.is_some() || m.picker.is_some();
-        AnyView::new(row!{Text::new("resonara").font_size(19.).color(TEXT),caption("AUDIO WORKSTATION"),Spacer::new(),label(format!("{}{}",ui::elide(&name,29),if dirty{"  •"}else{""})),Spacer::new(),self.header_button("Open…","Open a Resonara project · Ctrl/Cmd+O",|s|s.request_open()),self.header_icon(Icon::DeviceFloppy,"Save project · Ctrl/Cmd+S",false,|s|s.save()),self.header_button("Import WAV…","Import mono or stereo WAV · Ctrl/Cmd+I",|s|s.open_dialog(FileAction::Import)),self.header_button("Export…","Export stereo WAV · Ctrl/Cmd+E",|s|s.open_dialog(FileAction::Export)),self.header_icon(Icon::HelpCircle,"Keyboard shortcuts and editing help",false,|s|s.dialog.set(Dialog::Help)),caption(if busy{"Working…"}else{""})}.spacing(10.).padding_insets(EdgeInsets::new(14.,6.,12.,6.)).frame_height(44.).background(PANEL))
+        AnyView::new(row!{Text::new("resonara").font_size(19.).color(TEXT),caption("AUDIO WORKSTATION"),Spacer::new(),label(format!("{}{}",ui::elide(&name,29),if dirty{"  •"}else{""})),Spacer::new(),self.header_button("Open…","Open a Resonara project · Ctrl/Cmd+O",|s|s.request_open()),self.header_icon(Icon::DeviceFloppy,"Save project · Ctrl/Cmd+S",false,|s|s.save()),self.header_button("Import audio…","Import mono or stereo audio · Ctrl/Cmd+I",|s|s.open_dialog(FileAction::Import)),self.header_button("Export…","Export stereo WAV · Ctrl/Cmd+E",|s|s.open_dialog(FileAction::Export)),self.header_icon(Icon::HelpCircle,"Keyboard shortcuts and editing help",false,|s|s.dialog.set(Dialog::Help)),caption(if busy{"Working…"}else{""})}.spacing(10.).padding_insets(EdgeInsets::new(14.,6.,12.,6.)).frame_height(44.).background(PANEL))
     }
     fn transport(&self) -> AnyView {
         let m = self.model.borrow();
@@ -1814,8 +1866,9 @@ impl Daw {
             ui::transport_group("TRANSPORT",row!{
                 self.header_icon(Icon::ChevronLeft,"Return to start · Home",false,|s|s.seek(0.)),
                 self.header_icon(if playing{Icon::PlayerPause}else{Icon::PlayerPlay},"Play / stop · Space",playing,|s|s.play()),
-                self.header_button("Stop","Stop playback",|s|s.stop_audio(true))
-            }.spacing(6.),116.),
+                self.header_button("Stop","Stop playback",|s|s.stop_audio(true)),
+                self.header_icon(Icon::Music,"Metronome · C · accented bar starts",self.metronome.get(),|s|s.toggle_metronome())
+            }.spacing(6.),150.),
             Surface::section(row!{
                 ui::lcd_group(format.caption(),counter::Counter::new(self.clock.clone()),COUNTER_WIDTH),
                 ui::lcd_group("BPM",ui::lcd_field(self.tempo_input.clone()).on_submit(move||tempo.submit_tempo()).blur_on_submit(true).input_guard(),56.),
@@ -1827,10 +1880,18 @@ impl Daw {
         }.spacing(CONTROL_GAP).padding_insets(EdgeInsets::new(14.,9.,14.,9.)).frame_height(66.).background(RAISED))
     }
     fn editbar(&self) -> AnyView {
+        let snap = if self.snap.get() {
+            format!(
+                "Snap: {}",
+                self.snap_grid_for(&self.model.borrow().project).caption
+            )
+        } else {
+            "Snap: off".into()
+        };
         AnyView::new(row!{
             self.header_icon(Icon::ArrowBackUp,"Undo · Ctrl/Cmd+Z",false,|s|s.undo(false)),self.header_icon(Icon::ArrowForwardUp,"Redo · Ctrl/Cmd+Shift+Z",false,|s|s.undo(true)),Rectangle::new().fill(LINE).frame(1.,20.),
             self.header_button(if self.tool.get()==0{"• Pointer  1"}else{"Pointer  1"},"Pointer: select, move, trim edges · 1",|s|s.tool.set(0)),self.header_button(if self.tool.get()==1{"• Split  2"}else{"Split  2"},"Scissors: click a region to split · 2",|s|s.tool.set(1)),
-            self.header_button(if self.snap.get(){"Snap: 100 ms"}else{"Snap: off"},"Toggle absolute 100 ms grid snapping",|s|s.snap.set(!s.snap.get())),Spacer::new(),
+            self.header_button(&snap,"Toggle snapping to the displayed musical/time/sample grid",|s|s.snap.set(!s.snap.get())),Spacer::new(),
             self.header_button(if self.follow_playhead.get(){"Follow"}else{"Fixed"},"Toggle playhead-follow scrolling",|s|s.toggle_follow()),self.header_icon(Icon::ZoomOut,"Zoom out · −",false,|s|s.zoom(2.)),self.header_icon(Icon::ZoomIn,"Zoom in · +",false,|s|s.zoom(0.5)),self.header_button("Fit","Fit project to timeline · F",|s|s.fit()),Rectangle::new().fill(LINE).frame(1.,20.),
             self.header_icon(Icon::List,"Toggle inspector · I",self.inspector.get(),|s|s.inspector.set(!s.inspector.get())),self.header_icon(Icon::Adjustments,"Toggle mixer · X",self.mixer_visible.get(),|s|s.mixer_visible.set(!s.mixer_visible.get()))
         }.spacing(6.).padding_insets(EdgeInsets::new(10.,3.,10.,3.)).frame_height(36.).background(PANEL))
@@ -1891,8 +1952,8 @@ impl Daw {
                 let (title, submit, description) = match action {
                     FileAction::Import => (
                         "Import audio",
-                        "Import WAV",
-                        "New track at 0:00 · mono/stereo WAV · audio is embedded when saved",
+                        "Import audio",
+                        "WAV / MP3 / FLAC / AIFF / OGG / M4A / AAC / CAF · mono/stereo",
                     ),
                     FileAction::Open => (
                         "Open project",
@@ -1971,11 +2032,11 @@ impl Daw {
                     "Click ruler   Set playhead       ← / →   Nudge 100 ms",
                     "1   Pointer       2   Scissors       S   Split at playhead",
                     "Drag a region to move it. Drag either edge to trim it.",
-                    "Snap locks edits to 100 ms. Turn it off for finer edits.",
+                    "Snap follows the display: musical notes/bars, 100 ms, or one sample. C toggles the metronome.",
                     "+ / −   Zoom       F   Fit project       I   Inspector       X   Mixer",
                     "↑ / ↓   Select track       M   Mute       Delete   Delete region",
                     "Ctrl/Cmd + Z   Undo       Shift + Ctrl/Cmd + Z   Redo",
-                    "Ctrl/Cmd + D   Duplicate track       Ctrl/Cmd + I   Import WAV",
+                    "Ctrl/Cmd + D   Duplicate track       Ctrl/Cmd + I   Import audio",
                     "Ctrl/Cmd + O   Open       Ctrl/Cmd + S   Save       Ctrl/Cmd + E   Export",
                     "Rename a track in the inspector and press Enter.",
                     "Track edits and mixer changes are undoable. Original audio stays intact.",
@@ -2266,7 +2327,7 @@ fn main() -> Result<()> {
         && std::env::var_os("RESONARA_PROFILE_WAV").is_some()
     {
         let mut p = Project::default();
-        p.import_wav(Path::new(
+        p.import_audio(Path::new(
             &std::env::var_os("RESONARA_PROFILE_WAV").unwrap(),
         ))?;
         p.tracks[0].gain = 10f32.powf(-18. / 20.);
@@ -2278,10 +2339,8 @@ fn main() -> Result<()> {
         p
     } else if let Some(p) = path {
         Project::load(Path::new(p))?
-    } else if args.iter().any(|a| a == "--empty") {
-        Project::default()
     } else {
-        Project::demo()
+        Project::default()
     };
     let mut app = Daw::new(project);
     if let Some(p) = path {

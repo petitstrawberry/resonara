@@ -259,6 +259,7 @@ fn callback_never_allocates_or_frees() {
     p.split(0, 12345).unwrap();
     p.split(0, 48000).unwrap();
     let c = Arc::new(Controls::new(&p));
+    c.metronome.store(true, Ordering::Relaxed);
     let mut e = Engine::new(&p, c, 44100, 0);
     let mut out = [0.; 512];
     ALLOCS.with(|v| v.set(0));

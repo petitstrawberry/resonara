@@ -254,12 +254,24 @@ impl Daw {
     }
     fn ruler_position(&self, x: i32, drag: RulerDrag) -> f64 {
         let m = self.model.borrow();
-        let end = m.project.duration() as f64 / m.project.sample_rate as f64;
-        (drag.start + (x as f32 / drag.width.max(1.)).clamp(0., 1.) as f64 * drag.span)
-            .clamp(0., end)
+        let end = if m.project.duration() == 0 && self.metronome.get() {
+            86400.
+        } else {
+            m.project.duration() as f64 / m.project.sample_rate as f64
+        };
+        let position = (drag.start
+            + (x as f32 / drag.width.max(1.)).clamp(0., 1.) as f64 * drag.span)
+            .clamp(0., end);
+        if self.snap.get() {
+            self.snap_grid_for(&m.project)
+                .position(position)
+                .clamp(0., end)
+        } else {
+            position
+        }
     }
     fn ruler_preview(&self, position: f64) {
-        self.cursor.set(format!("{position:.3}"));
+        self.cursor.set(crate::timeline::seconds_input(position));
         self.animate_playhead(position);
     }
     pub(super) fn ruler_event(&self, e: &Event, start: f64, span: f64, width: f32) -> bool {

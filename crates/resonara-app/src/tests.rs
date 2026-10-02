@@ -11,8 +11,12 @@ pub(super) struct TestAudio {
 }
 impl TestAudio {
     pub fn start(project: &Project, start: u64) -> Result<Self> {
+        Self::start_with_metronome(project, start, false)
+    }
+    pub fn start_with_metronome(project: &Project, start: u64, metronome: bool) -> Result<Self> {
         project.validate()?;
         let controls = Arc::new(resonara_core::Controls::new(project));
+        controls.metronome.store(metronome, Ordering::Relaxed);
         let engine =
             resonara_core::Engine::new(project, controls.clone(), project.sample_rate, start);
         Ok(Self {
@@ -2016,13 +2020,14 @@ fn gain_selection_save_open_and_history_never_leave_normalized_state_stale() {
 #[test]
 fn no_op_or_reverted_mixer_gestures_do_not_create_history() {
     let s = Daw::new(project());
+    let initial_master = s.master.get();
     s.mix(0, Some(1.), Some(0.), None);
     s.finish_mix();
     assert!(s.model.borrow().undo.is_empty());
     s.mix(0, Some(0.2), Some(0.3), None);
     s.master_change(0.4);
     s.mix(0, Some(1.), Some(0.), None);
-    s.master_change(0.8);
+    s.master_change(initial_master);
     s.finish_mix();
     assert!(s.model.borrow().undo.is_empty());
     assert!(!s.dirty());
@@ -3501,6 +3506,7 @@ fn bpm_field_next_to_counter_accepts_enter_without_global_shortcuts() {
 #[test]
 fn master_pointer_drag_updates_thumb_state_until_release_and_groups_history() {
     let s = Daw::new(project());
+    let initial_master = s.master.get();
     let mut tree = scarlet_ui::ElementTree::new();
     tree.set_root(s.mixer().create_element());
     tree.layout(scarlet_ui::LayoutConstraints::tight(600., 286.));
@@ -3551,7 +3557,7 @@ fn master_pointer_drag_updates_thumb_state_until_release_and_groups_history() {
     s.finish_mix();
     assert_eq!(s.model.borrow().undo.len(), 1);
     s.undo(false);
-    assert_eq!(s.master.get(), 0.8);
+    assert_eq!(s.master.get(), initial_master);
     s.undo(true);
     assert_eq!(s.master.get(), final_gain);
 }
@@ -4076,6 +4082,7 @@ fn blank_track_column_and_plus_add_empty_tracks_with_history_and_persistence() {
 #[test]
 fn ruler_capture_follows_drag_without_rebuilding_waveforms_and_clamps_and_cancels() {
     let s = Daw::new(project());
+    s.snap.set(false); // This regression checks continuous pointer capture; snapped input is tested separately.
     s.seek(0.4);
     s.view_start.set(0.2);
     s.view_span.set(0.8);
@@ -4684,4 +4691,345 @@ fn pending_native_picker_blocks_edits_io_and_close_without_replacing_receipt() {
     assert!(s.dialog.get() == Dialog::Native(FileAction::Save));
     s.cancel_picker();
     assert!(s.model.borrow().picker.is_some());
+}
+
+#[test]
+fn ruler_subdivisions_adapt_to_zoom_reset_at_odd_bars_and_paint_distinct_lengths() {
+    use scarlet_ui::renderer::{PaintCommand, PaintContext};
+    use timeline::{Format, TickKind, ruler_grid};
+    let meter = resonara_core::TimeSignature::default();
+    let fine = ruler_grid(Format::Bars, 0., 2., 800., 120., 48000, meter);
+    assert_eq!(fine.ticks.len(), 16);
+    for (i, tick) in fine.ticks.iter().enumerate() {
+        assert_eq!(tick.seconds, i as f64 * 0.125);
+        assert_eq!(
+            tick.kind,
+            if i == 0 {
+                TickKind::Bar
+            } else if i % 4 == 0 {
+                TickKind::Quarter
+            } else if i % 2 == 0 {
+                TickKind::Eighth
+            } else {
+                TickKind::Sixteenth
+            }
+        );
+    }
+    let mut element = crate::ruler::Marks {
+        ticks: fine.ticks,
+        start: 0.,
+        span: 2.,
+        size: Size::new(800., 30.),
+    }
+    .create_element();
+    element.layout(scarlet_ui::LayoutConstraints::tight(800., 30.));
+    let mut paint = PaintContext::new();
+    element
+        .render_object()
+        .unwrap()
+        .paint(&mut paint, Point::new(20., 10.));
+    assert_eq!(paint.commands().len(), 16);
+    for (i, cmd) in paint.commands().iter().enumerate() {
+        let PaintCommand::FillPath { path, .. } = cmd else {
+            panic!("missing ruler line")
+        };
+        let length = if i == 0 {
+            14.
+        } else if i % 4 == 0 {
+            11.
+        } else if i % 2 == 0 {
+            7.
+        } else {
+            4.
+        };
+        assert_eq!(path[0].x, 20. + i as f32 * 50.);
+        assert_eq!(path[0].y, 40. - length);
+        assert_eq!(path[2].y, 40.);
+    }
+    let medium = ruler_grid(Format::Bars, 0., 10., 300., 120., 48000, meter);
+    assert!(
+        medium
+            .ticks
+            .iter()
+            .all(|t| matches!(t.kind, TickKind::Bar | TickKind::Quarter | TickKind::Major))
+    );
+    let far = ruler_grid(Format::Bars, 0., 200., 200., 120., 48000, meter);
+    assert!(far.ticks.len() <= 3);
+    assert!(far.ticks.iter().all(|t| t.kind == TickKind::Major));
+    let odd = ruler_grid(
+        Format::Bars,
+        1.6,
+        1.,
+        400.,
+        120.,
+        48000,
+        resonara_core::TimeSignature {
+            numerator: 7,
+            denominator: 8,
+        },
+    );
+    assert!(
+        odd.ticks
+            .iter()
+            .any(|t| t.seconds == 1.75 && t.kind == TickKind::Bar)
+    );
+    assert!(
+        odd.ticks
+            .iter()
+            .any(|t| t.seconds == 2. && t.kind == TickKind::Eighth)
+    );
+    assert!(
+        odd.ticks
+            .iter()
+            .any(|t| t.seconds == 2.25 && t.kind == TickKind::Quarter)
+    );
+    assert!(
+        odd.ticks
+            .iter()
+            .all(|t| t.seconds >= 1.6 && t.seconds < 2.6)
+    );
+    let huge = ruler_grid(Format::Bars, 0., 86400., 100., 400., 48000, meter);
+    assert!(huge.ticks.len() < 20);
+}
+
+#[test]
+fn snap_uses_display_units_zoom_and_bar_boundaries() {
+    use timeline::{Format, snap_grid};
+    let meter = resonara_core::TimeSignature {
+        numerator: 7,
+        denominator: 8,
+    };
+    let fine = snap_grid(Format::Bars, 2., 800., 120., 48000, meter);
+    assert_eq!(fine.caption, "1/16");
+    assert_eq!(fine.position(0.19), 0.25);
+    let quarter = snap_grid(Format::Bars, 6., 200., 120., 48000, meter);
+    assert_eq!(quarter.caption, "1/4");
+    assert_eq!(quarter.position(1.65), 1.75);
+    assert_eq!(quarter.position(2.24), 2.25);
+    assert_eq!(quarter.position(-0.2), 0.);
+    let bar = snap_grid(Format::Bars, 20., 200., 120., 48000, meter);
+    assert_eq!(bar.caption, "bar");
+    assert_eq!(bar.position(3.3), 3.5);
+    let time = snap_grid(Format::Seconds, 2., 800., 120., 48000, meter);
+    assert!((time.position(0.19) - 0.2).abs() < 1e-12);
+    let samples = snap_grid(Format::Samples, 2., 800., 120., 48000, meter);
+    assert_eq!(samples.caption, "1 sample");
+    assert!((samples.position(10.4 / 48000.) * 48000. - 10.).abs() < 1e-12);
+}
+
+#[test]
+fn musical_snap_applies_to_ruler_split_and_move_and_edge_trims_with_undo() {
+    for (x, moved, expected) in [
+        (100, 180, (5000, 400, 8000)),
+        (34, 75, (4000, 2800, 5600)),
+        (200, 150, (1600, 400, 5400)),
+    ] {
+        let s = Daw::new(project());
+        s.view_span.set(1.2);
+        s.arrangement_size.set(Size::new(410., 500.));
+        assert_eq!(s.snap_grid_for(&s.model.borrow().project).caption, "1/16");
+        let before = s.model.borrow().project.clone();
+        assert!(s.timeline_event(0, &press(x)));
+        assert!(s.timeline_event(0, &Event::Mouse(MouseEvent::Moved { x: moved, y: 40 })));
+        assert!(s.timeline_event(
+            0,
+            &Event::Mouse(MouseEvent::ButtonReleased {
+                button: MouseButton::Left,
+                x: moved,
+                y: 40,
+                click_count: 1
+            })
+        ));
+        let m = s.model.borrow();
+        let c = &m.project.tracks[0].clips[0];
+        assert_eq!((c.start, c.source_offset, c.frames), expected);
+        drop(m);
+        s.undo(false);
+        assert_project(&s.model.borrow().project, &before);
+    }
+    let s = Daw::new(project());
+    s.view_span.set(1.);
+    s.arrangement_size.set(Size::new(1000., 500.));
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.ruler().create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1000., 30.));
+    dispatched_click(&mut tree, (HEADER + 790. * 0.61) as i32, 15);
+    assert_eq!(s.playhead.get(), 0.625);
+    s.split();
+    assert_eq!(s.model.borrow().project.tracks[0].clips[1].start, 5000);
+    // Single-sample snapping must survive conversion through the transport input.
+    s.time_format.set(timeline::Format::Samples);
+    s.view_span.set(0.01);
+    assert!(s.ruler_event(&press(1), 0., 0.01, 80.));
+    assert_eq!(s.playhead.get(), 1. / 8000.);
+    assert_eq!(s.seconds(&s.cursor.get()).unwrap(), 1);
+    s.cancel_ruler_drag();
+}
+
+#[test]
+fn metronome_empty_transport_and_live_toggle_keep_audio_and_project_state() {
+    let s = Daw::new(Project::default());
+    let before = s.model.borrow().project.clone();
+    assert!(s.handle_key(KeyEvent::Pressed {
+        keycode: KeyCode::Char('c'),
+        modifiers: KeyModifiers::default()
+    }));
+    assert!(s.metronome.get());
+    s.play();
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    s.model.borrow().audio.as_ref().unwrap().render(60000);
+    assert!(controls.position.load(Ordering::Relaxed) >= 60000);
+    assert!(controls.playing.load(Ordering::Relaxed));
+    s.toggle_metronome();
+    assert!(!controls.metronome.load(Ordering::Relaxed));
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    s.toggle_metronome();
+    assert!(controls.metronome.load(Ordering::Relaxed));
+    s.play();
+    assert!(s.model.borrow().audio.is_none());
+    assert_eq!(s.seconds(&s.cursor.get()).unwrap(), 60000);
+    s.play();
+    assert_eq!(
+        s.model
+            .borrow()
+            .audio
+            .as_ref()
+            .unwrap()
+            .controls
+            .position
+            .load(Ordering::Relaxed),
+        60000
+    );
+    assert_project(&s.model.borrow().project, &before);
+    assert!(!s.dirty());
+    assert!(s.model.borrow().undo.is_empty());
+}
+
+#[test]
+fn audio_browser_filters_and_async_import_accept_new_formats() {
+    let temp = Temp::new();
+    for name in [
+        "a.MP3",
+        "b.flac",
+        "c.AIFF",
+        "d.m4a",
+        "e.ogg",
+        "f.caf",
+        "notes.txt",
+        "unsupported.wma",
+    ] {
+        std::fs::write(temp.0.join(name), "fixture").unwrap();
+    }
+    std::fs::create_dir(temp.0.join("folder")).unwrap();
+    let s = Daw::new(Project::default());
+    s.dialog.set(Dialog::File(FileAction::Import));
+    s.path.set(temp.0.to_string_lossy().into_owned());
+    s.read_directory();
+    assert_eq!(
+        s.files
+            .get()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>(),
+        [
+            "folder", "a.MP3", "b.flac", "c.AIFF", "d.m4a", "e.ogg", "f.caf"
+        ]
+    );
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../resonara-core/tests/fixtures/audio/stereo.mp3");
+    submit(&s, FileAction::Import, &fixture);
+    finish_io(&s);
+    assert!(s.status.get().starts_with("Audio imported"));
+    assert_eq!(s.model.borrow().project.tracks.len(), 1);
+    assert_eq!(
+        s.model.borrow().project.tracks[0].clips[0].source_channels,
+        2
+    );
+    assert!(s.dirty());
+    s.undo(false);
+    assert!(s.model.borrow().project.tracks.is_empty());
+    assert!(!s.dirty());
+}
+
+#[test]
+fn native_audio_selection_decodes_all_supported_fixture_formats_and_undoes_import() {
+    let temp = Temp::new();
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../resonara-core/tests/fixtures/audio");
+    let uppercase_mp3 = temp.0.join("音声.MP3");
+    std::fs::copy(fixtures.join("stereo.mp3"), &uppercase_mp3).unwrap();
+    let mut paths: Vec<_> = [
+        "source.wav",
+        "stereo.flac",
+        "stereo.aiff",
+        "stereo.caf",
+        "alac.m4a",
+        "aac.m4a",
+        "stereo.aac",
+        "stereo.ogg",
+        "mono.flac",
+    ]
+    .iter()
+    .map(|name| fixtures.join(name))
+    .collect();
+    paths.push(uppercase_mp3);
+    for path in paths {
+        let s = Daw::new(Project::default());
+        s.dialog.set(Dialog::Native(FileAction::Import));
+        s.apply_picker_result(
+            FileAction::Import,
+            Ok(FileDialogOutcome::Selected(vec![path.clone().into()])),
+        );
+        assert!(
+            s.model.borrow().io.is_some(),
+            "Selection was rejected before decoding: {} · {}",
+            path.display(),
+            s.status.get()
+        );
+        assert_eq!(s.status.get(), "Importing audio…");
+        finish_io(&s);
+        assert!(
+            s.status.get().starts_with("Audio imported"),
+            "{} · {}",
+            path.display(),
+            s.status.get()
+        );
+        {
+            let m = s.model.borrow();
+            assert_eq!(m.project.tracks.len(), 1);
+            let clip = &m.project.tracks[0].clips[0];
+            assert!(!clip.samples.is_empty());
+            assert_eq!(
+                clip.source_channels,
+                if path.ends_with("mono.flac") { 1 } else { 2 }
+            );
+        }
+        assert!(s.dirty());
+        s.undo(false);
+        assert!(s.model.borrow().project.tracks.is_empty());
+        assert!(!s.dirty());
+    }
+}
+
+#[test]
+fn native_audio_import_filter_does_not_weaken_project_or_export_filters() {
+    let temp = Temp::new();
+    for (action, path) in [
+        (FileAction::Import, PathBuf::from("relative.mp3")),
+        (FileAction::Import, temp.0.join("session.json")),
+        (FileAction::Import, temp.0.join("unsupported.wma")),
+        (FileAction::Export, temp.0.join("mix.mp3")),
+        (FileAction::Open, temp.0.join("audio.mp3")),
+        (FileAction::Save, temp.0.join("audio.mp3")),
+    ] {
+        let s = Daw::new(project());
+        let before = Daw::snapshot(&s.model.borrow());
+        s.apply_picker_result(action, Ok(FileDialogOutcome::Selected(vec![path.into()])));
+        assert!(s.model.borrow().io.is_none());
+        assert!(!s.dialog_error.get().is_empty());
+        assert_snapshot(&s.model.borrow(), &before);
+    }
 }

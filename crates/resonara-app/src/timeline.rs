@@ -1,10 +1,207 @@
 //! Musical display over the unchanged sample-based audio timeline.
 use resonara_core::TimeSignature;
+/// Keep sample-accurate transport positions, while retaining compact millisecond values.
+pub(crate) fn seconds_input(seconds: f64) -> String {
+    let mut value = format!("{seconds:.9}");
+    let minimum = value.find('.').unwrap() + 4;
+    while value.len() > minimum && value.ends_with('0') {
+        value.pop();
+    }
+    value
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Bars,
     Seconds,
     Samples,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TickKind {
+    Major,
+    Bar,
+    Quarter,
+    Eighth,
+    Sixteenth,
+}
+impl TickKind {
+    pub fn length(self) -> f32 {
+        match self {
+            Self::Major | Self::Bar => 14.,
+            Self::Quarter => 11.,
+            Self::Eighth => 7.,
+            Self::Sixteenth => 4.,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RulerTick {
+    pub seconds: f64,
+    pub kind: TickKind,
+}
+pub(crate) struct RulerGrid {
+    pub label_step: f64,
+    pub ticks: Vec<RulerTick>,
+}
+pub(crate) struct SnapGrid {
+    pub step: f64,
+    pub bar: Option<f64>,
+    pub caption: String,
+}
+impl SnapGrid {
+    pub fn position(&self, seconds: f64) -> f64 {
+        let seconds = seconds.max(0.);
+        if let Some(bar) = self.bar {
+            let start = (seconds / bar).floor() * bar;
+            let offset = seconds - start;
+            let nearest = (offset / self.step).round() * self.step;
+            let snapped = if bar - offset < (nearest - offset).abs() {
+                bar
+            } else {
+                nearest.min(bar)
+            };
+            start + snapped
+        } else {
+            (seconds / self.step).round() * self.step
+        }
+    }
+}
+pub(crate) fn snap_grid(
+    format: Format,
+    span: f64,
+    width: f32,
+    tempo: f64,
+    rate: u32,
+    meter: TimeSignature,
+) -> SnapGrid {
+    match format {
+        Format::Seconds => SnapGrid {
+            step: 0.1,
+            bar: None,
+            caption: "100 ms".into(),
+        },
+        Format::Samples => SnapGrid {
+            step: 1. / rate as f64,
+            bar: None,
+            caption: "1 sample".into(),
+        },
+        Format::Bars => {
+            let quarter = 60. / tempo;
+            let bar = meter.beat_seconds(tempo) * f64::from(meter.numerator);
+            for (step, caption) in [
+                (quarter / 4., "1/16"),
+                (quarter / 2., "1/8"),
+                (quarter, "1/4"),
+            ] {
+                if step <= bar && step / span * width as f64 >= 12. {
+                    return SnapGrid {
+                        step,
+                        bar: Some(bar),
+                        caption: caption.into(),
+                    };
+                }
+            }
+            let mut bars = 1u64;
+            while bar * bars as f64 / span * (width as f64) < 12. && bars < (1 << 32) {
+                bars *= 2;
+            }
+            SnapGrid {
+                step: bar * bars as f64,
+                bar: None,
+                caption: if bars == 1 {
+                    "bar".into()
+                } else {
+                    format!("{bars} bars")
+                },
+            }
+        }
+    }
+}
+pub(crate) fn ruler_grid(
+    format: Format,
+    start: f64,
+    span: f64,
+    width: f32,
+    tempo: f64,
+    rate: u32,
+    meter: TimeSignature,
+) -> RulerGrid {
+    if !start.is_finite()
+        || !span.is_finite()
+        || span <= 0.
+        || !width.is_finite()
+        || width <= 0.
+        || !tempo.is_finite()
+        || tempo <= 0.
+        || !meter.valid()
+        || rate == 0
+    {
+        return RulerGrid {
+            label_step: 1.,
+            ticks: vec![],
+        };
+    }
+    let quarter = 60. / tempo;
+    let mut label_step = format.step(span, tempo, rate, meter);
+    if format == Format::Bars {
+        label_step = label_step.max(quarter / 4.);
+    }
+    while label_step / span * (width as f64) < 100. {
+        label_step *= 2.;
+    }
+    let mut ticks = Vec::new();
+    let visible = |seconds: f64| seconds >= start && seconds < start + span;
+    if format == Format::Bars {
+        let bar_ticks = meter.ticks_per_beat() * u64::from(meter.numerator);
+        let bar = meter.beat_seconds(tempo) * f64::from(meter.numerator);
+        if bar / span * width as f64 >= 12. {
+            let unit = [240u64, 480, 960]
+                .into_iter()
+                .find(|unit| (*unit as f64 / 960. * quarter) / span * width as f64 >= 12.)
+                .unwrap_or(bar_ticks);
+            let first_bar = (start / bar).floor().max(0.) as u64;
+            let bar_count = (span / bar).ceil().min(4096.) as u64 + 1;
+            for index in first_bar..=first_bar.saturating_add(bar_count) {
+                for offset in (0..bar_ticks).step_by(unit as usize) {
+                    let seconds = index as f64 * bar + offset as f64 / 960. * quarter;
+                    if visible(seconds) {
+                        let kind = if offset == 0 {
+                            TickKind::Bar
+                        } else if offset.is_multiple_of(960) {
+                            TickKind::Quarter
+                        } else if offset.is_multiple_of(480) {
+                            TickKind::Eighth
+                        } else {
+                            TickKind::Sixteenth
+                        };
+                        ticks.push(RulerTick { seconds, kind });
+                    }
+                    if ticks.len() >= 4096 {
+                        break;
+                    }
+                }
+                if ticks.len() >= 4096 {
+                    break;
+                }
+            }
+        }
+    }
+    let first = (start / label_step).ceil().max(0.) as u64;
+    let count = (span / label_step).ceil().min(4096.) as u64;
+    for index in first..=first.saturating_add(count) {
+        let seconds = index as f64 * label_step;
+        if visible(seconds)
+            && !ticks
+                .iter()
+                .any(|t| (t.seconds - seconds).abs() < span / width as f64 * 0.5)
+        {
+            ticks.push(RulerTick {
+                seconds,
+                kind: TickKind::Major,
+            });
+        }
+    }
+    ticks.sort_by(|a, b| a.seconds.total_cmp(&b.seconds));
+    RulerGrid { label_step, ticks }
 }
 impl Format {
     pub fn next(self) -> Self {
