@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/resonara-clap", "crates/resonara-core", "crates/resonara-platform", "crates/resonara-app", "vendor/sws-protocol", "plugins/resonara-freeverb/editor"]
+members = ["crates/resonara-clap", "crates/resonara-core", "crates/resonara-platform", "crates/resonara-app", "vendor/sws-protocol", "crates/scarlet-clap-gui"]
+exclude = ["plugins/resonara-freeverb", "plugins/resonara-freeverb/editor"]
 [patch."https://github.com/petitstrawberry/Scarlet"]
 sws-protocol = { path = "vendor/sws-protocol" }
 [workspace.dependencies]

@@ -32,3 +32,29 @@ unsafe extern "C" fn memset(dst: *mut c_void, byte: c_int, size: usize) -> *mut 
     }
     dst
 }
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, size: usize) -> c_int {
+    for i in 0..size {
+        let x = unsafe { ptr::read_volatile(a.cast::<u8>().add(i)) };
+        let y = unsafe { ptr::read_volatile(b.cast::<u8>().add(i)) };
+        if x != y {
+            return x as c_int - y as c_int;
+        }
+    }
+    0
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn memmove(dst: *mut c_void, src: *const c_void, size: usize) -> *mut c_void {
+    if (dst as usize) < (src as usize) {
+        unsafe { memcpy(dst, src, size) };
+    } else {
+        for i in (0..size).rev() {
+            let b = unsafe { ptr::read_volatile(src.cast::<u8>().add(i)) };
+            unsafe {
+                ptr::write_volatile(dst.cast::<u8>().add(i), b);
+            }
+        }
+    }
+    dst
+}

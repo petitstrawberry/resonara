@@ -6,7 +6,6 @@ edition = "2024"
 log = "=0.4.34"
 resonara-core = { path = "../resonara-core" }
 resonara-platform = { path = "../resonara-platform" }
-resonara-freeverb-editor = { path = "../../plugins/resonara-freeverb/editor" }
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
 scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "4005841e514690f3328c6e09b8b2b77656fa07de", default-features = false, features = ["std", "platform-winit"] }
 

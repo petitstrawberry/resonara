@@ -35,6 +35,8 @@ fn bundle_freeverb() {
         "Cargo.lock",
         "build.rs",
         "src",
+        "editor",
+        "../../crates/scarlet-clap-gui",
         "vendor/clap-sys",
     ] {
         println!("cargo:rerun-if-changed={}", plugin.join(name).display());
@@ -73,6 +75,34 @@ fn bundle_freeverb() {
     fs::create_dir_all(&directory).unwrap();
     let temporary = directory.join("resonara-freeverb.clap.tmp");
     fs::copy(build.join(&target).join("release").join(file), &temporary).unwrap();
+    if target_os == "macos" {
+        let output = Command::new("otool")
+            .arg("-L")
+            .arg(&temporary)
+            .output()
+            .expect("inspect Freeverb dependencies");
+        assert!(
+            output.status.success(),
+            "Freeverb dependency inspection failed"
+        );
+        for line in String::from_utf8(output.stdout).unwrap().lines().skip(2) {
+            let library = line.trim().split(" (").next().unwrap();
+            if library.starts_with("/nix/store/") && library.ends_with("/libiconv.2.dylib") {
+                let status = Command::new("install_name_tool")
+                    .args(["-change", library, "/usr/lib/libiconv.2.dylib"])
+                    .arg(&temporary)
+                    .status()
+                    .expect("link Freeverb to system libiconv");
+                assert!(status.success(), "Freeverb dependency normalization failed");
+            }
+        }
+        let status = Command::new("codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&temporary)
+            .status()
+            .expect("sign bundled Freeverb");
+        assert!(status.success(), "Bundled Freeverb signing failed");
+    }
     fs::rename(temporary, directory.join("resonara-freeverb.clap")).unwrap();
     let mut notices = String::new();
     for name in [

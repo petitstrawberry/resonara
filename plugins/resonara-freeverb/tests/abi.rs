@@ -104,3 +104,49 @@ fn abi_matches_registry_bindings() {
         size_of::<clap_sys_upstream::ext::audio_ports::clap_audio_port_info>()
     );
 }
+
+#[test]
+fn gui_and_timer_abi_matches_registry_bindings() {
+    macro_rules! same {
+        ($module:ident::$ty:ident, $($field:ident),+ $(,)?) => {{
+            type Local = clap_sys::ext::$module::$ty;
+            type Original = clap_sys_upstream::ext::$module::$ty;
+            assert_eq!(size_of::<Local>(), size_of::<Original>());
+            assert_eq!(align_of::<Local>(), align_of::<Original>());
+            $(assert_eq!(offset_of!(Local, $field), offset_of!(Original, $field));)+
+        }};
+    }
+    same!(
+        gui::clap_plugin_gui,
+        is_api_supported,
+        get_preferred_api,
+        create,
+        destroy,
+        set_scale,
+        get_size,
+        can_resize,
+        get_resize_hints,
+        adjust_size,
+        set_size,
+        set_parent,
+        set_transient,
+        suggest_title,
+        show,
+        hide
+    );
+    same!(gui::clap_window, api, specific);
+    same!(
+        gui::clap_host_gui,
+        resize_hints_changed,
+        request_resize,
+        request_show,
+        request_hide,
+        closed
+    );
+    same!(timer_support::clap_plugin_timer_support, on_timer);
+    same!(
+        timer_support::clap_host_timer_support,
+        register_timer,
+        unregister_timer
+    );
+}

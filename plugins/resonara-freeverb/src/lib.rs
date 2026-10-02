@@ -20,7 +20,11 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 
+#[cfg(all(feature = "gui", any(target_os = "macos", target_os = "scarlet")))]
+extern crate alloc;
 mod dsp;
+#[cfg(all(feature = "gui", any(target_os = "macos", target_os = "scarlet")))]
+mod gui;
 const PLUGIN_ID: &CStr = c"org.resonara.freeverb";
 const CAPACITY: usize = 8;
 const PARAM_COUNT: usize = 5;
@@ -63,6 +67,11 @@ struct Slot {
     host_params: AtomicPtr<clap_host_params>,
     values: [AtomicU64; PARAM_COUNT],
     dsp: UnsafeCell<dsp::Freeverb>,
+    pending: [AtomicU64; PARAM_COUNT],
+    pending_mask: AtomicU32,
+    gesture_stage: [AtomicU8; PARAM_COUNT],
+    #[cfg(all(feature = "gui", any(target_os = "macos", target_os = "scarlet")))]
+    gui: UnsafeCell<Option<alloc::boxed::Box<gui::Gui>>>,
     lifecycle: AtomicU8,
     max_frames: AtomicU32,
 }
@@ -101,6 +110,11 @@ impl Slot {
                 AtomicU64::new(DEFAULTS[4].to_bits()),
             ],
             dsp: UnsafeCell::new(dsp::Freeverb::empty()),
+            pending: [const { AtomicU64::new(0) }; PARAM_COUNT],
+            pending_mask: AtomicU32::new(0),
+            gesture_stage: [const { AtomicU8::new(0) }; PARAM_COUNT],
+            #[cfg(all(feature = "gui", any(target_os = "macos", target_os = "scarlet")))]
+            gui: UnsafeCell::new(None),
             lifecycle: AtomicU8::new(CREATED),
             max_frames: AtomicU32::new(0),
         }
@@ -120,6 +134,99 @@ impl Slot {
         dsp.set_room_size(self.value(2));
         dsp.set_dampening(self.value(3));
         dsp.set_width(self.value(4));
+    }
+    fn queue_gui(&self, values: [f64; PARAM_COUNT]) {
+        for (id, value) in values.into_iter().enumerate() {
+            let queued = self.pending_mask.load(Ordering::Acquire) & (1 << id) != 0
+                || self.gesture_stage[id].load(Ordering::Relaxed) == 1;
+            let current = if queued {
+                f64::from_bits(self.pending[id].load(Ordering::Acquire))
+            } else {
+                self.value(id)
+            };
+            if value.is_finite() && (0. ..=1.).contains(&value) && value != current {
+                self.pending[id].store(value.to_bits(), Ordering::Release);
+                self.pending_mask.fetch_or(1 << id, Ordering::Release);
+            }
+        }
+        let host = self.host.load(Ordering::Acquire);
+        if let Some(params) = unsafe { self.host_params.load(Ordering::Acquire).as_ref() } {
+            if let Some(flush) = params.request_flush {
+                unsafe { flush(host) };
+            }
+        }
+    }
+    // Audio-thread only while active, main-thread only while inactive. CLAP
+    // serializes process/flush. Output backpressure preserves unfinished gestures.
+    fn emit_gui(&self, output: *const clap_output_events) {
+        let Some(out) = (unsafe { output.as_ref() }) else {
+            return;
+        };
+        let Some(push) = out.try_push else {
+            return;
+        };
+        for id in 0..PARAM_COUNT {
+            let bit = 1 << id;
+            let mut stage = self.gesture_stage[id].load(Ordering::Relaxed);
+            if stage == 0 {
+                if self.pending_mask.fetch_and(!bit, Ordering::AcqRel) & bit == 0 {
+                    continue;
+                }
+                let begin = clap_event_param_gesture {
+                    header: clap_event_header {
+                        size: core::mem::size_of::<clap_event_param_gesture>() as u32,
+                        time: 0,
+                        space_id: CLAP_CORE_EVENT_SPACE_ID,
+                        type_: CLAP_EVENT_PARAM_GESTURE_BEGIN,
+                        flags: CLAP_EVENT_IS_LIVE,
+                    },
+                    param_id: id as u32,
+                };
+                if !unsafe { push(output, &begin.header) } {
+                    self.pending_mask.fetch_or(bit, Ordering::Release);
+                    continue;
+                }
+                stage = 1;
+                self.gesture_stage[id].store(stage, Ordering::Relaxed);
+            }
+            if stage == 1 {
+                let value = f64::from_bits(self.pending[id].load(Ordering::Acquire));
+                let event = clap_event_param_value {
+                    header: clap_event_header {
+                        size: core::mem::size_of::<clap_event_param_value>() as u32,
+                        time: 0,
+                        space_id: CLAP_CORE_EVENT_SPACE_ID,
+                        type_: CLAP_EVENT_PARAM_VALUE,
+                        flags: CLAP_EVENT_IS_LIVE,
+                    },
+                    param_id: id as u32,
+                    cookie: ptr::null_mut(),
+                    note_id: -1,
+                    port_index: -1,
+                    channel: -1,
+                    key: -1,
+                    value,
+                };
+                if !unsafe { push(output, &event.header) } {
+                    continue;
+                }
+                self.set(id, value);
+                self.gesture_stage[id].store(2, Ordering::Relaxed);
+            }
+            let end = clap_event_param_gesture {
+                header: clap_event_header {
+                    size: core::mem::size_of::<clap_event_param_gesture>() as u32,
+                    time: 0,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: CLAP_EVENT_PARAM_GESTURE_END,
+                    flags: CLAP_EVENT_IS_LIVE,
+                },
+                param_id: id as u32,
+            };
+            if unsafe { push(output, &end.header) } {
+                self.gesture_stage[id].store(0, Ordering::Relaxed);
+            }
+        }
     }
     fn transition(&self, from: u8, to: u8) -> bool {
         self.lifecycle
@@ -226,6 +333,10 @@ unsafe extern "C" fn create(
             }
             instance.lifecycle.store(CREATED, Ordering::Relaxed);
             instance.max_frames.store(0, Ordering::Relaxed);
+            instance.pending_mask.store(0, Ordering::Relaxed);
+            for stage in &instance.gesture_stage {
+                stage.store(0, Ordering::Relaxed);
+            }
             unsafe {
                 (*instance.plugin.get()).plugin_data = (instance as *const Slot).cast_mut().cast();
             }
@@ -263,6 +374,10 @@ unsafe extern "C" fn destroy(plugin: *const clap_plugin) {
         && s.lifecycle.load(Ordering::Acquire) <= INITIALIZED
         && s.thread_ok(false)
     {
+        #[cfg(all(feature = "gui", any(target_os = "macos", target_os = "scarlet")))]
+        unsafe {
+            gui::GUI.destroy.unwrap()(plugin)
+        };
         s.taken.store(false, Ordering::Release);
     }
 }
@@ -400,6 +515,7 @@ unsafe extern "C" fn process(
     unsafe {
         (*p.audio_outputs).constant_mask = 0;
     }
+    s.emit_gui(p.out_events);
     let mut cursor = 0;
     unsafe {
         s.apply_values();
@@ -456,6 +572,16 @@ unsafe extern "C" fn extension(plugin: *const clap_plugin, id: *const c_char) ->
     };
     if s.lifecycle.load(Ordering::Acquire) < INITIALIZED {
         return ptr::null();
+    }
+    #[cfg(all(feature = "gui", any(target_os = "macos", target_os = "scarlet")))]
+    {
+        if unsafe { is_id(id, clap_sys::ext::gui::CLAP_EXT_GUI) } {
+            return (&gui::GUI as *const clap_sys::ext::gui::clap_plugin_gui).cast();
+        }
+        if unsafe { is_id(id, clap_sys::ext::timer_support::CLAP_EXT_TIMER_SUPPORT) } {
+            return (&gui::TIMER as *const clap_sys::ext::timer_support::clap_plugin_timer_support)
+                .cast();
+        }
     }
     if unsafe { is_id(id, CLAP_EXT_AUDIO_PORTS) } {
         (&PORTS as *const clap_plugin_audio_ports).cast()
@@ -609,7 +735,7 @@ unsafe extern "C" fn text_to_value(
 unsafe extern "C" fn flush(
     plugin: *const clap_plugin,
     input: *const clap_input_events,
-    _output: *const clap_output_events,
+    output: *const clap_output_events,
 ) {
     let Some(s) = (unsafe { slot(plugin) }) else {
         return;
@@ -618,6 +744,7 @@ unsafe extern "C" fn flush(
     if !s.thread_ok(active) {
         return;
     }
+    s.emit_gui(output);
     let Some(events) = (unsafe { input.as_ref() }) else {
         return;
     };
@@ -709,7 +836,10 @@ unsafe extern "C" fn load(plugin: *const clap_plugin, stream: *const clap_istrea
     true
 }
 
-#[cfg(not(test))]
+#[cfg(all(
+    not(test),
+    not(all(feature = "gui", any(target_os = "macos", target_os = "scarlet")))
+))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     // No intended path panics. A foreign ABI contract violation must never unwind.
@@ -718,8 +848,17 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(all(feature = "gui", target_os = "macos"))))]
 mod memory;
 
 #[cfg(test)]
 mod tests;
+
+// The legacy no_std ScarletUI facade links scarlet-rt's standalone _start.
+// A CLAP DSO is entered exclusively through clap_entry, never through _start.
+// Satisfy that runtime's link contract without providing an application entry.
+#[cfg(all(not(test), feature = "gui", target_os = "scarlet"))]
+#[unsafe(no_mangle)]
+extern "C" fn main() -> ! {
+    panic!("A CLAP library must be loaded through clap_entry")
+}

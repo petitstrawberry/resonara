@@ -8,7 +8,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -50,6 +50,40 @@ impl AudioDeadline {
     }
 }
 
+fn reserve_deadline() -> Option<AudioDeadline> {
+    if std::env::var("RESONARA_SCARLET_DEADLINE").as_deref() == Ok("0") {
+        return None;
+    }
+    match AudioDeadline::reserve() {
+        Ok(reservation) => Some(reservation),
+        Err(error) => {
+            eprintln!(
+                "[Resonara audio] deadline unavailable: {error:?}; retaining current scheduler"
+            );
+            None
+        }
+    }
+}
+fn connect_stream(cancelled: impl Fn() -> bool) -> Result<(SasClient, SasStream)> {
+    let mut client = SasClient::connect()
+        .map_err(|e| format!("Scarlet audio: {}. Check that SAS is running.", e.as_str()))?;
+    let config = StreamConfig {
+        format: FORMAT_S16LE,
+        rate: SAMPLE_RATE,
+        channels: CHANNELS as u16,
+        period_frames: PERIOD_FRAMES as u32,
+        buffer_frames: (PERIOD_FRAMES * 4) as u32,
+    };
+    let started = Instant::now();
+    let stream = client
+        .configure_cancellable(&config, || {
+            cancelled() || started.elapsed() >= CONNECT_TIMEOUT
+        })
+        .map_err(|e| format!("Scarlet audio configuration: {}", e.as_str()))?
+        .ok_or("Scarlet audio configuration timed out or cancelled")?;
+    Ok((client, stream))
+}
+
 impl Drop for AudioDeadline {
     fn drop(&mut self) {
         // Report after rendering stops, never log or query scheduler state per
@@ -71,6 +105,8 @@ impl Drop for AudioDeadline {
 pub struct Audio {
     stop: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
+    transport: Arc<AtomicU64>,
+    desired_playing: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     playback: Playback,
     _owner_thread: PhantomData<Rc<()>>,
@@ -88,17 +124,34 @@ impl Audio {
         self.playback.open_editor(slot)
     }
     pub fn has_open_editors(&self) -> bool {
-        false
+        self.playback.has_open_editors().unwrap_or(false)
     }
     pub fn pause(&self) {
-        self.controls.playing.store(false, Ordering::Relaxed);
+        self.desired_playing.store(false, Ordering::Release);
+        self.controls.playing.store(false, Ordering::Release);
     }
-    // SAS drains/finishes its producer at Stop; restart it through normal setup.
-    pub fn seek(&self, _: u64) -> bool {
-        false
+    // Recreate only the SAS stream, retaining the renderer and CLAP owners.
+    // The worker adopts transport commands after dropping any queued PCM.
+    pub fn seek(&self, start: u64) -> bool {
+        let resume = self.desired_playing.load(Ordering::Acquire);
+        self.request_transport(start, resume)
     }
-    pub fn resume(&self, _: u64, _: bool) -> bool {
-        false
+    pub fn resume(&self, start: u64, metronome: bool) -> bool {
+        self.controls.metronome.store(metronome, Ordering::Relaxed);
+        self.request_transport(start, true)
+    }
+    fn request_transport(&self, start: u64, resume: bool) -> bool {
+        if self.controls.error.load(Ordering::Acquire) {
+            return false;
+        }
+        self.desired_playing.store(resume, Ordering::Release);
+        self.controls.position.store(start, Ordering::Relaxed);
+        self.finished.store(false, Ordering::Release);
+        self.transport.store(
+            start.min((1u64 << 63) - 2) | ((resume as u64) << 63),
+            Ordering::Release,
+        );
+        true
     }
     pub fn close_editors(&self) -> Result<()> {
         self.playback.close_editors()
@@ -123,70 +176,103 @@ impl Audio {
     }
 
     pub fn start_with_metronome(project: &Project, start: u64, metronome: bool) -> Result<Self> {
+        Self::start_transport(project, start, metronome, true)
+    }
+    pub fn start_paused(project: &Project) -> Result<Self> {
+        Self::start_transport(project, 0, false, false)
+    }
+    fn start_transport(
+        project: &Project,
+        start: u64,
+        metronome: bool,
+        playing: bool,
+    ) -> Result<Self> {
         project.validate()?;
-        let mut client = SasClient::connect()
-            .map_err(|e| format!("Scarlet audio: {}. Check that SAS is running.", e.as_str()))?;
-        let config = StreamConfig {
-            format: FORMAT_S16LE,
-            rate: SAMPLE_RATE,
-            channels: CHANNELS as u16,
-            period_frames: PERIOD_FRAMES as u32,
-            buffer_frames: (PERIOD_FRAMES * 4) as u32,
-        };
-        let started = Instant::now();
-        let mut stream = client
-            .configure_cancellable(&config, || started.elapsed() >= CONNECT_TIMEOUT)
-            .map_err(|e| format!("Scarlet audio configuration: {}", e.as_str()))?
-            .ok_or("Scarlet audio configuration timed out")?;
+        let connection = connect_stream(|| false)?;
         // Resolve all fallible device setup before loading/activating plugins.
         // After guard extraction, only spawn can fail; its captured Engine is
         // dropped before the caller's guards if thread creation fails.
         let (playback, mut engine) = Playback::new(project, SAMPLE_RATE, start, metronome)?;
         let controls = playback.controls.clone();
+        controls.playing.store(playing, Ordering::Release);
+        let transport = Arc::new(AtomicU64::new(u64::MAX));
+        let worker_transport = transport.clone();
+        let desired_playing = Arc::new(AtomicBool::new(playing));
+        let worker_desired_playing = desired_playing.clone();
         let stop = Arc::new(AtomicBool::new(false));
-        let finished = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(!playing));
         let worker_stop = stop.clone();
         let worker_finished = finished.clone();
         let worker_controls = controls.clone();
         let worker = thread::Builder::new()
             .name("resonara-sas".into())
             .spawn(move || {
+                let mut connection = Some(connection);
                 let mut pump = Pump::new();
-                let mut deadline = if std::env::var("RESONARA_SCARLET_DEADLINE").as_deref() == Ok("0") {
-                    eprintln!("[Resonara audio] deadline disabled by environment");
-                    None
-                } else {
-                    match AudioDeadline::reserve() {
-                        Ok(reservation) => Some(reservation),
-                        Err(error) => {
-                            eprintln!(
-                                "[Resonara audio] deadline unavailable: {error:?}; retaining current scheduler"
-                            );
-                            None
-                        }
-                    }
-                };
+                let mut idle = !playing;
+                let mut deadline = if playing { reserve_deadline() } else { None };
                 let mut progressed = Instant::now();
-                loop {
+                let mut silence = [0i16; PERIOD_FRAMES * CHANNELS];
+                while !worker_stop.load(Ordering::Acquire) {
+                    let command = worker_transport.swap(u64::MAX, Ordering::AcqRel);
+                    if command != u64::MAX {
+                        drop(deadline.take());
+                        drop(connection.take());
+                        match connect_stream(|| worker_stop.load(Ordering::Acquire)) {
+                            Ok(next) => connection = Some(next),
+                            Err(error) => {
+                                if !worker_stop.load(Ordering::Acquire) {
+                                    eprintln!("[Resonara audio] resume failed: {error}");
+                                    worker_controls.error.store(true, Ordering::Release);
+                                    worker_controls.playing.store(false, Ordering::Release);
+                                }
+                                break;
+                            }
+                        }
+                        let start = command & !(1u64 << 63);
+                        // A Stop received while configuration was pending must
+                        // still win over the already-consumed Resume command.
+                        idle = command & (1u64 << 63) == 0
+                            || !worker_desired_playing.load(Ordering::Acquire);
+                        if idle {
+                            worker_controls.playing.store(false, Ordering::Release);
+                            resonara_core::Engine::request_seek(&worker_controls, start);
+                        } else {
+                            // This worker alone renders, so seek and play can be
+                            // adopted here without a deferred resume bit that
+                            // could override a subsequent UI Stop at render time.
+                            resonara_core::Engine::request_seek(&worker_controls, start);
+                            worker_controls.playing.store(true, Ordering::Release);
+                            if !worker_desired_playing.load(Ordering::Acquire) {
+                                worker_controls.playing.store(false, Ordering::Release);
+                                idle = true;
+                            } else {
+                                deadline = reserve_deadline();
+                            }
+                        }
+                        pump = Pump::new();
+                        progressed = Instant::now();
+                        worker_finished.store(idle, Ordering::Release);
+                    }
                     engine.apply_pending();
+                    if idle {
+                        // Service active CLAP flushes and graph swaps while stopped,
+                        // without feeding SAS or advancing the transport.
+                        engine.render(&mut silence, CHANNELS);
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
                     match pump.step(
                         engine.engine_mut(),
-                        &mut stream,
-                        worker_stop.load(Ordering::Acquire),
+                        &mut connection.as_mut().unwrap().1,
+                        false,
                     ) {
                         Ok(Step::Finished) => {
-                            // Release the reservation before retaining SAS's
-                            // idle connection for its final hardware tail.
                             drop(deadline.take());
                             worker_finished.store(true, Ordering::Release);
-                            // SAS reports client-ring consumption, not hardware
-                            // playback. Closing its final client stops the device
-                            // and discards that tail. The application retains this
-                            // idle connection until the next explicit action.
-                            while !worker_stop.load(Ordering::Acquire) {
-                                thread::sleep(Duration::from_millis(10));
-                            }
-                            break;
+                            // Preserve SAS's hardware tail and the exact plugin
+                            // instances until a transport command or Audio drop.
+                            idle = true;
                         }
                         Ok(Step::Cancelled) => break,
                         Ok(Step::Progress) => progressed = Instant::now(),
@@ -194,20 +280,21 @@ impl Audio {
                             thread::sleep(Duration::from_millis(1));
                         }
                         _ => {
-                            worker_controls.error.store(true, Ordering::Relaxed);
-                            worker_controls.playing.store(false, Ordering::Relaxed);
+                            worker_controls.error.store(true, Ordering::Release);
+                            worker_controls.playing.store(false, Ordering::Release);
                             break;
                         }
                     }
                 }
                 drop(deadline);
-                // Stop/seek drops without a blocking drain/close RPC to SAS.
-                drop(stream);
-                drop(client);
+                // Connection teardown never issues a blocking drain RPC.
+                drop(connection);
             })?;
         Ok(Self {
             stop,
             finished,
+            transport,
+            desired_playing,
             worker: Some(worker),
             playback,
             _owner_thread: PhantomData,

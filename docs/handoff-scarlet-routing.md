@@ -1,3 +1,13 @@
+## 2026-10-02: Freeverb の CLAP 埋め込み GUI
+
+- Freeverb の専用ホスト popup を削除。プラグインが `clap.gui` / timer を実装し、Pro-Q と同じ汎用ホスト経路で独立した複数画面を開く。
+- 共通 ScarletUI レイアウトはプラグイン側。macOS は `NSView`、Scarlet は実験的な C parent bridge `org.scarlet-os.sws/1` へ埋め込む。後者は CLAP 標準 API ではない。
+- preset は Select、値は常に小数2桁、編集は即時反映。CLAP 出力イベントが値をホストに返し、project/state/Undo と同期する。
+- Cocoa の上下反転を修正。更新のない AppKit 再描画も最後の bitmap を描き、preset/空白クリック時の白化を防ぐ。ユーザーが改善を確認。
+- Scarlet の停止中も同じ CLAP owner を維持。再開・seek は SAS 接続だけを交換し、GUI と DSP インスタンスを残す。停止中 flush は worker が処理し、音声は送らない。
+- 検証: workspace 317 passed / 19 ignored、plugin 7 + ABI 2、editor 12、Cocoa offscreen 8 library reopen / 16 GUI create・destroy。macOS release と単体 signed bundle、Scarlet 両 CPU の app/plugin ELF 監査が成功。新しい Scarlet 埋め込み GUI と SAS 再開は実機未確認。
+- 詳細・検証範囲は [CLAP GUI](clap-gui.md) と [Freeverb](../plugins/resonara-freeverb/README.md)。過去の dedicated popup の検証記録は現在の埋め込み GUI の実機確認ではない。
+
 # Resonara / Scarlet 引き継ぎ（2026-10-02）
 
 

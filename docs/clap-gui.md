@@ -1,81 +1,64 @@
-# CLAP editor integration contract
+# CLAP editor integration
 
-Independent plug-in windows are part of the intended host design. The current
-implementation adds owner-thread `HostPlugin::gui_support(api)` negotiation and
-keeps installed-library discovery separate from the generic parameter editor.
-It does not yet create or display a plug-in GUI. The generic editor remains the
-fallback when a plug-in has no GUI or its window API is unavailable.
+Resonara opens native editors through `HostPlugin::open_editor`, with the generic
+parameter editor as fallback. The bundled Freeverb exports `clap.gui` and uses
+this same path as installed plugins. Its layout and controls live in the plugin;
+the application has no Freeverb View dependency or editor dispatch by identity.
 
 The [CLAP GUI extension](https://github.com/free-audio/clap/blob/main/include/clap/ext/gui.h)
-defines embedded and floating windows, API negotiation, main-thread creation and
-destruction, resize requests, and asynchronous host notifications. A GUI belongs
-to the same CLAP instance as its DSP. Opening a second inactive instance, editing
-it and repeatedly replacing the playing graph is not the native GUI design.
+negotiates the window API and embedded/floating mode. The host selects a supported
+API, creates its own container and supplies the embedded parent. One CLAP instance
+owns its DSP and GUI. Multiple insert instances can display independent windows.
 
-## Ownership and playback
+## Ownership and transport
 
-Before exposing native editors, split `InstanceCell` into immutable shared
-instance identity/context, audio-owned scratch/process state, and owner-thread
-editor state. Do not add concurrent `&mut Instance` access to its existing
-`UnsafeCell`. `PluginOwner` retains the native editor; the realtime proxy retains
-only processing state. No raw GUI handle crosses into the audio callback.
+Immutable instance identity is shared; processing scratch belongs to the audio
+proxy and GUI objects belong to the creating/main thread. No GUI handle crosses
+into the callback. Hide/destroy releases GUI resources before the parent window
+and DSO. Closing an editor leaves its DSP alive; bypass leaves its editor open.
 
-Track open editors by a stable insert instance ID, not the current slot number
-or an engine pointer. Moving an insert retains its editor/DSP relationship;
-removing it, rebuilding it, opening a different project, or closing the app closes
-the editor before retiring/destroying its instance. A queued graph replacement
-must not silently leave a window attached to a superseded processor. Until
-instance-preserving graph updates exist, explicitly close the affected editor
-on replacement; transport still continues at the audio block boundary.
+A paused Audio owner retains the playback renderer and plugins. Resume/seek reuse
+those instances. Scarlet recreates the SAS output connection, not the CLAP
+processors, when transport restarts, and services paused parameter flushes without
+sending audio. Natural EOF retains the SAS connection for its hardware tail.
+Removal, structural graph replacement, project replacement and application exit
+close affected editors before retiring their exact processor owners.
 
-Normal editor close calls hide/destroy on the creator thread and leaves DSP
-running. Audio teardown joins/destroys the renderer before deactivation and final
-plug-in destruction. GUI resource lifetime must not depend on cached project
-metadata or the library discovery catalog.
+## Parameters and event loop
 
-## Parameters, state and notifications
+The main event loop services plugin callbacks, bounded host parameter output
+queues, GUI notifications and `clap.timer-support` timers. Active parameter flush
+runs only on the audio thread; inactive flush runs on the owner thread. State
+snapshot uses the existing host quiescence protocol. GUI edits update the project
+and coalesce host Undo without rebuilding the DSP per mouse move.
 
-Add bounded control/audio mailboxes for parameter values, gestures, flush requests
-and main-thread notifications. Apply active parameter events inside CLAP process
-or audio-thread flush; drain output events into the editor/project model outside
-the callback. Undo coalesces a GUI gesture, rather than replacing the DSP for each
-mouse movement. Reject overflowing queues visibly without allocating on audio.
-
-Service `request_callback`, `clap_host_gui` show/hide/resize/closed notifications,
-and required timer/fd extensions from the main event loop. The current host stops
-on active main-thread requests; this must be replaced before enabling a native
-editor. State saving/loading requires an explicit quiescence/ownership protocol;
-do not call state callbacks concurrently with processing unless the extension
-allows it. Preserve opaque state, parameter metadata and transport on failure.
+Freeverb queues normalized values atomically, requests a flush and emits live
+begin/value/end events. A full output queue retains unfinished gestures for retry.
+GUI/DSP parameter changes synchronize through the timer callback. Process, flush
+and reset remain allocation-free. The UI formats values to two decimals; DSP state
+retains its normal floating-point representation.
 
 ## Platform adapters
 
-- macOS: negotiate `cocoa`; an embedded parent is an NSView, not an NSWindow.
-  Cocoa uses logical sizes, so do not apply `set_scale` to it.
-- Linux: negotiate the backend actually in use. X11 supports an embedded window;
-  the standard Wayland contract currently supports floating windows.
-- Scarlet: standard CLAP has no SWS window API. Define and test a shared native
-  ABI with the plug-in SDK before advertising a custom API string. Specify the
-  window reference representation, ownership, embedding/floating behavior,
-  resize and output-scale units, event dispatch and disconnection behavior.
-  Do not pass an SWS integer window ID as a Cocoa/X11 handle. Native Scarlet
-  plug-ins also need GUI code built for Scarlet, just as their DSP does.
+- macOS: embedded `cocoa`, parent `NSView*`, logical dimensions. The host's native
+  NSWindow is the container. Freeverb's NSView uses a shared ScarletUI CPU layout
+  and retains its bitmap for AppKit redraws with no new damage.
+- Scarlet: experimental embedded `org.scarlet-os.sws/1`, parent `ParentV1*`.
+  See the [C ABI and lifetime contract](../crates/scarlet-clap-gui/README.md).
+  The host owns an SWS window and composites plugin BGRA frames using its SGFX
+  backend. Fixed-size parents are supported; resize requests are declined.
+  This is not a standard CLAP API or a Cocoa/X11 handle.
+- Linux: native GUI hosting is not implemented. Generic parameter UI remains
+  available; a future adapter must negotiate the window system actually in use.
 
-`gui_support` reports plug-in capability only; the host must intersect it with
-an implemented platform adapter. The host currently returns no `clap_host_gui`
-extension, and does not advertise editor callbacks that it cannot service.
+Embedded support is implemented; floating support is not advertised by Freeverb.
+`gui_support` reports plugin capabilities, which the host intersects with its
+implemented adapters. Standard Cocoa plugins remain independent of ScarletUI.
 
-## Next implementation and acceptance checks
+## Validation
 
-1. Split host ownership, add stable insert identity and bounded event mailboxes.
-2. Add a test CLAP GUI fixture with create/show/hide/destroy counters, resize
-   requests, callback requests and a GUI parameter controlling audible gain.
-3. Implement the platform adapter and host notification/timer plumbing.
-4. Add a native-editor action alongside the generic fallback. Verify resize,
-   scale, repeated open/close, removal, movement, bypass, undo, session reopening,
-   device stop/EOF and application close.
-5. Verify the GUI controls the actual playing instance, transport keeps advancing,
-   no owner callback runs on audio, and GUI/DSO resources are released exactly
-   once. Run first/repeated audio callback allocation audits with the editor open.
-
-These are outstanding implementation steps, not claims of completed GUI support.
+`clap_editor_smoke` opens two independent CLAP instances through the generic host
+API. DSP/CLAP tests cover negotiation, queue backpressure, instance isolation and
+allocation-free processing; editor tests cover presets, decimal formatting and
+knob input. macOS embedded rendering and immediate parameter edits are manually
+verified. Native cross-build/audit does not imply Scarlet GUI runtime verification.

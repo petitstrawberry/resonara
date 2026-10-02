@@ -1,4 +1,4 @@
-//! Native plug-in windows run on the application's Cocoa event loop, beside SGFX.
+//! Native CLAP editors are serviced on the application main thread, beside SGFX.
 use super::*;
 use resonara_core::InsertKind;
 
@@ -29,12 +29,12 @@ impl Daw {
         )
     }
     pub(super) fn open_native_editor(&self, target: RoutingTarget, slot: usize) -> bool {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "scarlet")))]
         {
             let _ = (target, slot);
             return false;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "scarlet"))]
         {
             self.close_inactive_editor();
             let Some(index) = self.flattened_insert(target, slot) else {

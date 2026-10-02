@@ -1,29 +1,33 @@
 # Resonara Freeverb editor
 
-A shared ScarletUI View for macOS and Scarlet. `FreeverbEditor::new([wet, dry,
-room_size, damping, width])` validates normalized values and creates stable knob
-and numeric-field states. `fields()` returns the five draft fields in CLAP ID
-order; `values()` validates numeric drafts and rounds them to 0.01 increments.
-`normalize_drafts()` applies that resolution before the host commits. `preset()` changes drafts only.
+Plugin-owned ScarletUI controls shared by the embedded Cocoa and Scarlet/SWS
+adapters. Resonara does not depend on or instantiate this crate.
 
-Supply `.on_apply(...)` and `.on_cancel(...)`, optionally `.error(State<String>)`.
-The host owns the popup/window, keyboard cancellation, input focus and parameter
-commit. Apply must validate values, update the inactive CLAP instance, snapshot
-state, commit through the host’s Undo history and preserve transport. No DSP or
-thread/event-loop work runs in this crate. A failed commit should keep the editor
-open and display the error. No `clap.gui` interface is exported by the DSP.
+`FreeverbEditor::new([wet, dry, room_size, damping, width])` creates stable knob
+and numeric field states. `.live()` enables immediate edits. Values are normalized
+0–1, use 0.01 increments and always display two decimal places. The stock Select
+component offers Default, Room, Hall, Aux send and a derived Custom selection.
 
-Use `PLUGIN_ID`, `PARAMETER_IDS`, `DEFAULTS` and `WIDTH` when connecting the host.
-Check the plugin identity and all five normalized writable continuous parameters
-before choosing this editor; fall back to generic UI on incompatible metadata.
+`CocoaEditor` creates an NSView, attaches it through `clap.gui.set_parent`, forwards
+input and caches the rendered bitmap. Every AppKit draw paints that cached image,
+including redraws without ScarletUI damage. It uses flipped coordinates consistently. The Cocoa adapter pins its Mach-O image
+after its first GUI creation because registered Objective-C classes retain method
+pointers; editor instances and bitmaps are still destroyed normally.
+`SwsEditor` consumes the experimental C parent bridge supplied by a host and
+presents BGRA frames. Neither adapter creates an application or an event loop.
 
-The ScarletUI revision is pinned to match Resonara. Platform/window/renderer
-features are enabled by the host (Winit on macOS, SWS on Scarlet), not this crate.
-This crate belongs to the Resonara workspace and uses its lockfile.
+The CLAP plugin owns both adapters and their lifetime. Host timers service GUI
+updates on the main thread. GUI changes request a CLAP parameter flush; DSP sees
+only atomics and never accesses ScarletUI objects. Editor teardown precedes
+parent/window destruction. The Scarlet adapter uses the legacy freestanding
+Scarlet runtime; no SWS/window backend is linked into the plugin itself.
+
+The crate has its own Cargo workspace and lockfile, using the same pinned
+ScarletUI revision as the host.
 
 ```sh
-cargo test --locked -p resonara-freeverb-editor
-cargo fmt --all -- --check
+cargo test --locked --manifest-path plugins/resonara-freeverb/editor/Cargo.toml
+cargo fmt --manifest-path plugins/resonara-freeverb/editor/Cargo.toml -- --check
 ```
 
-MIT. The rotary widget is adapted from Resonara’s parameter knob.
+MIT. The rotary widget is adapted from Resonara's parameter knob.

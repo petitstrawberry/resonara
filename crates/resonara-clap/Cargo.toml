@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+scarlet-clap-gui = { path = "../scarlet-clap-gui" }
 clap-sys = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -13,3 +14,6 @@ objc2-app-kit = { version = "=0.3.2", features = ["NSApplication", "NSWindow", "
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
+
+[target.'cfg(target_os = "scarlet")'.dependencies]
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "4005841e514690f3328c6e09b8b2b77656fa07de", default-features = false, features = ["std", "platform-sws"] }

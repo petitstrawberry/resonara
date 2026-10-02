@@ -9,7 +9,15 @@ description = "Freestanding stereo Freeverb CLAP reverb for Resonara"
 [lib]
 crate-type = ["cdylib"]
 [dependencies]
+scarlet-clap-gui = { path = "../../crates/scarlet-clap-gui" }
 clap-sys = { path = "vendor/clap-sys", version = "=0.5.0" }
+[features]
+default = ["gui"]
+gui = ["dep:resonara-freeverb-editor"]
+[target.'cfg(target_os = "macos")'.dependencies]
+resonara-freeverb-editor = { path = "editor", optional = true }
+[target.'cfg(target_os = "scarlet")'.dependencies]
+resonara-freeverb-editor = { path = "editor", optional = true, default-features = false, features = ["scarlet"] }
 [dev-dependencies]
 clap-sys-upstream = { package = "clap-sys", version = "=0.5.0" }
 freeverb-reference = { package = "freeverb", path = "vendor/freeverb" }

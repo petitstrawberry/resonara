@@ -85,8 +85,6 @@ def build_macos(command, env, output, crate_name, plugin_name):
     artifact = output / f"cargo/release/lib{crate_name}.dylib"
     dependencies = subprocess.check_output(["otool", "-L", str(artifact)], text=True)
     libraries = [line.strip().split(" (")[0] for line in dependencies.splitlines()[2:] if line.strip()]
-    if libraries != ["/usr/lib/libSystem.B.dylib"]:
-        raise RuntimeError("unexpected macOS dependencies: " + str(libraries))
     symbols = subprocess.check_output(["nm", "-gU", str(artifact)], text=True)
     if not re.search(r"\b[SD] _clap_entry$", symbols, re.M):
         raise RuntimeError("clap_entry must be exported data")
@@ -95,6 +93,16 @@ def build_macos(command, env, output, crate_name, plugin_name):
     binary.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(artifact, binary)
     binary.chmod(0o755)
+    # Nix's Darwin libiconv is Apple's ABI, but its store install name is not
+    # portable. Bind to the OS copy and audit the actual distributable binary.
+    for library in libraries:
+        if library.startswith("/nix/store/") and library.endswith("/libiconv.2.dylib"):
+            subprocess.run(["install_name_tool", "-change", library,
+                            "/usr/lib/libiconv.2.dylib", str(binary)], check=True)
+    dependencies = subprocess.check_output(["otool", "-L", str(binary)], text=True)
+    libraries = [line.strip().split(" (")[0] for line in dependencies.splitlines()[2:] if line.strip()]
+    if any(not (p.startswith("/System/Library/Frameworks/") or p in ("/usr/lib/libSystem.B.dylib", "/usr/lib/libobjc.A.dylib", "/usr/lib/libiconv.2.dylib")) for p in libraries):
+        raise RuntimeError("unexpected macOS dependencies: " + str(libraries))
     version = re.search(r'^version = "([^"]+)"', (ROOT / "Cargo.toml").read_text(), re.M).group(1)
     info = dict(CFBundleExecutable=plugin_name, CFBundleIdentifier="org.resonara.freeverb",
                 CFBundleName="Resonara Freeverb", CFBundlePackageType="BNDL",
@@ -159,10 +167,13 @@ def main():
             "-z", "max-page-size=4096", "-z", "now", "-z", "defs", "-Bsymbolic-functions",
             "--hash-style=both", "-soname", f"{plugin_name}.clap",
         ])
+        exports = output / "exports.map"
+        exports.write_text("{ global: clap_entry; local: *; };\n")
+        spec["pre-link-args"]["gnu-lld"].extend(["--version-script=" + str(exports)])
         spec.setdefault("metadata", {}).update(description=f"Isolated Scarlet {args.arch} CLAP cdylib", std=False)
         target = output / f"scarlet-clap-{args.arch}.json"
         target.write_text(json.dumps(spec, indent=2) + "\n")
-        command += ["--target", str(target), "-Zbuild-std=core,compiler_builtins"]
+        command += ["--target", str(target), "-Zbuild-std=core,alloc,compiler_builtins"]
         artifact = output / "cargo" / target.stem / f"release/lib{crate_name}.so"
         destination = output / f"staging/system/plugins/{plugin_name}.clap"
     if args.offline:

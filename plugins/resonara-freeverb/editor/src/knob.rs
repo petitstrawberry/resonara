@@ -2,6 +2,10 @@
 //! Positive mixer pan values pan right; CLAP dials follow the numeric field.
 //! Drag upward to increase pan; Shift+arrow keys provide fine adjustment.
 use crate::ui;
+use alloc::{boxed::Box, rc::Rc, string::String, sync::Arc, vec, vec::Vec};
+use core::{any::Any, cell::RefCell, f32::consts::PI};
+#[cfg(not(feature = "std"))]
+use core_maths::CoreFloat;
 use scarlet_ui::{
     buffer::Buffer,
     element::{Element, ElementRenderObject, LayoutConstraints, RenderElement, UpdateResult},
@@ -9,7 +13,6 @@ use scarlet_ui::{
     prelude::*,
     renderer::PaintContext,
 };
-use std::{any::Any, cell::RefCell, f32::consts::PI, rc::Rc, sync::Arc};
 
 const DIAMETER: f32 = 32.;
 const DRAG_TRAVEL: f32 = 120.;
@@ -61,7 +64,7 @@ impl ParameterValue {
             self.min + ((next as f64 + 1.) / 2.) * (self.max - self.min)
         };
         if self.stepped {
-            value = value.round();
+            value = libm::round(value);
         }
         self.text
             .set(crate::format_value(value.clamp(self.min, self.max)));
@@ -166,7 +169,7 @@ impl RotaryKnob {
                 } else {
                     -1.
                 };
-                let next = (value.round() + delta).clamp(parameter.min, parameter.max);
+                let next = (libm::round(value) + delta).clamp(parameter.min, parameter.max);
                 (self.changed)(parameter.fraction(next));
                 return true;
             }

@@ -68,7 +68,7 @@ impl HostGui {
         }
     }
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "scarlet"))]
 pub(super) fn host_extension(id: &CStr) -> *const c_void {
     if id == CLAP_EXT_GUI {
         (&HOST_GUI as *const clap_host_gui).cast()
@@ -78,11 +78,14 @@ pub(super) fn host_extension(id: &CStr) -> *const c_void {
         ptr::null()
     }
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "scarlet")))]
 pub(super) fn host_extension(_: &CStr) -> *const c_void {
     ptr::null()
 }
 unsafe extern "C" fn resize(h: *const clap_host, w: u32, height: u32) -> bool {
+    if cfg!(target_os = "scarlet") {
+        return false;
+    }
     let g = &unsafe { context(h) }.gui;
     if !g.alive.load(Ordering::Relaxed) || !(1..=8192).contains(&w) || !(1..=8192).contains(&height)
     {
@@ -212,14 +215,14 @@ pub(super) fn service(i: &Instance) -> Result<()> {
     }
     Ok(())
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "scarlet")))]
 pub(super) fn open(i: &Instance) -> Result<bool> {
     i.context.check_owner()?;
     Ok(false)
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "scarlet")))]
 pub(super) struct Editor;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "scarlet")))]
 impl Editor {
     fn destroy(&mut self, _: &Instance) {}
     fn service(&mut self, _: &Instance) -> bool {
@@ -227,6 +230,9 @@ impl Editor {
     }
 }
 
+#[cfg(target_os = "scarlet")]
+#[path = "gui_sws.rs"]
+mod sws;
 #[cfg(target_os = "macos")]
 use objc2::{MainThreadOnly, rc::Retained};
 #[cfg(target_os = "macos")]
@@ -235,6 +241,8 @@ use objc2_app_kit::{
 };
 #[cfg(target_os = "macos")]
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
+#[cfg(target_os = "scarlet")]
+pub(super) use sws::{Editor, open};
 #[cfg(target_os = "macos")]
 pub(super) struct Editor {
     window: Retained<NSWindow>,

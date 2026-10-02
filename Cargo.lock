@@ -2053,7 +2053,6 @@ version = "0.1.0"
 dependencies = [
  "log",
  "resonara-core",
- "resonara-freeverb-editor",
  "resonara-platform",
  "scarlet-ui",
 ]
@@ -2066,6 +2065,8 @@ dependencies = [
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "scarlet-clap-gui",
+ "scarlet-ui",
 ]
 
 [[package]]
@@ -2077,13 +2078,6 @@ dependencies = [
  "serde",
  "serde_json",
  "symphonia",
-]
-
-[[package]]
-name = "resonara-freeverb-editor"
-version = "0.2.0"
-dependencies = [
- "scarlet-ui",
 ]
 
 [[package]]
@@ -2213,6 +2207,10 @@ dependencies = [
 name = "scarlet-abi"
 version = "1.0.0"
 source = "git+https://github.com/petitstrawberry/Scarlet?rev=b3d2a55740a3d2ca49daad0ec7baba233f706f7a#b3d2a55740a3d2ca49daad0ec7baba233f706f7a"
+
+[[package]]
+name = "scarlet-clap-gui"
+version = "0.1.0"
 
 [[package]]
 name = "scarlet-desktop-config"

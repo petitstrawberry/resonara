@@ -30,7 +30,8 @@ assert dependency.get('rev') == revision, 'Review and update the ScarletUI pin e
 assert 'path' not in dependency, 'Committed ScarletUI dependency must not require a local checkout'
 editor = tomllib.loads((root / 'plugins/resonara-freeverb/editor/Cargo.toml').read_text())['dependencies']['scarlet-ui']
 assert editor.get('git') == repository and editor.get('rev') == revision
-assert editor.get('features') == ['std'] and not editor.get('default-features', True), 'Editor must share UI identity and leave platform selection to the host'
+assert not editor.get('default-features', True), 'Plugin editor selects its own platform adapter'
+assert 'resonara-freeverb-editor' not in app['dependencies'], 'Host must open Freeverb via CLAP GUI rather than a dedicated View'
 
 
 runtime_repository = 'https://github.com/petitstrawberry/Scarlet'

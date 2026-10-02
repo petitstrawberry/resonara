@@ -82,7 +82,6 @@ enum Dialog {
     InsertPicker(RoutingTarget),
     InsertActions(RoutingTarget, usize),
     ClapEditor(RoutingTarget, usize),
-    FreeverbEditor(RoutingTarget, usize),
     ClapPicker(RoutingTarget),
     SendPicker(RoutingTarget, Option<usize>),
     SendActions(RoutingTarget, usize),
@@ -171,7 +170,6 @@ struct Daw {
     insert_focus: Rc<RefCell<std::collections::HashMap<(RoutingTarget, usize), State<bool>>>>,
     plugin_fields: Rc<RefCell<Vec<(u32, State<String>)>>>,
     plugin_knobs: Rc<RefCell<Vec<(u32, knob::PanKnob)>>>,
-    freeverb_editor: Rc<RefCell<Option<resonara_freeverb_editor::FreeverbEditor>>>,
     plugin_catalog: Rc<RefCell<resonara_core::plugins::ClapCatalog>>,
     native_editor: Rc<RefCell<Option<(RoutingTarget, usize, resonara_core::plugins::ClapEditor)>>>,
     native_edit_group: Rc<Cell<bool>>,
@@ -264,7 +262,6 @@ impl Daw {
             insert_focus: Rc::new(RefCell::new(std::collections::HashMap::new())),
             plugin_fields: Rc::new(RefCell::new(vec![])),
             plugin_knobs: Rc::new(RefCell::new(vec![])),
-            freeverb_editor: Rc::new(RefCell::new(None)),
             plugin_catalog: Rc::new(RefCell::new(Default::default())),
             native_editor: Rc::new(RefCell::new(None)),
             native_edit_group: Rc::new(Cell::new(false)),
@@ -2243,9 +2240,6 @@ impl Daw {
             Dialog::InsertPicker(target) => return self.insert_picker_dialog(target),
             Dialog::InsertActions(target, slot) => return self.insert_actions_dialog(target, slot),
             Dialog::ClapEditor(target, slot) => return self.clap_editor_dialog(target, slot),
-            Dialog::FreeverbEditor(target, slot) => {
-                return self.freeverb_editor_dialog(target, slot);
-            }
             Dialog::ClapPicker(target) => return self.clap_picker_dialog(target),
             Dialog::InsertValue(target, slot) => {
                 return self.insert_value_dialog(target, slot);
@@ -2303,7 +2297,6 @@ impl Daw {
                 | Dialog::InsertPicker(..)
                 | Dialog::InsertActions(..)
                 | Dialog::ClapEditor(..)
-                | Dialog::FreeverbEditor(..)
                 | Dialog::ClapPicker(..)
                 | Dialog::SendPicker(..)
                 | Dialog::SendActions(..)

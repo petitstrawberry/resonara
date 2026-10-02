@@ -50,76 +50,11 @@ impl Daw {
             return;
         }
         self.clear_control_focus();
-        if self.open_freeverb_editor(target, slot) {
-            return;
-        }
         if self.open_native_editor(target, slot) {
             self.dialog.set(Dialog::None);
             return;
         }
         self.open_generic_editor(target, slot);
-    }
-    fn open_freeverb_editor(&self, target: RoutingTarget, slot: usize) -> bool {
-        let plugin = target
-            .get(&self.model.borrow().project)
-            .and_then(|r| r.inserts.get(slot))
-            .and_then(|i| {
-                if let InsertKind::Clap { plugin } = &i.kind {
-                    Some(plugin.clone())
-                } else {
-                    None
-                }
-            });
-        let Some(plugin) = plugin.filter(|p| p.is_bundled_freeverb()) else {
-            return false;
-        };
-        let mut values = [0.; 5];
-        // Do not apply a dedicated layout to a changed or incompatible schema.
-        if plugin.parameters.len() != 5 {
-            return false;
-        }
-        for id in 0..5 {
-            let Some(parameter) = plugin.parameters.iter().find(|p| {
-                p.id == id as u32
-                    && p.min == 0.
-                    && p.max == 1.
-                    && !p.hidden
-                    && !p.read_only
-                    && !p.stepped
-            }) else {
-                return false;
-            };
-            values[id] = parameter.value;
-        }
-        let Ok(editor) = resonara_freeverb_editor::FreeverbEditor::new(values) else {
-            return false;
-        };
-        *self.plugin_fields.borrow_mut() = editor
-            .fields()
-            .into_iter()
-            .enumerate()
-            .map(|(id, text)| (id as u32, text))
-            .collect();
-        *self.freeverb_editor.borrow_mut() = Some(editor);
-        self.dialog_error.set(String::new());
-        self.dialog.set(Dialog::FreeverbEditor(target, slot));
-        true
-    }
-    pub(super) fn freeverb_editor_dialog(&self, target: RoutingTarget, slot: usize) -> AnyView {
-        let Some(editor) = self.freeverb_editor.borrow().clone() else {
-            return self.clap_editor_dialog(target, slot);
-        };
-        let apply = self.clone();
-        let cancel = self.clone();
-        self.insert_popup(
-            AnyView::new(
-                editor
-                    .error(self.dialog_error.clone())
-                    .on_apply(move || apply.submit_clap_parameters(target, slot))
-                    .on_cancel(move || cancel.dialog.set(Dialog::None)),
-            ),
-            resonara_freeverb_editor::WIDTH,
-        )
     }
     pub(super) fn open_generic_editor(&self, target: RoutingTarget, slot: usize) {
         let kind = target
@@ -501,13 +436,6 @@ impl Daw {
         let Some(mut plugin) = plugin else {
             return;
         };
-        if self.dialog.get() == Dialog::FreeverbEditor(target, slot)
-            && let Some(editor) = self.freeverb_editor.borrow().as_ref()
-        {
-            // The dedicated normalized editor uses 0.01 increments. Invalid
-            // input remains untouched so the normal parameter error names it.
-            let _ = editor.normalize_drafts();
-        }
         let values = self
             .plugin_fields
             .borrow()

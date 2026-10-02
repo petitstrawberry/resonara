@@ -1,9 +1,16 @@
-//! Host-integrated ScarletUI editor for the Resonara Freeverb CLAP DSP.
-//! The host owns the window, parameter commit, transport, state and Undo.
+#![cfg_attr(not(feature = "std"), no_std)]
+//! Plugin-owned ScarletUI controls and CLAP embedding adapters.
+//! The host owns the containing window, transport, state and Undo.
 //! This crate creates no event loop and never runs on the audio thread.
 use scarlet_ui::{hstack as row, prelude::*, vstack};
-use std::{any::Any, rc::Rc};
+extern crate alloc;
+use alloc::{boxed::Box, format, rc::Rc, string::String, vec, vec::Vec};
+use core::any::Any;
+#[cfg(target_os = "macos")]
+pub mod cocoa;
 mod knob;
+#[cfg(target_os = "scarlet")]
+pub mod sws;
 mod ui;
 use knob::RotaryKnob;
 use ui::*;
@@ -14,13 +21,51 @@ pub const DEFAULTS: [f64; 5] = [0.3, 1., 0.5, 0.5, 1.];
 pub const WIDTH: f32 = 548.;
 
 fn round_value(value: f64) -> f64 {
-    (value * 100.).round() / 100. + 0.0
+    libm::round(value * 100.) / 100. + 0.0
 }
 fn format_value(value: f64) -> String {
     format!("{:.2}", round_value(value))
 }
 
-#[derive(Clone, Copy, Debug)]
+/// Distinguish rounded UI text from actual host values. Passive clicks must not
+/// quantize untouched parameters, and successive edits retain earlier requests.
+#[cfg(any(target_os = "macos", target_os = "scarlet", test))]
+struct LiveParameters {
+    observed: [f64; 5],
+    desired: [f64; 5],
+    shown: [f64; 5],
+}
+#[cfg(any(target_os = "macos", target_os = "scarlet", test))]
+impl LiveParameters {
+    fn new(values: [f64; 5]) -> Self {
+        Self {
+            observed: values,
+            desired: values,
+            shown: values.map(round_value),
+        }
+    }
+    fn observe(&mut self, values: [f64; 5]) -> bool {
+        if self.observed == values {
+            return false;
+        }
+        *self = Self::new(values);
+        true
+    }
+    fn changes(&mut self, values: [f64; 5]) -> Option<[f64; 5]> {
+        if self.shown == values {
+            return None;
+        }
+        for i in 0..5 {
+            if self.shown[i] != values[i] {
+                self.desired[i] = values[i];
+            }
+        }
+        self.shown = values;
+        Some(self.desired)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Preset {
     Default,
     Room,
@@ -43,30 +88,34 @@ pub struct FreeverbEditor {
     fields: [State<String>; 5],
     knobs: [RotaryKnob; 5],
     error: State<String>,
+    preset_index: State<usize>,
+    live: bool,
     apply: Rc<dyn Fn()>,
     cancel: Rc<dyn Fn()>,
 }
 impl FreeverbEditor {
-    pub fn new(values: [f64; 5]) -> std::result::Result<Self, &'static str> {
+    pub fn new(values: [f64; 5]) -> core::result::Result<Self, &'static str> {
         if values
             .iter()
             .any(|v| !v.is_finite() || !(0. ..=1.).contains(v))
         {
             return Err("Freeverb values must be finite and between 0 and 1");
         }
-        let fields = std::array::from_fn(|i| {
+        let fields = core::array::from_fn(|i| {
             State::new(
                 scarlet_ui::state::generate_state_id(),
                 format_value(values[i]),
             )
         });
-        let knobs = std::array::from_fn(|i| {
+        let knobs = core::array::from_fn(|i| {
             RotaryKnob::parameter(fields[i].clone(), 0., 1., values[i], false).unwrap()
         });
         Ok(Self {
             fields,
             knobs,
             error: State::new(scarlet_ui::state::generate_state_id(), String::new()),
+            preset_index: State::new(scarlet_ui::state::generate_state_id(), 0),
+            live: false,
             apply: Rc::new(|| {}),
             cancel: Rc::new(|| {}),
         })
@@ -74,7 +123,7 @@ impl FreeverbEditor {
     pub fn fields(&self) -> [State<String>; 5] {
         self.fields.clone()
     }
-    pub fn values(&self) -> std::result::Result<[f64; 5], &'static str> {
+    pub fn values(&self) -> core::result::Result<[f64; 5], &'static str> {
         let mut values = [0.; 5];
         for (i, field) in self.fields.iter().enumerate() {
             values[i] = field
@@ -89,7 +138,7 @@ impl FreeverbEditor {
         Ok(values)
     }
     /// Normalize numeric drafts to the editor's 0.01 resolution before commit.
-    pub fn normalize_drafts(&self) -> std::result::Result<(), &'static str> {
+    pub fn normalize_drafts(&self) -> core::result::Result<(), &'static str> {
         let values = self.values()?;
         for (field, value) in self.fields.iter().zip(values) {
             field.set(format_value(value));
@@ -115,7 +164,14 @@ impl FreeverbEditor {
         self
     }
     fn control(&self, i: usize, name: &str, hint: &str, diameter: f32) -> AnyView {
-        let apply = self.apply.clone();
+        let apply: Rc<dyn Fn()> = if self.live {
+            let editor = self.clone();
+            Rc::new(move || {
+                let _ = editor.normalize_drafts();
+            })
+        } else {
+            self.apply.clone()
+        };
         AnyView::new(vstack! {
             label(name).font_size(12.),
             self.knobs[i].clone().frame(diameter,diameter),
@@ -123,27 +179,55 @@ impl FreeverbEditor {
             caption(hint).font_size(10.)
         }.alignment(Alignment::Center).spacing(6.).frame_width(144.))
     }
-    fn preset_button(&self, name: &str, preset: Preset) -> Button {
+    pub fn live(mut self) -> Self {
+        self.live = true;
+        self
+    }
+    pub fn set_values(&self, values: [f64; 5]) {
+        for (field, value) in self.fields.iter().zip(values) {
+            let value = format_value(value);
+            if field.get() != value {
+                field.set(value);
+            }
+        }
+    }
+    pub fn current_preset(&self) -> Option<Preset> {
+        let values = self.values().ok()?;
+        [Preset::Default, Preset::Room, Preset::Hall, Preset::AuxSend]
+            .into_iter()
+            .find(|p| p.values() == values)
+    }
+    fn preset_selector(&self) -> AnyView {
+        let presets = [Preset::Default, Preset::Room, Preset::Hall, Preset::AuxSend];
+        let index = self
+            .current_preset()
+            .and_then(|p| presets.iter().position(|v| *v == p))
+            .unwrap_or(4);
+        if self.preset_index.get() != index {
+            self.preset_index.set(index);
+        }
         let editor = self.clone();
-        button(name)
-            .font_size(11.)
-            .on_click(move || editor.preset(preset))
+        AnyView::new(row! {
+            caption("PRESET").font_size(10.),
+            Select::new(vec!["Default".into(), "Room".into(), "Hall".into(), "Aux send".into(), "Custom".into()], self.preset_index.clone())
+                .width(240.).row_height(30.).on_change(move |i| { if let Some(p) = presets.get(i) { editor.preset(*p); } })
+        }.spacing(12.))
     }
     fn body(&self) -> AnyView {
         let apply = self.apply.clone();
         let cancel = self.cancel.clone();
         AnyView::new(VStack::new(Children(vec![
             Box::new(vstack! { caption("RESONARA · STEREO REVERB").font_size(10.).color(ACCENT),label("Freeverb").font_size(28.),caption("Space, tone and stereo ambience").font_size(12.) }.alignment(Alignment::TopLeading).spacing(4.)),
-            Box::new(row! { self.preset_button("Default",Preset::Default),self.preset_button("Room",Preset::Room),self.preset_button("Hall",Preset::Hall),self.preset_button("Aux send",Preset::AuxSend) }.spacing(8.)),
+            Box::new(self.preset_selector()),
             Box::new(Rectangle::new().fill(LINE).frame(500.,1.)),
             Box::new(caption("SPACE").font_size(10.)),
             Box::new(row! { self.control(2,"Room size","Small → spacious",76.),self.control(3,"Damping","Bright → soft",76.),self.control(4,"Width","Mono → stereo",76.) }.spacing(18.)),
             Box::new(Rectangle::new().fill(LINE).frame(500.,1.)),
             Box::new(caption("OUTPUT MIX").font_size(10.)),
             Box::new(row! { self.control(0,"Wet","Reverb level",52.),self.control(1,"Dry","Original level",52.) }.spacing(18.)),
-            Box::new(caption("Apply to hear changes · Aux send uses Wet 1 / Dry 0").font_size(10.)),
+            Box::new(caption(if self.live { "Changes apply immediately · Aux send uses Wet 1 / Dry 0" } else { "Apply to hear changes · Aux send uses Wet 1 / Dry 0" }).font_size(10.)),
             Box::new(Text::from_state(self.error.clone()).font_size(11.).color(GOLD).frame_width(500.)),
-            Box::new(row! { button("Cancel").on_click(move||cancel()),button("Apply").background_color(ACCENT).text_color(BG).on_click(move||apply()) }.spacing(8.)),
+            Box::new(if self.live { AnyView::new(caption("")) } else { AnyView::new(row! { button("Cancel").on_click(move||cancel()),button("Apply").background_color(ACCENT).text_color(BG).on_click(move||apply()) }.spacing(8.)) }),
         ])).alignment(Alignment::TopLeading).spacing(8.).padding(24.).frame_width(WIDTH))
     }
 }
@@ -158,7 +242,7 @@ impl View for FreeverbEditor {
         self.fields
             .iter()
             .map(|s| s as &dyn Listenable)
-            .chain(std::iter::once(&self.error as &dyn Listenable))
+            .chain(core::iter::once(&self.error as &dyn Listenable))
             .collect()
     }
     fn as_any(&self) -> &dyn Any {
@@ -169,6 +253,44 @@ impl View for FreeverbEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn passive_input_preserves_unrounded_values_and_successive_edits() {
+        let actual = [0.303, 0.997, 0.503, 0.504, 0.995];
+        let mut live = LiveParameters::new(actual);
+        let mut ui = actual.map(round_value);
+        assert_eq!(live.changes(ui), None);
+        ui[0] = 0.20;
+        let mut expected = actual;
+        expected[0] = 0.20;
+        assert_eq!(live.changes(ui), Some(expected));
+        ui[1] = 0.90;
+        expected[1] = 0.90;
+        assert_eq!(live.changes(ui), Some(expected));
+        assert!(live.observe(expected));
+        assert_eq!(live.changes(ui), None);
+        assert!(!live.observe(expected));
+    }
+
+    #[test]
+    fn preset_selection_tracks_external_values_and_custom_edits() {
+        let editor = FreeverbEditor::new(DEFAULTS).unwrap().live();
+        let fields = editor.fields();
+        assert_eq!(editor.current_preset(), Some(Preset::Default));
+        editor.set_values(Preset::Hall.values());
+        assert_eq!(editor.current_preset(), Some(Preset::Hall));
+        assert_eq!(
+            fields[2].get(),
+            "0.82",
+            "synchronization keeps existing field states"
+        );
+        fields[2].set("0.80".into());
+        assert_eq!(editor.current_preset(), None);
+        editor.preset(Preset::AuxSend);
+        assert_eq!(editor.current_preset(), Some(Preset::AuxSend));
+        assert_eq!(fields[0].get(), "1.00");
+        assert_eq!(fields[1].get(), "0.00");
+    }
+
     #[test]
     fn presets_preserve_parameter_order_and_validate_typed_drafts() {
         let editor = FreeverbEditor::new(DEFAULTS).unwrap();

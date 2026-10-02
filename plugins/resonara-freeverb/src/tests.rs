@@ -371,3 +371,137 @@ fn parameters_state_and_capacity_are_bounded() {
     drop(others);
     let _again = Instance::new();
 }
+
+struct Output {
+    accepted: [(u16, u32, f64); 32],
+    count: usize,
+    budget: usize,
+}
+impl Output {
+    fn list(&mut self) -> clap_output_events {
+        clap_output_events {
+            ctx: (self as *mut Self).cast(),
+            try_push: Some(capture_output),
+        }
+    }
+}
+unsafe extern "C" fn capture_output(
+    list: *const clap_output_events,
+    event: *const clap_event_header,
+) -> bool {
+    let output = unsafe { &mut *(*list).ctx.cast::<Output>() };
+    if output.budget == 0 {
+        return false;
+    }
+    let header = unsafe { &*event };
+    assert_eq!(header.time, 0);
+    assert_eq!(header.flags, CLAP_EVENT_IS_LIVE);
+    let (id, value) = if header.type_ == CLAP_EVENT_PARAM_VALUE {
+        let event = unsafe { &*event.cast::<clap_event_param_value>() };
+        assert_eq!(
+            (event.note_id, event.port_index, event.channel, event.key),
+            (-1, -1, -1, -1)
+        );
+        (event.param_id, event.value)
+    } else {
+        (
+            unsafe { &*event.cast::<clap_event_param_gesture>() }.param_id,
+            0.,
+        )
+    };
+    output.accepted[output.count] = (header.type_, id, value);
+    output.count += 1;
+    output.budget -= 1;
+    true
+}
+#[test]
+fn gui_changes_survive_output_backpressure_and_keep_instances_independent() {
+    let _lock = SERIAL.lock().unwrap();
+    let p = Instance::new();
+    let other = Instance::new();
+    let s = unsafe { slot(p.0).unwrap() };
+    let mut values = DEFAULTS;
+    values[0] = 0.20;
+    s.queue_gui(values);
+    // Missing output events must not consume pending GUI edits.
+    unsafe {
+        flush(p.0, ptr::null(), ptr::null());
+    }
+    assert_eq!(p.value(), 0.30);
+    let mut out = Output {
+        accepted: [(0, 0, 0.); 32],
+        count: 0,
+        budget: 1,
+    };
+    unsafe {
+        flush(p.0, ptr::null(), &out.list());
+    }
+    assert_eq!(out.accepted[0].0, CLAP_EVENT_PARAM_GESTURE_BEGIN);
+    assert_eq!(p.value(), 0.30);
+    // Coalesce a newer knob position while its value event is backpressured.
+    values[0] = 0.25;
+    s.queue_gui(values);
+    out.budget = 1;
+    p.activate();
+    AUDIO.with(|a| a.set(true));
+    ALLOCS.with(|c| c.set(0));
+    COUNT_ALLOC.with(|c| c.set(true));
+    unsafe {
+        flush(p.0, ptr::null(), &out.list());
+    }
+    COUNT_ALLOC.with(|c| c.set(false));
+    AUDIO.with(|a| a.set(false));
+    assert_eq!(ALLOCS.with(Cell::get), 0);
+    assert_eq!(p.value(), 0.25);
+    assert_eq!(other.value(), 0.30);
+    assert_eq!(out.accepted[1], (CLAP_EVENT_PARAM_VALUE, 0, 0.25));
+    // Finish the old gesture before accepting any next gesture.
+    out.budget = 1;
+    AUDIO.with(|a| a.set(true));
+    unsafe {
+        flush(p.0, ptr::null(), &out.list());
+    }
+    AUDIO.with(|a| a.set(false));
+    assert_eq!(out.accepted[2].0, CLAP_EVENT_PARAM_GESTURE_END);
+    out.budget = 16;
+    AUDIO.with(|a| a.set(true));
+    unsafe {
+        flush(p.0, ptr::null(), &out.list());
+    }
+    AUDIO.with(|a| a.set(false));
+    assert_eq!(s.pending_mask.load(Ordering::Acquire), 0);
+    assert_eq!(s.gesture_stage[0].load(Ordering::Relaxed), 0);
+    assert_eq!(p.value(), 0.25);
+}
+
+#[cfg(all(feature = "gui", any(target_os = "macos", target_os = "scarlet")))]
+#[test]
+fn gui_negotiates_embedded_platform_api_and_fails_cleanly_without_host_timers() {
+    use clap_sys::ext::{gui::*, timer_support::*};
+    let _lock = SERIAL.lock().unwrap();
+    let p = Instance::new();
+    let gui = unsafe { &*extension(p.0, CLAP_EXT_GUI.as_ptr()).cast::<clap_plugin_gui>() };
+    let mut api = ptr::null();
+    let mut floating = true;
+    assert!(unsafe { gui.get_preferred_api.unwrap()(p.0, &mut api, &mut floating) });
+    assert!(!floating);
+    #[cfg(target_os = "macos")]
+    assert_eq!(unsafe { CStr::from_ptr(api) }, c"cocoa");
+    #[cfg(target_os = "scarlet")]
+    assert_eq!(unsafe { CStr::from_ptr(api) }, scarlet_clap_gui::API);
+    assert!(unsafe { gui.is_api_supported.unwrap()(p.0, api, false) });
+    assert!(!unsafe { gui.is_api_supported.unwrap()(p.0, api, true) });
+    assert!(!unsafe { gui.is_api_supported.unwrap()(p.0, c"invalid".as_ptr(), false) });
+    assert!(!unsafe { gui.create.unwrap()(p.0, api, false) });
+    assert!(!unsafe { gui.show.unwrap()(p.0) });
+    unsafe {
+        gui.destroy.unwrap()(p.0);
+    }
+    assert!(!unsafe { extension(p.0, CLAP_EXT_TIMER_SUPPORT.as_ptr()) }.is_null());
+    assert_eq!(
+        unsafe { slot(p.0).unwrap() }
+            .lifecycle
+            .load(Ordering::Acquire),
+        INITIALIZED
+    );
+}

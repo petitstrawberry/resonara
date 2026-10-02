@@ -1,5 +1,6 @@
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::any::Any;
 use scarlet_ui::{prelude::*, views::containers::ViewTuple};
-use std::any::Any;
 pub const BG: Color = Color::rgb_f32(0.075, 0.083, 0.101);
 pub const RAISED: Color = Color::rgb_f32(0.155, 0.168, 0.194);
 pub const LINE: Color = Color::rgb_f32(0.225, 0.243, 0.275);
