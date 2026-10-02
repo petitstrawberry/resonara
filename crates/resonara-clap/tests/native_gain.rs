@@ -8,6 +8,45 @@ use std::{
     path::PathBuf,
 };
 
+#[test]
+#[ignore = "requires native gain fixture"]
+fn audio_only_plugin_has_no_native_gui_capability() {
+    let host = load();
+    assert_eq!(
+        host.gui_support(c"cocoa").unwrap(),
+        resonara_clap::GuiSupport::default()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires native gain fixture"]
+fn macos_bundle_uses_declared_executable_and_shares_binary_lease() {
+    let path = std::env::temp_dir().join(format!("resonara-bundle-{}.clap", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(path.join("Contents/MacOS")).unwrap();
+    // Name deliberately differs from the bundle; guessing its stem would fail.
+    let binary = path.join("Contents/MacOS/ActualGain");
+    std::fs::copy(gain_path(), &binary).unwrap();
+    std::fs::write(
+        path.join("Contents/Info.plist"),
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>ActualGain</string>
+<key>CFBundleIdentifier</key><string>org.resonara.test.bundle</string>
+<key>CFBundlePackageType</key><string>BNDL</string></dict></plist>"#,
+    )
+    .unwrap();
+    let mut bundle = HostPlugin::load(&path, Some("org.resonara.gain")).unwrap();
+    let binary_host = HostPlugin::load(&binary, Some("org.resonara.gain")).unwrap();
+    bundle.set_parameter(0, 0.75).unwrap();
+    assert_eq!(binary_host.parameter_value(0).unwrap(), 1.);
+    assert_eq!(bundle.parameter_value(0).unwrap(), 0.75);
+    drop(bundle);
+    assert_eq!(binary_host.parameter_value(0).unwrap(), 1.);
+    drop(binary_host);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 struct CountingAllocator;
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };

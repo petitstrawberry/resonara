@@ -58,6 +58,7 @@ impl Daw {
             *self.plugin_fields.borrow_mut() = plugin
                 .parameters
                 .iter()
+                .filter(|p| !p.hidden && !p.read_only)
                 .map(|p| {
                     (
                         p.id,
@@ -98,6 +99,15 @@ impl Daw {
         index: usize,
         action: impl Fn(Self) + 'static,
     ) -> AnyView {
+        self.insert_menu_item_width(label, index, 250., action)
+    }
+    fn insert_menu_item_width(
+        &self,
+        label: &str,
+        index: usize,
+        width: f32,
+        action: impl Fn(Self) + 'static,
+    ) -> AnyView {
         let s = self.clone();
         AnyView::new(
             ui::button(label)
@@ -109,7 +119,7 @@ impl Daw {
                 .font_size(11.)
                 .padding(4.)
                 .on_click(move || action(s.clone()))
-                .frame(250., 26.),
+                .frame(width, 26.),
         )
     }
     pub(super) fn insert_picker_dialog(&self, target: RoutingTarget) -> AnyView {
@@ -120,12 +130,20 @@ impl Daw {
             self.insert_menu_item("Delay",2,move|s|s.select_insert_kind(target,2)),
             caption("CLAP · NATIVE EFFECT").font_size(10.),
             self.insert_menu_item("Resonara Gain",3,move|s|s.select_insert_kind(target,3)),
+            self.insert_menu_item("Installed CLAP effects…",4,move|s|s.select_insert_kind(target,4)),
             Text::from_state(self.dialog_error.clone()).font_size(11.).color(GOLD).frame_width(250.),
-            self.insert_menu_item("Cancel",4,|s|s.dialog.set(Dialog::None)),
+            self.insert_menu_item("Cancel",5,|s|s.dialog.set(Dialog::None)),
         }.alignment(Alignment::TopLeading).spacing(4.).padding(14.)),278.)
     }
     pub(super) fn select_insert_kind(&self, target: RoutingTarget, kind: usize) {
+        if self.busy() {
+            return;
+        }
         if kind == 4 {
+            self.open_clap_picker(target);
+            return;
+        }
+        if kind == 5 {
             self.dialog.set(Dialog::None);
             return;
         }
@@ -184,8 +202,9 @@ impl Daw {
     }
     pub(super) fn handle_insert_popup_key(&self, key: KeyCode) -> bool {
         let count = match self.dialog.get() {
-            Dialog::InsertPicker(_) => 5,
+            Dialog::InsertPicker(_) => 6,
             Dialog::InsertActions(..) => 6,
+            Dialog::ClapPicker(_) => self.plugin_catalog.borrow().effects.len() + 2,
             _ => return false,
         };
         match key {
@@ -200,12 +219,86 @@ impl Daw {
                 Dialog::InsertActions(target, slot) => {
                     self.insert_action(target, slot, self.menu_choice.get())
                 }
+                Dialog::ClapPicker(target) => self.select_clap(target, self.menu_choice.get()),
                 _ => {}
             },
             KeyCode::Escape => self.dialog.set(Dialog::None),
             _ => {}
         }
         true
+    }
+    pub(super) fn open_clap_picker(&self, target: RoutingTarget) {
+        if self.busy() {
+            return;
+        }
+        self.clear_control_focus();
+        *self.plugin_catalog.borrow_mut() = plugins::scan_installed();
+        self.menu_choice.set(0);
+        self.dialog_error.set(String::new());
+        self.dialog.set(Dialog::ClapPicker(target));
+    }
+    pub(super) fn select_clap(&self, target: RoutingTarget, index: usize) {
+        if self.busy() {
+            return;
+        }
+        let catalog = self.plugin_catalog.borrow();
+        if index == catalog.effects.len() {
+            drop(catalog);
+            self.open_clap_picker(target);
+            return;
+        }
+        let Some(choice) = catalog.effects.get(index).cloned() else {
+            self.dialog.set(Dialog::None);
+            return;
+        };
+        drop(catalog);
+        match plugins::load_installed(&choice) {
+            Ok(plugin) => {
+                self.dialog.set(Dialog::None);
+                self.add_insert(target, InsertKind::Clap { plugin });
+            }
+            Err(error) => self
+                .dialog_error
+                .set(format!("Could not load {}: {error}", choice.name)),
+        }
+    }
+    pub(super) fn clap_picker_dialog(&self, target: RoutingTarget) -> AnyView {
+        let catalog = self.plugin_catalog.borrow();
+        let mut effects: Vec<Box<dyn View>> = Vec::new();
+        for (index, choice) in catalog.effects.iter().enumerate() {
+            let s = self.clone();
+            effects.push(Box::new(
+                ui::button(format!("{} · {}", choice.name, choice.vendor))
+                    .background_color(if self.menu_choice.get() == index {
+                        RAISED
+                    } else {
+                        PANEL
+                    })
+                    .font_size(12.)
+                    .padding(6.)
+                    .on_click(move || s.select_clap(target, index))
+                    .frame(440., 30.),
+            ));
+            effects.push(Box::new(
+                caption(format!("{} · {}", choice.library, choice.plugin_id)).font_size(10.),
+            ));
+        }
+        let count = catalog.effects.len();
+        let warnings = catalog.warnings.join("\n");
+        self.insert_popup(AnyView::new(vstack!{
+            label("Installed CLAP effects").font_size(20.),
+            caption("Stereo audio effects · native OS and CPU required").font_size(11.),
+            ScrollView::new(VStack::new(Children(effects)).spacing(4.).alignment(Alignment::TopLeading))
+                .scroll_to_index((self.menu_choice.get() < count).then_some(self.menu_choice.get()), 52.)
+                .frame(440.,240.),
+            caption(if count==0 { "No effects found. Install in the CLAP folder or set CLAP_PATH." } else { "Select an effect to add it to this channel." }).frame_width(440.),
+            ScrollView::new(Text::new(warnings).font_size(11.).color(GOLD).frame_width(440.)).frame(440.,60.),
+            Text::from_state(self.dialog_error.clone()).font_size(11.).color(GOLD).frame_width(440.),
+            row!{
+                self.insert_menu_item_width("Rescan",count,215.,move|s|s.open_clap_picker(target)),
+                self.insert_menu_item_width("Cancel",count+1,215.,|s|s.dialog.set(Dialog::None))
+            }.spacing(10.)
+        }.alignment(Alignment::TopLeading).spacing(10.).padding(22.)),484.)
     }
     pub(super) fn clap_editor_dialog(&self, target: RoutingTarget, slot: usize) -> AnyView {
         let plugin = target
@@ -238,7 +331,15 @@ impl Daw {
                 .frame_width(380.),
             ));
         }
+        let mut parameter_rows: Vec<Box<dyn View>> = Vec::new();
         for parameter in &plugin.parameters {
+            if parameter.hidden {
+                continue;
+            }
+            if parameter.read_only {
+                parameter_rows.push(Box::new(row!{label(&parameter.name).font_size(12.).frame_width(140.),caption(format!("{} (read-only)",parameter.value)).font_size(12.)}.spacing(8.)));
+                continue;
+            }
             let Some((_, value)) = self
                 .plugin_fields
                 .borrow()
@@ -249,8 +350,20 @@ impl Daw {
                 continue;
             };
             let submit = self.clone();
-            rows.push(Box::new(row!{label(&parameter.name).font_size(12.).frame_width(140.),ui::field(value).on_submit(move||submit.submit_clap_parameters(target,slot)).frame_width(130.).input_guard(),caption(format!("{} … {}",parameter.min,parameter.max)).font_size(10.)}.spacing(8.)));
+            parameter_rows.push(Box::new(row!{label(&parameter.name).font_size(12.).frame_width(140.),ui::field(value).on_submit(move||submit.submit_clap_parameters(target,slot)).frame_width(130.).input_guard(),caption(format!("{} … {}",parameter.min,parameter.max)).font_size(10.)}.spacing(8.)));
         }
+        rows.push(Box::new(
+            ScrollView::new(
+                VStack::new(Children(parameter_rows))
+                    .spacing(12.)
+                    .alignment(Alignment::TopLeading),
+            )
+            .frame(
+                426.,
+                (plugin.parameters.iter().filter(|p| !p.hidden).count() as f32 * 38.)
+                    .clamp(38., 260.),
+            ),
+        ));
         rows.push(Box::new(
             Text::from_state(self.dialog_error.clone())
                 .font_size(11.)
@@ -314,16 +427,14 @@ impl Daw {
             return;
         }
         // Prepare state on a separate inactive instance on the UI thread.
-        // Only a successful routing commit stops/rebuilds the active graph.
+        // Only a successful routing commit replaces the active graph; transport continues.
         // Failure preserves saved state, history, and ongoing playback.
-        for (id, value) in edits {
-            match plugins::set_parameter(&plugin, id, value) {
-                Ok(updated) => plugin = updated,
-                Err(error) => {
-                    self.dialog_error
-                        .set(format!("Could not update CLAP: {error}"));
-                    return;
-                }
+        match plugins::set_parameters(&plugin, &edits) {
+            Ok(updated) => plugin = updated,
+            Err(error) => {
+                self.dialog_error
+                    .set(format!("Could not update CLAP: {error}"));
+                return;
             }
         }
         self.dialog.set(Dialog::None);

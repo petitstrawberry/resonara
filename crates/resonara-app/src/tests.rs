@@ -5846,6 +5846,105 @@ fn clap_generic_editor_roundtrips_opaque_state_and_undoes_parameter_change() {
 }
 
 #[test]
+#[ignore = "requires external-gain.clap in CLAP_PATH (native gain fixture)"]
+fn installed_clap_picker_edit_bypass_and_undo_keep_playback_running() {
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    s.play();
+    assert_playback_advances(&s, 1700);
+    s.open_insert_picker(target);
+    s.menu_choice.set(4);
+    s.handle_insert_popup_key(KeyCode::Enter);
+    assert!(s.dialog.get() == Dialog::ClapPicker(target));
+    assert_playback_advances(&s, 17);
+    let index = s
+        .plugin_catalog
+        .borrow()
+        .effects
+        .iter()
+        .position(|c| c.library == "external-gain.clap")
+        .unwrap();
+    s.menu_choice.set(index);
+    s.handle_insert_popup_key(KeyCode::Enter);
+    assert!(s.dialog.get() == Dialog::None, "{}", s.dialog_error.get());
+    assert_playback_advances(&s, 17);
+    s.open_insert_editor(target, 0);
+    s.plugin_fields.borrow()[0].1.set("0.25".into());
+    s.submit_clap_parameters(target, 0);
+    assert!(s.dialog.get() == Dialog::None, "{}", s.dialog_error.get());
+    assert_playback_advances(&s, 17);
+    s.toggle_insert(target, 0);
+    assert_playback_advances(&s, 17);
+    s.undo(false);
+    assert_playback_advances(&s, 17);
+    s.undo(false);
+    assert_playback_advances(&s, 17);
+    let m = s.model.borrow();
+    if let resonara_core::InsertKind::Clap { plugin } = &m.project.tracks[0].routing.inserts[0].kind
+    {
+        assert_eq!(plugin.library, "external-gain.clap");
+        assert_eq!(plugin.parameters[0].value, 1.);
+    } else {
+        panic!("CLAP insert missing");
+    }
+}
+
+#[test]
+fn clap_editor_hides_internal_parameters_and_keeps_read_only_values_visible() {
+    wait_for_test_font();
+    let s = Daw::new(project());
+    let target = RoutingTarget::Track(0);
+    let parameters = (0..3)
+        .map(|id| resonara_core::ClapParameter {
+            id,
+            name: ["Editable", "Read only", "Internal"][id as usize].into(),
+            min: 0.,
+            max: 2.,
+            value: 1.,
+            stepped: false,
+            read_only: id == 1,
+            hidden: id == 2,
+        })
+        .collect();
+    s.add_insert(
+        target,
+        resonara_core::InsertKind::Clap {
+            plugin: resonara_core::ClapInsert {
+                library: "missing-editor-fixture.clap".into(),
+                plugin_id: "org.resonara.test.editor".into(),
+                name: "Editor fixture".into(),
+                state: vec![],
+                parameters,
+            },
+        },
+    );
+    s.open_insert_editor(target, 0);
+    assert_eq!(
+        s.plugin_fields
+            .borrow()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        vec![0]
+    );
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.dialog_view().create_element());
+    tree.layout(scarlet_ui::LayoutConstraints::tight(1280., 790.));
+    let mut text = Vec::new();
+    text_layouts(tree.root().unwrap(), Point::ZERO, &mut text);
+    assert!(text.iter().any(|(text, _, _)| text == "Read only"));
+    assert!(!text.iter().any(|(text, _, _)| text == "Internal"));
+    let mut fields = Vec::new();
+    control_bounds(
+        tree.root().unwrap(),
+        Point::ZERO,
+        "::views::text_field::TextFieldRenderObject",
+        &mut fields,
+    );
+    assert_eq!(fields.len(), 1);
+}
+
+#[test]
 fn full_height_inspector_is_outside_right_mixer_and_has_one_editable_name() {
     wait_for_test_font();
     let s = Daw::new(project());

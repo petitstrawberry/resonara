@@ -14,7 +14,9 @@
 //! instance and DSO rather than running illegal callbacks or unloading live code.
 //! Callers should stop/rebuild an insert on `MainThreadRequest`/`RestartRequested`.
 //! Main callbacks are serviced while inactive, never silently called on audio.
+mod gui;
 mod loader;
+pub use gui::GuiSupport;
 
 use clap_sys::{
     audio_buffer::clap_audio_buffer,
@@ -120,9 +122,12 @@ struct LibraryLease {
 }
 impl LibraryLease {
     fn load(path: &Path) -> Result<Self> {
-        let path = path
+        let entry_path = path
             .canonicalize()
             .map_err(|e| Error::new(format!("Plugin path: {e}")))?;
+        let path = loader::binary_path(&entry_path)?
+            .canonicalize()
+            .map_err(|e| Error::new(format!("Plugin executable: {e}")))?;
         let mut registry = LIBRARIES
             .lock()
             .map_err(|_| Error::new("CLAP registry poisoned"))?;
@@ -142,7 +147,7 @@ impl LibraryLease {
         {
             return Err(Error::new("Invalid or incompatible CLAP entry"));
         }
-        let cpath = CString::new(path.as_os_str().as_encoded_bytes())
+        let cpath = CString::new(entry_path.as_os_str().as_encoded_bytes())
             .map_err(|_| Error::new("Invalid plugin path"))?;
         if !unsafe { entry.init.unwrap()(cpath.as_ptr()) } {
             return Err(Error::new("CLAP entry init failed"));

@@ -29,6 +29,17 @@
 - ログは `[Resonara audio] deadline enabled` / `deadline unavailable` / `deadline stats`。kernel の miss / overrun は SAS underrun 回数ではない。今回のコードでのゲストの改善効果は未測定。
 - Deadline 版の AArch64 / RISC-V64 release build と ELF 監査、既存 PCM adapter 7テストに成功。ログは `artifacts/deadline-native-verify.log`、`artifacts/deadline-platform-tests.log`。バイナリは各 `target/<target>/release/resonara`。
 
+## 外部 CLAP と GUI の準備（同日）
+
+- 空き Insert の `Installed CLAP effects…` から、インストール済み native CLAP を一覧・Rescan・追加できる。同一 library の複数 plugin ID は別項目。標準 CLAP 配置先、絶対パスの `CLAP_PATH`、executable 横の `plugins`、Scarlet の `/system/plugins` を再帰検索。
+- 同梱 Gain 固定だった core の解決を拡張。プロジェクトには basename と plugin ID のみ保存し、配置先から解決する。同名の別ファイルは曖昧として拒否。symlink cycle と canonical 重複を処理し、検索量を制限。UI 描画中は inventory を再帰走査し直さない。
+- macOS の `.clap` bundle は CoreFoundation で宣言された executable を解決。entry init は bundle path、library registry は canonical binary を使用。
+- 汎用 parameter popup はスクロール可能。hidden を除外し、read-only は表示だけ。旧プロジェクトの flags は false を既定にする。Apply は1個の inactive instance でまとめて編集・state 保存。
+- GUI も前提にし、`HostPlugin::gui_support(api)` に owner-thread の embedded/floating negotiation を追加。**独自 GUI の表示はまだ未実装**。同じ DSP instance と GUI の所有権、active parameter queue、main callback、Scarlet の SWS window ABI を [GUI contract](clap-gui.md) に整理。SWS を Cocoa/X11 の handle として偽装しない。
+- 外部ファイルとして配置した実 Gain の discovery → add → parameter → bypass → undo で再生継続、state save/reopen、exact DSP、export、callback allocation audit に成功。macOS bundle の executable 名が bundle と異なるケースも成功。
+- host workspace 323テスト成功（長時間 stress のみ除外）、AArch64 / RISC-V64 release build と ELF 監査成功。ログは `artifacts/clap-discovery-tests.log`、`artifacts/clap-discovery-native-verify.log`。ゲストの外部 CLAP と独自 GUI の実機動作を確認したものではない。
+- Scarlet Rust shell の macOS test run は panic runtime error で abort したため、host 用 Resonara Nix shell で再ビルドして全体成功。native は Scarlet 用 shell で検証した。
+
 ## まず結論
 
 - 作業ブランチ: `feat/scarlet-routing`（`main` へのマージ、PR 作成は行わない）
@@ -52,7 +63,7 @@
 
 ### 最初の CLAP
 
-- 対応するのは同梱の `org.resonara.gain`。パラメーターと opaque state を保存・復元し、汎用エディターで編集する
+- 同梱 `org.resonara.gain` と検索で見つかる native stereo CLAP effect に対応。パラメーターと opaque state を保存・復元し、汎用エディターで編集する
 - stereo float32、Gain 0〜2。custom GUI、MIDI、sidechain、PDC、automation、可変ポート構成は未対応
 - **OS/CPU が一致する native C ABI が対象。Linux `.so` を Scarlet や macOS でそのまま動かす機能ではない**
 - 不明／不足プラグインは state を残して再生時に警告つき passthrough。必要な effect が使えない export は WAV 作成前にエラーにする

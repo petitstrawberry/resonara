@@ -1,8 +1,7 @@
 # Resonara's bounded CLAP host
 
-This is the first native effect path, not a general-purpose CLAP workstation host.
-The application currently admits its bundled `org.resonara.gain` effect. The host
-crate itself validates one main stereo input/output, mandatory float32 support,
+The application admits bundled and discovered installed native effects. The host
+validates one main stereo input/output, mandatory float32 support,
 no note ports, zero latency, parameter metadata and opaque state support.
 Native plug-ins execute arbitrary code in the application. Loading and metadata
 validation provide no sandbox or protection from a malicious/broken DSO.
@@ -60,10 +59,20 @@ start/process/stop; they do not claim all concurrent threads are audio threads.
 - Every graph insert must own a separate realtime proxy. Fanout belongs in the
   graph schedule, which should execute that node just once per quantum.
 
+## Native editor preparation
+
+`HostPlugin::gui_support(api)` queries embedded/floating capabilities on the
+original owner thread without creating GUI resources. Incomplete GUI extensions
+fall back to no editor capability and do not block audio-only hosting. Capability
+is not a promise that the host supports that platform API. Native editor creation,
+active main-thread service and GUI parameter transport remain to be implemented;
+see [the editor integration contract](../../docs/clap-gui.md).
+
 ## Dynamic loading
 
 Linux uses `dlopen(RTLD_NOW | RTLD_LOCAL)`; macOS uses its native flag values and
-expects the actual binary path (bundle discovery is outside this first stage).
+accepts native files or `.clap` bundles resolved through CoreFoundation. Bundle
+entry init receives the bundle path; canonical executable paths key the leases.
 Scarlet imports the C entry points from `/bin/scarlet-ld` and uses exactly
 `RTLD_NOW | RTLD_GLOBAL = 0x102`. It does **not** statically link `scarlet-dl`.
 All instances of a canonical DSO path share one entry init/deinit pair; registry

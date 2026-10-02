@@ -1,13 +1,14 @@
 //! Control-thread-only CLAP preparation and persisted plug-in descriptions.
 //!
-//! Project files are data, never dynamic-library search paths. This first host
-//! supports one bundled effect; an unknown identity remains an editable,
-//! passthrough placeholder instead of executing a saved path.
+//! Project files are data, never dynamic-library search paths. Only application
+//! installation/search configuration authorizes a library location.
 use crate::Result;
 use resonara_clap::{HostPlugin, PluginOwner, RealtimePlugin};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+mod catalog;
+pub use catalog::{ClapCatalog, ClapChoice, scan_installed};
 
 pub const BUNDLED_GAIN_LIBRARY: &str = "resonara-gain.clap";
 pub const BUNDLED_GAIN_ID: &str = "org.resonara.gain";
@@ -23,6 +24,12 @@ pub struct ClapParameter {
     pub min: f64,
     pub max: f64,
     pub value: f64,
+    #[serde(default)]
+    pub stepped: bool,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -147,22 +154,31 @@ fn bundled_gain_path() -> Result<PathBuf> {
 /// Cheap UI availability hint only. An existing file can still fail ABI/state
 /// validation during preparation; `Controls::unavailable_plugins` reports that.
 pub fn is_available(insert: &ClapInsert) -> bool {
-    insert.is_bundled_gain() && bundled_gain_path().is_ok()
+    library_path(insert).is_ok()
+}
+
+fn library_path(insert: &ClapInsert) -> Result<PathBuf> {
+    // Preserve the bundled override and reject an unrelated ID masquerading as it.
+    if insert.library == BUNDLED_GAIN_LIBRARY {
+        return if insert.is_bundled_gain() {
+            bundled_gain_path()
+        } else {
+            Err("Unknown bundled CLAP identity".into())
+        };
+    }
+    catalog::resolve(&insert.library)
 }
 
 fn load_inactive(insert: &ClapInsert) -> Result<HostPlugin> {
     insert.validate()?;
-    if !insert.is_bundled_gain() {
-        return Err("This CLAP plug-in is not supported by this host".into());
-    }
-    let mut host = HostPlugin::load(&bundled_gain_path()?, Some(BUNDLED_GAIN_ID))?;
+    let mut host = HostPlugin::load(&library_path(insert)?, Some(&insert.plugin_id))?;
     // Even an empty blob must be accepted by the effect. Never silently turn
     // a missing/corrupt saved state into a default-sounding successful export.
     host.load_state(&insert.state)?;
     Ok(host)
 }
 
-fn snapshot(host: &mut HostPlugin) -> Result<ClapInsert> {
+fn snapshot(host: &mut HostPlugin, library: &str) -> Result<ClapInsert> {
     let plugin_id = host.descriptor().id.clone();
     let name = host.descriptor().name.clone();
     let parameters = host
@@ -175,11 +191,14 @@ fn snapshot(host: &mut HostPlugin) -> Result<ClapInsert> {
                 min: parameter.min_value,
                 max: parameter.max_value,
                 value: host.parameter_value(parameter.id)?,
+                stepped: parameter.stepped,
+                read_only: parameter.read_only,
+                hidden: parameter.hidden,
             })
         })
         .collect::<Result<Vec<_>>>()?;
     let insert = ClapInsert {
-        library: BUNDLED_GAIN_LIBRARY.into(),
+        library: library.into(),
         plugin_id,
         name,
         state: host.save_state()?,
@@ -193,15 +212,28 @@ fn snapshot(host: &mut HostPlugin) -> Result<ClapInsert> {
 /// default opaque state and generic parameter metadata. No activated DSP leaks.
 pub fn load_bundled_gain() -> Result<ClapInsert> {
     let mut host = HostPlugin::load(&bundled_gain_path()?, Some(BUNDLED_GAIN_ID))?;
-    snapshot(&mut host)
+    snapshot(&mut host, BUNDLED_GAIN_LIBRARY)
+}
+
+/// Load a catalog identity on the owner/control thread, with default opaque state.
+pub fn load_installed(choice: &ClapChoice) -> Result<ClapInsert> {
+    let mut host = HostPlugin::load(&catalog::resolve(&choice.library)?, Some(&choice.plugin_id))?;
+    snapshot(&mut host, &choice.library)
 }
 
 /// Restore, edit and resnapshot an inactive instance on the control thread.
 /// Cached UI metadata never replaces the plug-in's authoritative state.
 pub fn set_parameter(insert: &ClapInsert, id: u32, value: f64) -> Result<ClapInsert> {
+    set_parameters(insert, &[(id, value)])
+}
+
+/// Apply one editor submission to one inactive instance, then save once.
+pub fn set_parameters(insert: &ClapInsert, values: &[(u32, f64)]) -> Result<ClapInsert> {
     let mut host = load_inactive(insert)?;
-    host.set_parameter(id, value)?;
-    snapshot(&mut host)
+    for &(id, value) in values {
+        host.set_parameter(id, value)?;
+    }
+    snapshot(&mut host, &insert.library)
 }
 
 pub(crate) fn activate(

@@ -81,6 +81,7 @@ enum Dialog {
     InsertPicker(RoutingTarget),
     InsertActions(RoutingTarget, usize),
     ClapEditor(RoutingTarget, usize),
+    ClapPicker(RoutingTarget),
     SendPicker(RoutingTarget, Option<usize>),
     SendActions(RoutingTarget, usize),
     SendLevel(RoutingTarget, usize),
@@ -167,6 +168,7 @@ struct Daw {
     routing_value: State<String>,
     insert_focus: Rc<RefCell<std::collections::HashMap<(RoutingTarget, usize), State<bool>>>>,
     plugin_fields: Rc<RefCell<Vec<(u32, State<String>)>>>,
+    plugin_catalog: Rc<RefCell<resonara_core::plugins::ClapCatalog>>,
     send_controls:
         Rc<RefCell<std::collections::HashMap<(RoutingTarget, usize), routing::SendControl>>>,
     follow_playhead: State<bool>,
@@ -254,6 +256,7 @@ impl Daw {
             routing_value: state(38, String::new()),
             insert_focus: Rc::new(RefCell::new(std::collections::HashMap::new())),
             plugin_fields: Rc::new(RefCell::new(vec![])),
+            plugin_catalog: Rc::new(RefCell::new(Default::default())),
             send_controls: Rc::new(RefCell::new(std::collections::HashMap::new())),
             follow_playhead: state(34, false),
             follow_suspended: Rc::new(Cell::new(false)),
@@ -2137,7 +2140,7 @@ impl Daw {
                 ] {
                     rows.push(Box::new(label(text)));
                 }
-                rows.push(Box::new(caption("Audio arrangement and mixing. Built-in inserts and the bundled CLAP effect are supported. Recording and MIDI are not implemented.")));
+                rows.push(Box::new(caption("Audio arrangement and mixing. Built-in inserts and native stereo CLAP effects are supported. Recording and MIDI are not implemented.")));
                 rows.push(Box::new(self.button(
                     "Back to session",
                     "Close keyboard reference · Escape",
@@ -2160,6 +2163,7 @@ impl Daw {
             Dialog::InsertPicker(target) => return self.insert_picker_dialog(target),
             Dialog::InsertActions(target, slot) => return self.insert_actions_dialog(target, slot),
             Dialog::ClapEditor(target, slot) => return self.clap_editor_dialog(target, slot),
+            Dialog::ClapPicker(target) => return self.clap_picker_dialog(target),
             Dialog::InsertValue(target, slot) => {
                 return self.insert_value_dialog(target, slot);
             }
@@ -2216,6 +2220,7 @@ impl Daw {
                 | Dialog::InsertPicker(..)
                 | Dialog::InsertActions(..)
                 | Dialog::ClapEditor(..)
+                | Dialog::ClapPicker(..)
                 | Dialog::SendPicker(..)
                 | Dialog::SendActions(..)
                 | Dialog::SendLevel(..)
@@ -2263,6 +2268,7 @@ impl Daw {
                 if matches!(
                     context.dialog.get(),
                     Dialog::InsertPicker(..)
+                        | Dialog::ClapPicker(..)
                         | Dialog::InsertActions(..)
                         | Dialog::SendPicker(..)
                         | Dialog::SendActions(..)

@@ -1,11 +1,13 @@
-# First native CLAP effect
+# Native CLAP effects
 
 Resonara now has a small, separate CLAP host and a cleanroom gain effect. CLAP
 is a C interface, not Linux binary compatibility: the effect must be built for
-the actual operating system and CPU. The first integration intentionally accepts
-only `org.resonara.gain` / `resonara-gain.clap`. It is not a claim that arbitrary
-commercial CLAPs, custom plugin windows, instruments, MIDI, sidechains, latency
-compensation, or dynamic port changes work.
+the actual operating system and CPU. The app can now discover installed native
+CLAP effects as well as the bundled `org.resonara.gain`. Admission still requires
+one main stereo float32 input/output, opaque state, no note ports and zero
+latency. Custom plugin windows, instruments, MIDI, sidechains, latency
+compensation and dynamic port changes are not implemented. See the
+[GUI integration contract](clap-gui.md) for the intended editor architecture.
 
 ## Components and lifecycle
 
@@ -17,7 +19,7 @@ compensation, or dynamic port changes work.
   state is 16 bytes. It uses a fixed 64-instance pool and no libc, TLS, or OS API
 - `resonara-core::plugins` stores identity, opaque state, and cached generic
   parameter metadata. Saved project paths never authorize loading code. Only
-  application configuration and the fixed bundled-effect location are resolved
+  application search configuration and installation locations are resolved
 - The graph creates one processor per active insert. Fanout reads that single
   output, so sends never process the same effect again. Bypass omits the effect
   from the prepared graph
@@ -43,8 +45,13 @@ do not replace the saved state.
 ## UI
 
 An empty insert slot opens the effect picker. `Resonara Gain` loads the bundled
-CLAP effect; its slot opens a generic parameter popup. Custom plugin GUI windows
-are not part of this phase. The dedicated native slot separates name, bypass,
+CLAP effect. `Installed CLAP effects…` opens a scrollable catalog with Rescan,
+load errors and keyboard selection. Multiple descriptors in one library are
+separate choices. Its slot opens a scrollable generic parameter popup; hidden
+parameters are omitted and read-only parameters are displayed without input.
+One Apply restores one inactive instance, edits its parameters and saves once.
+The native GUI negotiation API is available to the future platform adapter;
+custom windows are not yet displayed. The dedicated native slot separates name, bypass,
 and context hit areas; context actions reorder or remove without permanent
 button clutter. Edits and CLAP bypass prepare a replacement graph and switch at
 an audio block boundary, preserving transport and the open output device.
@@ -74,6 +81,23 @@ application checks `plugins/resonara-gain.clap` beside its executable, then
 `/system/plugins/resonara-gain.clap`. The filename stored in a project is an
 identity, never a path passed directly to `dlopen`.
 
+Other effects are discovered recursively as `.clap` libraries in absolute
+`CLAP_PATH` directories (colon-separated on Unix), `plugins` beside the executable,
+and `/system/plugins`. Linux additionally searches `~/.clap` and `/usr/lib/clap`;
+macOS searches `~/Library/Audio/Plug-Ins/CLAP` and `/Library/Audio/Plug-Ins/CLAP`.
+macOS bundles use CoreFoundation to resolve `CFBundleExecutable`; entry init
+receives the bundle path, while leases deduplicate by canonical binary path.
+These locations follow the [CLAP entry contract](https://github.com/free-audio/clap/blob/main/include/clap/entry.h).
+
+Projects retain a basename and plug-in ID; absolute paths and path traversal never
+become loader input. Distinct installed files with the same basename are rejected
+as ambiguous. Symlink cycles and duplicate canonical locations are handled during
+indexing. Search is bounded to 16,384 entries, depth 32, and 1,024 library names;
+the catalog lists at most 1,024 effects. Rescan refreshes the filesystem inventory
+and executes library entry callbacks for descriptor inspection on the control
+thread. A cached inventory avoids repeated recursive scans during UI painting.
+After changing installations, rescan before reloading effects.
+
 ## Verification
 
 Ordinary tests do not require a deployed binary. Build the actual effect and run
@@ -83,9 +107,13 @@ these additional tests so loading, C ABI, and process behavior are exercised:
 cargo test --locked --workspace
 cargo test --manifest-path plugins/resonara-gain/Cargo.toml --locked
 export RESONARA_CLAP_LIBRARY="$PWD/plugins/resonara-gain/target/release/libresonara_gain.so"
+export RESONARA_TEST_CLAP="$RESONARA_CLAP_LIBRARY"
+mkdir -p target/clap-tests
+cp "$RESONARA_CLAP_LIBRARY" target/clap-tests/external-gain.clap
+export CLAP_PATH="$PWD/target/clap-tests"
 cargo test --locked -p resonara-clap --test native_gain -- --include-ignored
 cargo test --locked -p resonara-core --test clap -- --include-ignored
-cargo test --locked -p resonara clap_generic_editor_roundtrips -- --include-ignored
+cargo test --locked -p resonara clap_ -- --include-ignored
 RESONARA_SMOKE_ROUTING=1 RESONARA_SMOKE_CLAP=1 bash scripts/audio-smoke
 ```
 
@@ -93,9 +121,13 @@ Linux tests have exercised real loading, independent instances, generic paramete
 and opaque-state roundtrips, exact samples, failure latching, export, owner-thread
 teardown, and first/repeated callback allocation audits. CPAL/ALSA file-sink
 playback with the real effect has produced nonzero PCM. The final 2026-10-02
-host handoff run completed 301 ordinary workspace tests, all nine explicitly
+earlier cloud handoff run completed 301 ordinary workspace tests, all nine explicitly
 enabled real-CLAP cases, ten effect tests, and nine executable-auditor tests.
-These checks do not measure real hardware latency or dropouts.
+The installed-effect update passed 323 workspace cases on macOS with actual
+native gain binaries (one long stress workload excluded), including external
+catalog loading, continued playback during edits, save/reopen/export, allocation
+audits and bundle executable resolution. Both Scarlet release builds passed their
+ELF audits. These checks do not measure real hardware latency or dropouts.
 
 ## Scarlet status and boundaries
 

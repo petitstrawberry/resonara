@@ -64,6 +64,9 @@ fn saved_gain(value: f64) -> ClapInsert {
             min: 0.,
             max: 2.,
             value,
+            stepped: false,
+            read_only: false,
+            hidden: false,
         }],
     }
 }
@@ -102,6 +105,55 @@ fn project(plugin: ClapInsert, bypass: bool) -> Project {
 }
 fn temp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("resonara-clap-{}-{name}", std::process::id()))
+}
+
+#[test]
+#[ignore = "requires external-gain.clap in CLAP_PATH (a copy of the native gain fixture)"]
+fn installed_effect_discovery_state_reopen_render_and_export() {
+    let catalog = plugins::scan_installed();
+    let choice = catalog
+        .effects
+        .iter()
+        .find(|c| c.library == "external-gain.clap")
+        .unwrap_or_else(|| panic!("External fixture missing: {:?}", catalog.warnings));
+    let default = plugins::load_installed(choice).unwrap();
+    assert_eq!(default.library, "external-gain.clap");
+    assert!(plugins::is_available(&default));
+    let edited = plugins::set_parameters(&default, &[(0, 0.5)]).unwrap();
+    assert_eq!(edited.library, default.library);
+    assert!(plugins::set_parameters(&default, &[(0, 0.5), (99, 1.)]).is_err());
+    assert_eq!(default.parameters[0].value, 1.);
+    let path = temp("external-session.json");
+    project(edited, false).save(&path).unwrap();
+    let loaded = Project::load(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    let mut engine = Engine::try_new(&loaded, Arc::new(Controls::new(&loaded)), 48000, 0).unwrap();
+    assert_eq!(engine.graph_info().unavailable_plugins, 0);
+    let mut output = [0.; 64];
+    ALLOCS.with(|n| n.set(0));
+    FREES.with(|n| n.set(0));
+    AUDITING.with(|a| a.set(true));
+    engine.render(&mut output, 2);
+    AUDITING.with(|a| a.set(false));
+    assert_eq!(ALLOCS.with(Cell::get), 0);
+    assert_eq!(FREES.with(Cell::get), 0);
+    assert_eq!(output, [0.0625, -0.125].repeat(32).as_slice());
+    let wav = temp("external-export.wav");
+    loaded.export_wav(&wav).unwrap();
+    let samples = hound::WavReader::open(&wav)
+        .unwrap()
+        .into_samples::<f32>()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(samples, [0.0625, -0.125].repeat(512));
+    std::fs::remove_file(wav).unwrap();
+}
+
+#[test]
+fn old_parameter_metadata_defaults_to_editable_continuous_visible() {
+    let parameter: ClapParameter =
+        serde_json::from_str(r#"{"id":0,"name":"Gain","min":0,"max":2,"value":1}"#).unwrap();
+    assert!(!parameter.stepped && !parameter.read_only && !parameter.hidden);
 }
 
 #[test]
@@ -193,6 +245,9 @@ fn clap_storage_and_parameter_metadata_are_bounded_even_when_bypassed() {
             min: 0.,
             max: 1.,
             value: 0.,
+            stepped: false,
+            read_only: false,
+            hidden: false,
         })
         .collect();
     assert!(plugin.validate().is_err());
