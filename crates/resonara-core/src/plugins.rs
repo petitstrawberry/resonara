@@ -144,8 +144,8 @@ fn bundled_path(library: &str, override_name: &str) -> Result<PathBuf> {
         }
         return Ok(path);
     }
-    // Some native targets do not implement current_exe; their fixed system
-    // installation must still be reachable when that discovery is unavailable.
+    // Prefer an app's own sidecar. Native targets without current_exe still
+    // reach system/user installations and CLAP_PATH through the catalog below.
     if let Ok(executable) = std::env::current_exe()
         && let Some(directory) = executable.parent()
     {
@@ -154,11 +154,8 @@ fn bundled_path(library: &str, override_name: &str) -> Result<PathBuf> {
             return Ok(path);
         }
     }
-    let native = PathBuf::from("/system/plugins").join(library);
-    if native.is_file() {
-        return Ok(native);
-    }
-    Err(format!("Bundled {library} is unavailable").into())
+    catalog::resolve(library)
+        .map_err(|error| format!("Bundled {library} is unavailable: {error}").into())
 }
 
 /// Cheap UI availability hint only. An existing file can still fail ABI/state

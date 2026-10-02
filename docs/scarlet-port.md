@@ -115,10 +115,15 @@ The full compatibility profile remains the default and is explicitly selectable:
 
 The image wrapper enters that checkout's Nix shell, builds the native app with
 `--locked`, and runs the mandatory ELF host audit before staging it. It also
-builds/audits the bundled native Resonara Gain CLAP effect and installs it with
-its license at `/system/plugins/resonara-gain.clap`. Failed host or effect audits
+builds/audits the bundled native Resonara Gain and Freeverb CLAP effects and installs
+them with their licenses under `/usr/lib/clap`. Failed host or effect audits
 prevent staging and image composition. Each selected profile receives its own
 additive local rootfs layer and launcher entry.
+
+For Scarlet's own image recipes, include the
+[native Resonara bundle](../platforms/scarlet/README.md), which installs both
+the app and the standard plugins. An executable-only Cargo layer installs no
+CLAP plugins; the app build script bundles Freeverb only on macOS/Linux.
 
 Normal runs reuse the selected guest disk. Image reconstruction requires
 `--replace-image` with the same `--profile`, after exporting guest-created files.

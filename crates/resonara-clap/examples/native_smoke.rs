@@ -5,7 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/system/plugins/resonara-gain.clap"));
+        .unwrap_or_else(|| PathBuf::from("/usr/lib/clap/resonara-gain.clap"));
     let descriptors = discover(&path)?;
     if descriptors.len() != 1 || descriptors[0].id != "org.resonara.gain" {
         return Err("Unexpected gain plugin descriptor".into());

@@ -1,3 +1,13 @@
+## 2026-10-03: Scarlet CLAP の配置漏れと検索パス
+
+- `../Scarlet/projects/aarch64-limine-full` の rootfs staging は `/bin/resonara` のみで、標準 CLAP が未配置だった。experimental bundle が executable-only Cargo layer を取り込んでいたのが原因。
+- `platforms/scarlet/bundle.toml` を追加。アプリと native Gain / Freeverb を一緒にビルド・配置する。両プラグインの ELF 監査と license 確認が済むまで plugin destination を更新しない。
+- ユーザー指定で `/system` を廃止対象として扱い、native plugin builder / image wrapper / example の配置先を `/usr/lib/clap` に統一。以下の過去記録の `/system/plugins` は当時の artifact path。
+- Linux / Scarlet の検索は `/usr/lib/clap`、`/usr/local/lib/clap`、`~/.clap`、`~/.local/lib/clap` と `CLAP_PATH` / executable 横。標準 effect も sidecar が無ければ同じ catalog を使う。明示 override は従来通り優先し、異なる同名ファイルは曖昧として拒否。
+- 手元の full project に未存在だった `scarlet.local.toml` を追加し、このローカル checkout の bundle を読むよう設定。`replace = true` で旧 executable-only layer を置き換える。既存 experimental bundle 編集は維持。ゲスト disk の再作成・起動はしていない。
+- 検証: core 106 passed / 8 ignored、独立した `CLAP_PATH` の Gain を専用 override 無しで load / parameter edit / render する追加ケース1件成功。packaging 4 tests、既存 image wrapper tests、両 plugin audit tests 各3成功。AArch64 / RISC-V64 の app と両 plugin の release build / ELF audit に成功。実ゲストの新配置での起動は未確認。
+- 新 packaging artifacts は `artifacts/scarlet-clap-package/usr/lib/clap` と `artifacts/scarlet-clap-package-riscv64/usr/lib/clap`。新しい Scarlet recipe は [native bundle](../platforms/scarlet/README.md) を参照。
+
 ## 2026-10-02: Freeverb の CLAP 埋め込み GUI
 
 - Freeverb の専用ホスト popup を削除。プラグインが `clap.gui` / timer を実装し、Pro-Q と同じ汎用ホスト経路で独立した複数画面を開く。

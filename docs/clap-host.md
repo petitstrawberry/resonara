@@ -77,17 +77,21 @@ cargo run --locked -p resonara
 ```
 
 The environment override must be an existing absolute file. Without it, the
-application checks `plugins/resonara-gain.clap` beside its executable, then
-`/system/plugins/resonara-gain.clap`. The filename stored in a project is an
+application checks `plugins/resonara-gain.clap` beside its executable, then the
+same installation catalog used for other effects. Freeverb follows the same
+rule, with `RESONARA_FREEVERB_LIBRARY` as its override. The filename stored in a project is an
 identity, never a path passed directly to `dlopen`.
 
 Other effects are discovered recursively as `.clap` libraries in absolute
-`CLAP_PATH` directories (colon-separated on Unix), `plugins` beside the executable,
-and `/system/plugins`. Linux additionally searches `~/.clap` and `/usr/lib/clap`;
+`CLAP_PATH` directories (colon-separated on Unix) and `plugins` beside the executable.
+Linux and Scarlet also search `/usr/lib/clap`, `/usr/local/lib/clap`, `~/.clap`
+and `~/.local/lib/clap`;
 macOS searches `~/Library/Audio/Plug-Ins/CLAP` and `/Library/Audio/Plug-Ins/CLAP`.
 macOS bundles use CoreFoundation to resolve `CFBundleExecutable`; entry init
 receives the bundle path, while leases deduplicate by canonical binary path.
-These locations follow the [CLAP entry contract](https://github.com/free-audio/clap/blob/main/include/clap/entry.h).
+The [CLAP entry contract](https://github.com/free-audio/clap/blob/main/include/clap/entry.h)
+specifies the Linux `~/.clap` and `/usr/lib/clap` paths; the other two Unix
+locations are additional compatibility paths.
 
 Projects retain a basename and plug-in ID; absolute paths and path traversal never
 become loader input. Distinct installed files with the same basename are rejected
@@ -134,7 +138,7 @@ ELF audits. These checks do not measure real hardware latency or dropouts.
 The effect build helper produces separate native AArch64 and RISC-V ELF shared
 objects and audits imports, dynamic tags, and relocation kinds. See the plugin’s
 README and generated `artifacts/<arch>/build.json` for provenance. The packaging
-path is `/system/plugins/resonara-gain.clap`.
+path is `/usr/lib/clap/resonara-gain.clap`.
 
 Scarlet’s resident `/bin/scarlet-ld` provides the loader C API. It requires eager
 `RTLD_NOW | RTLD_GLOBAL`; this host must not embed a second scarlet-dl runtime.

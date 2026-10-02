@@ -108,6 +108,21 @@ fn temp(name: &str) -> PathBuf {
 }
 
 #[test]
+#[ignore = "requires resonara-gain.clap in CLAP_PATH with no RESONARA_CLAP_LIBRARY override"]
+fn standard_effect_uses_the_installation_catalog_without_an_override() {
+    assert!(std::env::var_os("RESONARA_CLAP_LIBRARY").is_none());
+    let insert = plugins::load_bundled_gain().unwrap();
+    assert!(insert.is_bundled_gain());
+    let edited = plugins::set_parameter(&insert, 0, 0.5).unwrap();
+    let loaded = project(edited, false);
+    let mut engine = Engine::try_new(&loaded, Arc::new(Controls::new(&loaded)), 48000, 0).unwrap();
+    assert_eq!(engine.graph_info().unavailable_plugins, 0);
+    let mut output = [0.; 64];
+    engine.render(&mut output, 2);
+    assert_eq!(output, [0.0625, -0.125].repeat(32).as_slice());
+}
+
+#[test]
 #[ignore = "requires external-gain.clap in CLAP_PATH (a copy of the native gain fixture)"]
 fn installed_effect_discovery_state_reopen_render_and_export() {
     let catalog = plugins::scan_installed();

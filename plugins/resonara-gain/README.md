@@ -93,7 +93,7 @@ can download Rust sysroot build dependencies even though only these two
 components are built; subsequent runs support `--offline`.
 
 Each output has its own Cargo target directory. Packaged Scarlet artifacts:
-`artifacts/{aarch64,riscv64}/staging/system/plugins/resonara-gain.clap`.
+`artifacts/{aarch64,riscv64}/staging/usr/lib/clap/resonara-gain.clap`.
 The ELF OSABI byte is set to `83` (`ELFOSABI_SCARLET`) as in Scarlet's loader
 smoke fixture. This alone does not make a Linux plugin Scarlet-compatible.
 Only an actual native-Scarlet compilation is packaged.

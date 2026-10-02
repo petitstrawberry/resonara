@@ -37,7 +37,6 @@ fn roots() -> Vec<PathBuf> {
     {
         roots.push(directory.join("plugins"));
     }
-    roots.push(PathBuf::from("/system/plugins"));
     #[cfg(target_os = "macos")]
     {
         roots.push(PathBuf::from("/Library/Audio/Plug-Ins/CLAP"));
@@ -45,12 +44,20 @@ fn roots() -> Vec<PathBuf> {
             roots.push(PathBuf::from(home).join("Library/Audio/Plug-Ins/CLAP"));
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "scarlet"))]
     {
-        roots.push(PathBuf::from("/usr/lib/clap"));
-        if let Some(home) = std::env::var_os("HOME") {
-            roots.push(PathBuf::from(home).join(".clap"));
-        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        roots.extend(unix_roots(home.as_deref()));
+    }
+    roots
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "scarlet"))]
+fn unix_roots(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = vec!["/usr/lib/clap".into(), "/usr/local/lib/clap".into()];
+    if let Some(home) = home.filter(|p| p.is_absolute()) {
+        roots.push(home.join(".clap"));
+        roots.push(home.join(".local/lib/clap"));
     }
     roots
 }
@@ -233,6 +240,21 @@ fn installed(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unix_search_includes_system_and_user_installations_without_relative_home() {
+        assert_eq!(
+            unix_roots(Some(Path::new("/home/musician"))),
+            [
+                "/usr/lib/clap",
+                "/usr/local/lib/clap",
+                "/home/musician/.clap",
+                "/home/musician/.local/lib/clap",
+            ]
+            .map(PathBuf::from)
+        );
+        assert_eq!(unix_roots(Some(Path::new("relative"))), unix_roots(None));
+    }
     struct Temp(PathBuf);
     impl Temp {
         fn new(name: &str) -> Self {

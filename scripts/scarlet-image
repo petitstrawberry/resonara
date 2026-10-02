@@ -181,19 +181,19 @@ for i in "${!PLUGIN_NAMES[@]}"; do
   python3 "$REPO/plugins/$plugin/build.py" --arch aarch64 \
     --toolchain "$(rustc --print sysroot)" --output "$output"
   for required in "$plugin.clap" "$plugin.LICENSE.txt"; do
-    if [[ ! -f "$output/staging/system/plugins/$required" ]]; then
+    if [[ ! -f "$output/staging/usr/lib/clap/$required" ]]; then
       printf 'Audited plugin output is missing: %s\n' "$required" >&2
       exit 2
     fi
   done
 done
-mkdir -p "$ARTIFACTS/rootfs/bin" "$ARTIFACTS/rootfs/etc/stemd.d/apps" "$ARTIFACTS/rootfs/system/plugins"
+mkdir -p "$ARTIFACTS/rootfs/bin" "$ARTIFACTS/rootfs/etc/stemd.d/apps" "$ARTIFACTS/rootfs/usr/lib/clap"
 install -m 0755 "$BINARY" "$ARTIFACTS/rootfs/bin/resonara"
 for i in "${!PLUGIN_NAMES[@]}"; do
   plugin="${PLUGIN_NAMES[$i]}"
   for suffix in clap LICENSE.txt; do
-    install -m 0644 "$ARTIFACTS/${PLUGIN_BUILD_DIRS[$i]}/staging/system/plugins/$plugin.$suffix" \
-      "$ARTIFACTS/rootfs/system/plugins/$plugin.$suffix"
+    install -m 0644 "$ARTIFACTS/${PLUGIN_BUILD_DIRS[$i]}/staging/usr/lib/clap/$plugin.$suffix" \
+      "$ARTIFACTS/rootfs/usr/lib/clap/$plugin.$suffix"
   done
 done
 cat > "$ARTIFACTS/rootfs/etc/stemd.d/apps/org.resonara.Resonara.desktop" <<'EOF'

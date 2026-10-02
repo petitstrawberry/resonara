@@ -69,7 +69,7 @@ GL-enabled VirtIO GPU requirements apply as for the full project. Audio capture
 and actual guest playback must be verified separately from image construction.
 
 The application overlay also installs the MIT-licensed Resonara Freeverb port
-(`org.resonara.freeverb`) and its license notices in `/system/plugins`. Both Gain
+(`org.resonara.freeverb`) and its license notices in `/usr/lib/clap`. Both Gain
 and Freeverb must pass ELF audits before staging begins. In Resonara, select
 an empty Insert → Resonara Freeverb. Its dedicated ScarletUI editor is shared
 with macOS; see [Freeverb](../../../plugins/resonara-freeverb/README.md).

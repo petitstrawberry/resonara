@@ -61,7 +61,7 @@ mono/stereoのWAV（PCM 8/16/24/32bit・32bit float）、MP3、FLAC、AIFF、OGG
 - Bus削除では依存するmain outputをStereo Outへ戻し、そのBus宛のsendを削除。Undo/Redoで全ルーティングと選択を復元します。フィードバック循環はDelay、disabled sendを含め拒否し、失敗した変更は履歴や再生状態を変えません。
 - ルーティング・insert・send宛先／pre-post切替は再生を停止して適用し、次の再生開始時に一度だけgraphをコンパイルします。通常のgain/pan/muteとsend gainは再生中にatomic更新し、再コンパイルしません。保存・再読込・WAV書出しは同じsession routingを使用し、旧JSONは従来のtrack→masterとして読み込みます。
 
-コアの `Engine::with_graph` による明示的なDAGも使用可能です。CLAPは汎用パラメーターとopaque stateを保存し、インストール済みエフェクトも読み込みます。標準リバーブ [Resonara Freeverb](plugins/resonara-freeverb/README.md) はmacOSとScarletで共通のScarletUI専用画面を使い、5つのノブ・数値入力・4プリセットを備えます。Applyで反映、Cancel／Escapeで破棄し、Undoや再生中の変更にも対応します。macOS/Linuxの通常ビルドは実行ファイルの隣の `plugins/` にDSPを生成するため、実行ファイルを移動する際はこのフォルダーも同梱してください。Scarletのimage builderは `/system/plugins/` に配置します。MIDI、PDC、エフェクトtail延長は未対応です。制限・ビルド・検証は[CLAPホスト](docs/clap-host.md)を参照してください。API、信号順序、制限、テストとスケール試験は[音声グラフ](docs/audio-graph.md)に記載しています。
+コアの `Engine::with_graph` による明示的なDAGも使用可能です。CLAPは汎用パラメーターとopaque stateを保存し、インストール済みエフェクトも読み込みます。標準リバーブ [Resonara Freeverb](plugins/resonara-freeverb/README.md) はmacOSとScarletで共通のScarletUI専用画面を使い、5つのノブ・数値入力・プリセット選択を備えます。CLAPの埋め込みGUIから即時反映し、Undoや再生中の変更にも対応します。macOS/Linuxの通常ビルドは実行ファイルの隣の `plugins/` にDSPを生成するため、実行ファイルを移動する際はこのフォルダーも同梱してください。Scarletのimage builderは `/usr/lib/clap/` に配置します。Scarlet側の通常image recipeには[Resonara bundle](platforms/scarlet/README.md)を含めて、本体とプラグインを一緒に配置してください。MIDI、PDC、エフェクトtail延長は未対応です。制限・ビルド・検証は[CLAPホスト](docs/clap-host.md)を参照してください。API、信号順序、制限、テストとスケール試験は[音声グラフ](docs/audio-graph.md)に記載しています。
 
 Scarlet版はネイティブstdターゲットでSWS UIとSAS音声アダプターを選択します。Git依存・既存vendorパッチを保持し、ネイティブstdでファイルI/Oを共有します。ビルドとQEMU実行の手順、音声の制約、検証段階は[Scarlet移植](docs/scarlet-port.md)を参照してください。クロスビルド成功と実機動作は区別します。
 

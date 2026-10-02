@@ -175,7 +175,7 @@ def main():
         target.write_text(json.dumps(spec, indent=2) + "\n")
         command += ["--target", str(target), "-Zbuild-std=core,alloc,compiler_builtins"]
         artifact = output / "cargo" / target.stem / f"release/lib{crate_name}.so"
-        destination = output / f"staging/system/plugins/{plugin_name}.clap"
+        destination = output / f"staging/usr/lib/clap/{plugin_name}.clap"
     if args.offline:
         command.append("--offline")
     subprocess.run(command, env=env, check=True)

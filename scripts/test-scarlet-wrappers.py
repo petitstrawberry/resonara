@@ -108,7 +108,7 @@ with open(os.environ["FIXTURE_LOG"], "a") as handle:
     handle.write(json.dumps(entry) + "\\n")
 if os.getenv("FIXTURE_FAIL_PLUGIN_BUILD") or os.getenv("FIXTURE_FAIL_PLUGIN_NAME") == pathlib.Path(__file__).parent.name:
     raise SystemExit("mock native plugin ELF audit rejected output")
-staging = args.output / "staging/system/plugins"
+staging = args.output / "staging/usr/lib/clap"
 staging.mkdir(parents=True, exist_ok=True)
 (staging / "resonara-gain.clap").write_bytes(b"MOCK NATIVE CLAP PLUGIN")
 (staging / "resonara-gain.LICENSE.txt").write_bytes(b"MOCK LICENSE NOTICES")
@@ -140,11 +140,11 @@ elif args[:2] == ["scarlet", "image"]:
     assert (artifacts / "native-host-audit.json").is_file()
     assert (artifacts / "gain-aarch64/build.json").is_file()
     assert (artifacts / "resonara-freeverb-aarch64/build.json").is_file()
-    assert (artifacts / "rootfs/system/plugins/resonara-freeverb.clap").read_bytes() == b"MOCK NATIVE CLAP PLUGIN"
-    assert (artifacts / "rootfs/system/plugins/resonara-freeverb.LICENSE.txt").read_bytes() == b"MOCK LICENSE NOTICES"
+    assert (artifacts / "rootfs/usr/lib/clap/resonara-freeverb.clap").read_bytes() == b"MOCK NATIVE CLAP PLUGIN"
+    assert (artifacts / "rootfs/usr/lib/clap/resonara-freeverb.LICENSE.txt").read_bytes() == b"MOCK LICENSE NOTICES"
     assert (artifacts / "rootfs/bin/resonara").is_file()
-    assert (artifacts / "rootfs/system/plugins/resonara-gain.clap").read_bytes() == b"MOCK NATIVE CLAP PLUGIN"
-    assert (artifacts / "rootfs/system/plugins/resonara-gain.LICENSE.txt").read_bytes() == b"MOCK LICENSE NOTICES"
+    assert (artifacts / "rootfs/usr/lib/clap/resonara-gain.clap").read_bytes() == b"MOCK NATIVE CLAP PLUGIN"
+    assert (artifacts / "rootfs/usr/lib/clap/resonara-gain.LICENSE.txt").read_bytes() == b"MOCK LICENSE NOTICES"
     image = project / ".scarlet/images" / ("limine-aarch64-resonara-native.img" if native else "limine-aarch64-full.img")
     image.parent.mkdir(parents=True, exist_ok=True)
     image.write_text("UNIT TEST FIXTURE ONLY")
@@ -223,7 +223,7 @@ with tempfile.TemporaryDirectory(prefix="resonara-wrapper-tests-") as temporary:
     generated = fixture.overlay.read_bytes()
     assert b'[[images.rootfs.layers]]' in generated and b'kind = "copy"' in generated
     assert (fixture.app / "artifacts/scarlet/rootfs/etc/stemd.d/apps/org.resonara.Resonara.desktop").exists()
-    plugin_root = fixture.app / "artifacts/scarlet/rootfs/system/plugins"
+    plugin_root = fixture.app / "artifacts/scarlet/rootfs/usr/lib/clap"
     assert (plugin_root / "resonara-gain.clap").read_bytes() == b"MOCK NATIVE CLAP PLUGIN"
     assert (plugin_root / "resonara-gain.LICENSE.txt").read_bytes() == b"MOCK LICENSE NOTICES"
 
@@ -261,7 +261,7 @@ with tempfile.TemporaryDirectory(prefix="resonara-wrapper-tests-") as temporary:
     desktop_before = (native.checkout / "bundles/desktop/bundle.toml").read_bytes()
     success(native.run("scarlet-run", inside=False))
     assert native.image.exists()
-    assert (native.app / "artifacts/scarlet-native/rootfs/system/plugins/resonara-gain.clap").exists()
+    assert (native.app / "artifacts/scarlet-native/rootfs/usr/lib/clap/resonara-gain.clap").exists()
     manifest = tomllib.loads((native.project / "scarlet.toml").read_text())
     assert manifest["images"]["rootfs"]["min-size-mib"] == 2048
     assert manifest["images"]["rootfs"]["layers"][0]["path"] == "../../bundles/desktop/bundle.toml"

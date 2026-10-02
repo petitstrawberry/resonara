@@ -19,7 +19,9 @@ popup. Aux send sets Wet=1 / Dry=0. Each insert owns its own editor.
 
 The app build places the plugin under `<profile>/plugins/` beside its executable.
 Move that directory with the app binary. Scarlet's image builder stages native
-plugins and license notices under `/system/plugins/`. No separate repository,
+plugins and license notices under `/usr/lib/clap/`. Scarlet's own image recipes
+must include the [Resonara bundle](../../platforms/scarlet/README.md) rather than
+only the app's Cargo layer. No separate repository,
 installation or catalog scan is required for Resonara's bundled Freeverb.
 
 ## Structure and GUI
