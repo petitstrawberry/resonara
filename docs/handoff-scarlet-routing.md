@@ -1,5 +1,12 @@
 # Resonara / Scarlet 引き継ぎ（2026-10-02）
 
+## 無料 TAL-Reverb-4 の macOS 導入（同日）
+
+- ユーザーの選択で [公式 macOS 配布](https://tal-software.com/products/tal-reverb-4) から CLAP 4.0.4 を導入。署名・notarization・bundle signature を確認し、CLAP payload のみ `~/Library/Audio/Plug-Ins/CLAP/TAL-Reverb-4.clap` に配置した。Intel / arm64 universal binary。アプリへの vendor binary 同梱や Scarlet への配置はしていない。
+- catalog の名前は `TAL Reverb 4 Plugin`、ID は `ch.toguaudioline.talreverb4`。20 parameters / 641 bytes state。Cocoa embedded GUI negotiation に成功（実 window 表示は未検証）。
+- Resonara Engine で3秒の wet impulse response と50 ms後の tail energy = 0.008938697256020839 を確認。state save/reopen、WAV export、正確な dry bypass、live bypass 時の同一 Engine 維持が成功。ログは `artifacts/tal-reverb4/inspect.log`、`artifacts/tal-reverb4/core-smoke.log`。検証 probe / project / WAV も同じ artifact directory にある。
+- アプリでは空 Insert → `Installed CLAP effects…` → `Rescan` → `TAL Reverb 4 Plugin` から追加できる。
+
 ## CLAP bypass の GUI / DSP 保持（同日）
 
 - CLAP bypass も built-in と同じ atomic 制御に変更。graph / PluginOwner / GUI を交換せず、音声だけを dry passthrough にする。内部 DSP history は保持して凍結する。bypass 中も GUI の pending params flush は同じ audio thread で処理する。
