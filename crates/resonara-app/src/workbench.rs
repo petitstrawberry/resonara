@@ -309,6 +309,11 @@ impl Daw {
         let position = (drag.start
             + (x as f32 / drag.width.max(1.)).clamp(0., 1.) as f64 * drag.span)
             .clamp(0., end);
+        if let Some((begin, end)) = self.region_editor.ruler_bounds.get() {
+            return ((position.clamp(begin, end) * m.project.sample_rate as f64).round()
+                / m.project.sample_rate as f64)
+                .clamp(begin, end);
+        }
         if self.snap.get() {
             self.snap_grid_for(&m.project)
                 .position(position)
@@ -373,6 +378,7 @@ impl Daw {
         let Some(drag) = self.ruler_drag.borrow_mut().take() else {
             return false;
         };
+        self.region_editor.ruler_bounds.set(None);
         if drag.resume {
             // No seek was committed: keep the existing stream at its current position.
             let position = {

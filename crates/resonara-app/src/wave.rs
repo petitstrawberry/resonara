@@ -2,7 +2,13 @@
 use crate::ui;
 use resonara_core::Track;
 use scarlet_ui::prelude::*;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 const BIN_FRAMES: usize = 128;
 
@@ -34,6 +40,32 @@ impl Envelope {
 struct SourcePeaks {
     samples: Arc<Vec<[f32; 2]>>,
     bins: Vec<Envelope>,
+}
+/// Built alongside newly edited audio, before the UI receives the result.
+pub(crate) struct PreparedPeaks(SourcePeaks);
+impl PreparedPeaks {
+    pub(crate) fn new(
+        samples: &Arc<Vec<[f32; 2]>>,
+        cancel: &AtomicBool,
+    ) -> std::result::Result<Self, String> {
+        let mut bins = Vec::new();
+        bins.try_reserve_exact(samples.len().div_ceil(BIN_FRAMES))
+            .map_err(|_| "Could not allocate waveform peaks")?;
+        for chunk in samples.chunks(BIN_FRAMES) {
+            if cancel.load(Ordering::Acquire) {
+                return Err("Region processing cancelled".into());
+            }
+            let mut envelope = Envelope::empty();
+            for sample in chunk {
+                envelope.sample(*sample);
+            }
+            bins.push(envelope);
+        }
+        Ok(Self(SourcePeaks {
+            samples: samples.clone(),
+            bins,
+        }))
+    }
 }
 impl SourcePeaks {
     fn envelope(&self, from: usize, to: usize) -> Envelope {
@@ -71,6 +103,10 @@ pub struct Peaks {
     sources: HashMap<usize, SourcePeaks>,
 }
 impl Peaks {
+    pub(crate) fn install(&mut self, prepared: PreparedPeaks) {
+        self.sources
+            .insert(Arc::as_ptr(&prepared.0.samples) as usize, prepared.0);
+    }
     fn source(&mut self, samples: &Arc<Vec<[f32; 2]>>) -> &SourcePeaks {
         let key = Arc::as_ptr(samples) as usize;
         self.sources.entry(key).or_insert_with(|| {

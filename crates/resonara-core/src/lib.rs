@@ -5,6 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 pub mod audio;
+pub mod audio_edit;
 pub mod graph;
 pub mod live;
 pub mod pitch;

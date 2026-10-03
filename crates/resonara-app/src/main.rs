@@ -47,7 +47,9 @@ mod channel_strip;
 mod insert_editor;
 mod inspector;
 mod lower_panel;
+mod region_audio_edits;
 mod region_editor;
+mod region_editor_menu;
 mod region_processing;
 mod routing;
 mod send_editor;
@@ -579,6 +581,7 @@ impl Daw {
         self.changed();
     }
     fn edit(&self, label: &str, f: impl FnOnce(&mut Model) -> Result<()>) {
+        self.region_editor.menu.set(None);
         self.poll_native_editors(true);
         self.native_edit_group.set(false);
         self.track_menu.set(None);
@@ -1717,6 +1720,9 @@ impl Daw {
         }
     }
     fn handle_key(&self, e: KeyEvent) -> bool {
+        if let KeyEvent::Pressed { modifiers, .. } | KeyEvent::Released { modifiers, .. } = e {
+            self.region_editor.modifiers.set(modifiers);
+        }
         if self.model.borrow().picker.is_some() {
             if matches!(
                 e,
@@ -1777,6 +1783,12 @@ impl Daw {
                 KeyCode::Char('z' | 'Z') => self.undo(modifiers.shift),
                 KeyCode::Char('y' | 'Y') => self.undo(true),
                 KeyCode::Char('d' | 'D') => self.duplicate(),
+                KeyCode::Char('v' | 'V')
+                    if self.panel_visible.get()
+                        && self.panel_mode() == lower_panel::PanelTab::Editor =>
+                {
+                    self.editor_paste()
+                }
                 _ => return false,
             };
             return true;
@@ -1977,7 +1989,7 @@ impl Daw {
             }
         }
         let s = self.clone();
-        AnyView::new(row!{row!{caption("TRACKS"),Spacer::new(),caption(format!("{}",self.model.borrow().project.tracks.len())),self.button("+","Add an empty audio track",|s|{let after=(!s.model.borrow().project.tracks.is_empty()).then_some(s.model.borrow().selected);s.add_track(after);}).frame(24.,24.)}.spacing(5.).padding_insets(EdgeInsets::new(10.,3.,6.,3.)).frame(HEADER,30.).background(PANEL),ZStack::new(Children(labels)).alignment(Alignment::TopLeading).frame(width,30.).background(RAISED).on_event(move|e|s.ruler_event(e,start,span,width))}.spacing(0.))
+        AnyView::new(row!{row!{caption("TRACKS"),Spacer::new(),caption(format!("{}",self.model.borrow().project.tracks.len())),self.button("+","Add an empty audio track",|s|{let after=(!s.model.borrow().project.tracks.is_empty()).then_some(s.model.borrow().selected);s.add_track(after);}).frame(24.,24.)}.spacing(5.).padding_insets(EdgeInsets::new(10.,3.,6.,3.)).frame(HEADER,30.).background(PANEL),ZStack::new(Children(labels)).alignment(Alignment::TopLeading).frame(width,30.).background(RAISED).on_event(move|e|{if matches!(e,Event::Mouse(MouseEvent::ButtonPressed{button:MouseButton::Left,..})){s.region_editor.ruler_bounds.set(None);}s.ruler_event(e,start,span,width)})}.spacing(0.))
     }
     fn arrangement(&self) -> AnyView {
         let size = self.arrangement_size.get();
@@ -2379,6 +2391,25 @@ impl Daw {
                 .alignment(Alignment::TopLeading)
                 .frame(self.size.get().width, self.size.get().height),
             )
+        } else if let Some(anchor) = self
+            .region_editor
+            .menu
+            .get()
+            .filter(|_| self.dialog.get() == Dialog::None)
+        {
+            AnyView::new(
+                ZStack::new(Children(vec![
+                    Box::new(inner),
+                    Box::new(
+                        Rectangle::new()
+                            .fill(Color::TRANSPARENT)
+                            .frame(self.size.get().width, self.size.get().height),
+                    ),
+                    Box::new(self.editor_menu_view(anchor)),
+                ]))
+                .alignment(Alignment::TopLeading)
+                .frame(self.size.get().width, self.size.get().height),
+            )
         } else {
             inner
         };
@@ -2386,6 +2417,19 @@ impl Daw {
         AnyView::new(InputBoundary(
             AnyView::new(ShortcutBoundary(content)),
             Rc::new(move |root, e| {
+                if context.editor_context_event(
+                    root,
+                    e,
+                    matches!(
+                        e,
+                        Event::Mouse(MouseEvent::ButtonPressed {
+                            button: MouseButton::Left,
+                            ..
+                        })
+                    ) && ui::mac_control_down(),
+                ) {
+                    return true;
+                }
                 if matches!(
                     context.dialog.get(),
                     Dialog::InsertPicker(..)

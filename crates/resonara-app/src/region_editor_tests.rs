@@ -363,7 +363,7 @@ fn editor_refresh_preserves_drafts_and_untouched_sub_display_precision() {
 }
 
 #[test]
-fn editor_inherited_fades_require_explicit_reset_and_keep_undo() {
+fn editor_fades_reanchor_inherited_envelope_in_one_undo_step() {
     let s = fixture();
     s.edit("Fade source", |m| {
         m.project.tracks[0].clips[0].set_fades(100, 200)
@@ -378,17 +378,12 @@ fn editor_inherited_fades_require_explicit_reset_and_keep_undo() {
     let history = s.model.borrow().undo.len();
     s.region_editor.fade_in.set("5.0".into());
     s.editor_fades();
-    assert_eq!(s.model.borrow().undo.len(), history);
-    assert_eq!(
-        s.model.borrow().project.tracks[0].clips[0].edit,
-        before.edit
-    );
-    s.editor_reset_fades();
-    assert!(
-        !s.model.borrow().project.tracks[0].clips[0]
-            .edit
-            .has_inherited_fades()
-    );
+    let after = s.model.borrow().project.tracks[0].clips[0].clone();
+    assert_eq!(s.model.borrow().undo.len(), history + 1);
+    assert_eq!(after.edit.fade_in, 40);
+    assert_eq!(after.edit.fade_out, 200);
+    assert!(!after.edit.has_inherited_fades());
+    assert!(Arc::ptr_eq(&before.samples, &after.samples));
     s.undo(false);
     assert_eq!(
         s.model.borrow().project.tracks[0].clips[0].edit,
@@ -550,4 +545,561 @@ fn mounted_full_window_editor_shortcut_and_region_selection_fill_lower_pane() {
     }
     assert_editor_geometry(&s, &pipeline);
     pipeline.teardown();
+}
+
+fn finish_worker(s: &Daw) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while s.region_processing_active() && Instant::now() < deadline {
+        s.poll_region_processing();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(!s.region_processing_active(), "{}", s.status.get());
+}
+fn key(s: &Daw, keycode: KeyCode, modifiers: KeyModifiers) {
+    assert!(s.editor_key(KeyEvent::Pressed { keycode, modifiers }));
+}
+#[test]
+fn clipboard_cut_delete_and_paste_preserve_time_and_live_transport() {
+    let s = fixture();
+    s.edit("Shared copy", |m| {
+        let mut other = m.project.tracks[0].clips[0].clone();
+        other.start = 1400;
+        m.project.tracks[0].clips.push(other);
+        Ok(())
+    });
+    let original = s.model.borrow().project.tracks[0].clips[0].clone();
+    s.play();
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    let primary = KeyModifiers {
+        super_key: true,
+        ..Default::default()
+    };
+    s.editor_set_selection(Selection {
+        anchor: 100,
+        head: 200,
+    });
+    key(&s, KeyCode::Char('x'), primary);
+    {
+        let m = s.model.borrow();
+        let clips = &m.project.tracks[0].clips;
+        assert_eq!(
+            clips
+                .iter()
+                .map(|c| (c.start, c.frames))
+                .collect::<Vec<_>>(),
+            vec![(400, 100), (600, 600), (1400, 800)]
+        );
+        assert_eq!(clips[1].sample_at(0.), original.sample_at(200.));
+        assert!(
+            clips
+                .iter()
+                .all(|c| Arc::ptr_eq(&c.samples, &original.samples))
+        );
+        assert!(Arc::ptr_eq(&controls, &m.audio.as_ref().unwrap().controls));
+    }
+    let copied = s
+        .region_editor
+        .clipboard
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .audio
+        .clone();
+    assert_eq!(copied.frames, 100);
+    assert_eq!(copied.sample_at(0.), original.sample_at(100.));
+    s.seek(500. / 8000.);
+    key(&s, KeyCode::Char('v'), primary);
+    {
+        let m = s.model.borrow();
+        let clips = &m.project.tracks[0].clips;
+        assert_eq!(
+            clips
+                .iter()
+                .map(|c| (c.start, c.frames))
+                .collect::<Vec<_>>(),
+            vec![(400, 100), (500, 100), (600, 600), (1400, 800)]
+        );
+        assert_eq!(m.clip, Some(1));
+        assert_eq!(clips[1].sample_at(0.), copied.sample_at(0.));
+    }
+    s.editor_set_selection(Selection {
+        anchor: 0,
+        head: 100,
+    });
+    key(&s, KeyCode::Delete, KeyModifiers::default());
+    assert_eq!(
+        s.region_editor
+            .clipboard
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .audio
+            .start,
+        copied.start
+    );
+    assert_eq!(s.model.borrow().project.tracks[0].clips.len(), 3);
+    s.undo(false);
+    s.undo(false);
+    s.undo(false);
+    assert_eq!(s.model.borrow().project.tracks[0].clips[0].frames, 800);
+    assert!(controls.playing.load(Ordering::Relaxed));
+}
+
+#[test]
+fn whole_region_cut_can_paste_at_playhead_with_no_region_selected() {
+    let s = fixture();
+    let original = s.model.borrow().project.tracks[0].clips[0].clone();
+    s.editor_set_selection(Selection {
+        anchor: 0,
+        head: original.frames,
+    });
+    s.editor_cut();
+    assert!(s.model.borrow().project.tracks[0].clips.is_empty());
+    assert!(s.model.borrow().clip.is_none());
+    s.seek(0.);
+    assert!(s.handle_key(KeyEvent::Pressed {
+        keycode: KeyCode::Char('v'),
+        modifiers: KeyModifiers {
+            super_key: true,
+            ..Default::default()
+        }
+    }));
+    let m = s.model.borrow();
+    let pasted = &m.project.tracks[0].clips[0];
+    assert_eq!(pasted.start, 0);
+    assert_eq!(pasted.frames, original.frames);
+    assert_eq!(pasted.edit, original.edit);
+    assert!(Arc::ptr_eq(&pasted.samples, &original.samples));
+    assert_eq!(m.undo.len(), 2);
+}
+
+#[test]
+fn region_selection_change_resets_drafts_and_cancels_scroll_gesture() {
+    let s = fixture();
+    s.region_editor.range_start.set("unfinished".into());
+    s.region_editor.scroll_drag.set(Some((20., 200.)));
+    s.choose(0, None);
+    assert!(!s.editor_gesture_active());
+    s.choose(0, Some(0));
+    assert_eq!(s.region_editor.range_start.get(), "0.000000");
+    assert_eq!(s.region_editor.range_end.get(), "0.000000");
+}
+#[test]
+fn delete_key_is_scoped_to_the_editor_range_and_silence_keeps_duration() {
+    let s = fixture();
+    key(&s, KeyCode::Delete, KeyModifiers::default());
+    assert_eq!(s.model.borrow().project.tracks[0].clips.len(), 1);
+    assert!(s.model.borrow().undo.is_empty());
+    s.editor_set_selection(Selection {
+        anchor: 100,
+        head: 300,
+    });
+    s.editor_silence();
+    finish_worker(&s);
+    let silent = s.model.borrow().project.tracks[0].clips[0].clone();
+    assert_eq!(silent.frames, 800);
+    assert_eq!(silent.sample_at(150.), [0.; 2]);
+    assert_ne!(silent.sample_at(99.), [0.; 2]);
+    key(&s, KeyCode::Delete, KeyModifiers::default());
+    finish_worker(&s);
+    assert_eq!(
+        s.model.borrow().project.tracks[0]
+            .clips
+            .iter()
+            .map(|c| (c.start, c.frames))
+            .collect::<Vec<_>>(),
+        vec![(400, 100), (700, 500)]
+    );
+    assert_eq!(s.region_editor.selection.get().head, 100);
+}
+#[test]
+fn selection_fields_are_exact_validate_ranges_and_preserve_typing() {
+    let s = fixture();
+    s.region_editor.sample_units.set(true);
+    s.editor_refresh_range_fields(8000);
+    s.region_editor.range_start.set("123".into());
+    s.region_editor.range_end.set("456".into());
+    s.editor_submit_range();
+    assert_eq!(s.region_editor.selection.get().range(), 123..456);
+    s.region_editor.range_start.set("1.".into());
+    s.refresh(true);
+    assert_eq!(s.region_editor.range_start.get(), "1.");
+    s.region_editor.range_start.set("800".into());
+    s.editor_submit_range();
+    assert_eq!(s.region_editor.selection.get().range(), 123..456);
+    s.region_editor.sample_units.set(false);
+    s.editor_refresh_range_fields(8000);
+    assert_eq!(s.region_editor.range_start.get(), "0.015375");
+    s.region_editor.range_start.set("0.0125".into());
+    s.region_editor.range_end.set("0.025".into());
+    s.editor_submit_range();
+    assert_eq!(s.region_editor.selection.get().range(), 100..200);
+}
+#[test]
+fn fade_handle_preview_cancel_and_commit_are_transactional() {
+    let s = fixture();
+    s.play();
+    let before = s.model.borrow().undo.len();
+    let press = Event::Mouse(MouseEvent::ButtonPressed {
+        button: MouseButton::Left,
+        x: 5,
+        y: 5,
+        click_count: 1,
+    });
+    assert!(s.editor_event(&press));
+    assert!(s.editor_event(&Event::Mouse(MouseEvent::Moved { x: 126, y: 10 })));
+    assert!(s.region_editor.fade_preview.get().unwrap().0 > 100);
+    assert_eq!(s.model.borrow().project.tracks[0].clips[0].edit.fade_in, 0);
+    key(&s, KeyCode::Escape, KeyModifiers::default());
+    assert_eq!(s.model.borrow().undo.len(), before);
+    assert!(s.region_editor.fade_preview.get().is_none());
+    assert!(s.editor_event(&press));
+    assert!(s.editor_event(&Event::Mouse(MouseEvent::ButtonReleased {
+        button: MouseButton::Left,
+        x: 126,
+        y: 10,
+        click_count: 1
+    })));
+    assert_eq!(s.model.borrow().undo.len(), before + 1);
+    assert!(s.model.borrow().project.tracks[0].clips[0].edit.fade_in > 100);
+    s.undo(false);
+    assert_eq!(s.model.borrow().project.tracks[0].clips[0].edit.fade_in, 0);
+    assert!(
+        s.model
+            .borrow()
+            .audio
+            .as_ref()
+            .unwrap()
+            .controls
+            .playing
+            .load(Ordering::Relaxed)
+    );
+}
+#[test]
+fn shift_click_and_boundary_drag_extend_selection_without_seeking() {
+    let s = fixture();
+    s.editor_set_selection(Selection {
+        anchor: 100,
+        head: 400,
+    });
+    let x = (100. / 800. * s.region_editor.waveform_size().width) as i32;
+    s.editor_event(&Event::Mouse(MouseEvent::ButtonPressed {
+        button: MouseButton::Left,
+        x,
+        y: 30,
+        click_count: 1,
+    }));
+    s.editor_event(&Event::Mouse(MouseEvent::ButtonReleased {
+        button: MouseButton::Left,
+        x: x + 20,
+        y: 30,
+        click_count: 1,
+    }));
+    let range = s.region_editor.selection.get().range();
+    assert_eq!(range.end, 400);
+    assert!(range.start > 100);
+    s.region_editor.modifiers.set(KeyModifiers {
+        shift: true,
+        ..Default::default()
+    });
+    s.editor_event(&Event::Mouse(MouseEvent::ButtonPressed {
+        button: MouseButton::Left,
+        x: 500,
+        y: 30,
+        click_count: 1,
+    }));
+    assert_eq!(s.region_editor.selection.get().anchor, 400);
+    assert!(s.region_editor.selection.get().head > 600);
+}
+#[test]
+fn editor_ruler_seek_and_cancel_use_absolute_clip_offset_and_preserve_range() {
+    let s = fixture();
+    s.editor_set_selection(Selection {
+        anchor: 200,
+        head: 300,
+    });
+    s.region_editor.set_view(200., 400., 800);
+    let width = s.region_editor.waveform_size().width;
+    let press = Event::Mouse(MouseEvent::ButtonPressed {
+        button: MouseButton::Left,
+        x: (width / 2.) as i32,
+        y: 5,
+        click_count: 1,
+    });
+    s.snap.set(true); // Musical arrangement snap must not quantize audio positions.
+    s.editor_ruler_event(&press);
+    s.editor_ruler_event(&Event::Mouse(MouseEvent::ButtonReleased {
+        button: MouseButton::Left,
+        x: (width / 2.) as i32,
+        y: 5,
+        click_count: 1,
+    }));
+    assert!((s.playhead.get() - 0.1).abs() < 0.0002);
+    assert_eq!(s.region_editor.selection.get().range(), 200..300);
+    let before = s.playhead.get();
+    s.editor_ruler_event(&Event::Mouse(MouseEvent::ButtonPressed {
+        button: MouseButton::Left,
+        x: 0,
+        y: 5,
+        click_count: 1,
+    }));
+    s.editor_ruler_event(&Event::Mouse(MouseEvent::Moved {
+        x: width as i32,
+        y: 5,
+    }));
+    assert!(s.playhead.get() > before);
+    assert!(s.cancel_ruler_drag());
+    assert_eq!(s.playhead.get(), before);
+    assert!(s.region_editor.ruler_bounds.get().is_none());
+    s.play();
+    let controls = s.model.borrow().audio.as_ref().unwrap().controls.clone();
+    s.editor_ruler_event(&press);
+    s.editor_ruler_event(&Event::Mouse(MouseEvent::ButtonReleased {
+        button: MouseButton::Left,
+        x: (width / 4.) as i32,
+        y: 5,
+        click_count: 1,
+    }));
+    assert!(Arc::ptr_eq(
+        &controls,
+        &s.model.borrow().audio.as_ref().unwrap().controls
+    ));
+    assert!(controls.playing.load(Ordering::Relaxed));
+}
+
+#[test]
+fn mounted_editor_ruler_drags_outside_bounds_and_escape_restores_transport() {
+    let s = fixture();
+    s.size.set(Size::new(1200., 860.));
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.create_element());
+    for _ in 0..3 {
+        tree.root_mut().unwrap().rebuild();
+        tree.layout(LayoutConstraints::tight(1200., 860.));
+    }
+    let mut rulers = vec![];
+    render_bounds::<EditorRulerRender>(tree.root().unwrap(), Point::ZERO, &mut rulers);
+    let (origin, size) = rulers[0];
+    let x = (origin.x + size.width * 0.4) as i32;
+    let y = (origin.y + size.height * 0.5) as i32;
+    let mut dispatcher = scarlet_ui::EventDispatcher::new();
+    let press = Event::Mouse(MouseEvent::ButtonPressed {
+        button: MouseButton::Left,
+        x,
+        y,
+        click_count: 1,
+    });
+    assert!(dispatcher.dispatch(&mut tree, &press));
+    assert!(s.ruler_drag.borrow().is_some());
+    assert!((s.playhead.get() - 0.09).abs() < 0.0003);
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Mouse(MouseEvent::Moved {
+            x: (origin.x + size.width + 100.) as i32,
+            y: y + 100
+        })
+    ));
+    assert_eq!(s.playhead.get(), 0.15);
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Keyboard(KeyEvent::Pressed {
+            keycode: KeyCode::Escape,
+            modifiers: Default::default()
+        })
+    ));
+    assert_eq!(s.playhead.get(), 0.);
+    assert!(s.ruler_drag.borrow().is_none());
+    dispatcher.dispatch(
+        &mut tree,
+        &Event::Mouse(MouseEvent::ButtonReleased {
+            button: MouseButton::Left,
+            x,
+            y,
+            click_count: 1,
+        }),
+    );
+    assert_eq!(s.playhead.get(), 0.);
+    assert!(dispatcher.dispatch(&mut tree, &press));
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Mouse(MouseEvent::ButtonReleased {
+            button: MouseButton::Left,
+            x,
+            y,
+            click_count: 1
+        })
+    ));
+    assert!((s.playhead.get() - 0.09).abs() < 0.0003);
+    assert_eq!(s.region_editor.selection.get(), Selection::default());
+    assert!(s.model.borrow().undo.is_empty());
+}
+
+#[test]
+fn mounted_editor_context_menu_copy_and_paste_use_the_selected_range() {
+    let s = fixture();
+    s.size.set(Size::new(1200., 860.));
+    s.editor_set_selection(Selection {
+        anchor: 100,
+        head: 200,
+    });
+    let mut tree = scarlet_ui::ElementTree::new();
+    tree.set_root(s.create_element());
+    for _ in 0..3 {
+        tree.root_mut().unwrap().rebuild();
+        tree.layout(LayoutConstraints::tight(1200., 860.));
+    }
+    let mut selections = vec![];
+    render_bounds::<SelectionRender>(tree.root().unwrap(), Point::ZERO, &mut selections);
+    let (origin, _) = selections[0];
+    let mut dispatcher = scarlet_ui::EventDispatcher::new();
+    assert!(dispatcher.dispatch(
+        &mut tree,
+        &Event::Mouse(MouseEvent::ButtonPressed {
+            button: MouseButton::Right,
+            x: (origin.x + 50.) as i32,
+            y: (origin.y + 40.) as i32,
+            click_count: 1
+        })
+    ));
+    assert!(s.region_editor.menu.get().is_some());
+    assert_eq!(s.region_editor.selection.get().range(), 100..200);
+    for keycode in [KeyCode::Down, KeyCode::Enter] {
+        assert!(dispatcher.dispatch(
+            &mut tree,
+            &Event::Keyboard(KeyEvent::Pressed {
+                keycode,
+                modifiers: Default::default()
+            })
+        ));
+    }
+    assert!(s.region_editor.menu.get().is_none());
+    assert_eq!(
+        s.region_editor
+            .clipboard
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .audio
+            .frames,
+        100
+    );
+    assert!(s.model.borrow().undo.is_empty());
+    s.editor_set_selection(Selection {
+        anchor: 500,
+        head: 500,
+    });
+    s.seek(1500. / 8000.);
+    s.editor_paste();
+    assert_eq!(s.model.borrow().project.tracks[0].clips.len(), 2);
+    assert_eq!(s.model.borrow().project.tracks[0].clips[1].start, 1500);
+    assert_eq!(s.model.borrow().project.tracks[0].clips[1].frames, 100);
+    s.undo(false);
+    assert_eq!(s.model.borrow().project.tracks[0].clips[0].frames, 800);
+}
+
+#[test]
+fn changing_selected_region_cancels_editor_ruler_preview() {
+    let s = fixture();
+    let event = Event::Mouse(MouseEvent::ButtonPressed {
+        button: MouseButton::Left,
+        x: 100,
+        y: 10,
+        click_count: 1,
+    });
+    assert!(s.editor_ruler_event(&event));
+    assert!(s.playhead.get() > 0.);
+    s.choose(0, None);
+    assert!(s.ruler_drag.borrow().is_none());
+    assert!(s.region_editor.ruler_bounds.get().is_none());
+    assert_eq!(s.playhead.get(), 0.);
+}
+
+#[test]
+fn zero_crossing_uses_raw_dominant_channel_and_scrollbar_does_not_edit_audio() {
+    let s = fixture();
+    s.edit("Crossing source", |m| {
+        let c = &mut m.project.tracks[0].clips[0];
+        c.samples = Arc::new(
+            (0..800)
+                .map(|i| {
+                    let a = if i < 105 { -0.5 } else { 0.5 };
+                    [a, -a] // Opposite phase must not become a false all-zero signal.
+                })
+                .collect(),
+        );
+        c.source_offset = 0;
+        c.set_fades(200, 200)
+    });
+    s.region_editor.zero_cross.set(true);
+    let clip = s.model.borrow().project.tracks[0].clips[0].clone();
+    let x = 100. / 800. * s.region_editor.waveform_size().width;
+    assert_eq!(s.editor_pointer_frame(x, &clip), 105);
+    assert_eq!(s.editor_pointer_frame(0., &clip), 0);
+    s.region_editor.set_view(0., 200., 800);
+    let before = s.model.borrow().undo.len();
+    s.editor_scrollbar_event(
+        &Event::Mouse(MouseEvent::ButtonPressed {
+            button: MouseButton::Left,
+            x: 10,
+            y: 10,
+            click_count: 1,
+        }),
+        400.,
+    );
+    s.editor_scrollbar_event(&Event::Mouse(MouseEvent::Moved { x: 160, y: 10 }), 400.);
+    assert_eq!(s.region_editor.start.get(), 300.);
+    s.editor_scrollbar_event(
+        &Event::Mouse(MouseEvent::ButtonCancelled {
+            button: MouseButton::Left,
+            x: 160,
+            y: 10,
+        }),
+        400.,
+    );
+    assert_eq!(s.region_editor.start.get(), 0.);
+    assert_eq!(s.model.borrow().undo.len(), before);
+    assert!(Arc::ptr_eq(
+        &clip.samples,
+        &s.model.borrow().project.tracks[0].clips[0].samples
+    ));
+}
+
+#[test]
+fn sample_edit_waits_for_range_gesture_and_discards_results_after_project_change() {
+    let s = fixture();
+    s.editor_set_selection(Selection {
+        anchor: 100,
+        head: 200,
+    });
+    s.editor_silence();
+    // Freeze a UI range gesture while the worker finishes.
+    s.region_editor
+        .drag
+        .set(Some(s.region_editor.selection.get()));
+    for _ in 0..20 {
+        s.poll_region_processing();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(s.region_processing_active());
+    assert!(s.model.borrow().undo.is_empty());
+    s.region_editor.drag.set(None);
+    finish_worker(&s);
+    assert_eq!(s.model.borrow().undo.len(), 1);
+    let source = s.model.borrow().project.tracks[0].clips[0].samples.clone();
+    s.editor_set_selection(Selection {
+        anchor: 300,
+        head: 400,
+    });
+    s.editor_reverse_range();
+    s.edit("Rename during processing", |m| {
+        m.project.tracks[0].name = "Renamed during processing".into();
+        Ok(())
+    });
+    finish_worker(&s);
+    assert!(s.status.get().contains("discarded"));
+    assert!(Arc::ptr_eq(
+        &source,
+        &s.model.borrow().project.tracks[0].clips[0].samples
+    ));
+    assert_eq!(s.model.borrow().project.tracks[0].clips[0].frames, 800);
 }

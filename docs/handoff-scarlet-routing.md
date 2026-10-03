@@ -1,3 +1,15 @@
+## 2026-10-03: オーディオ範囲編集とEditorルーラー
+
+- 通常のAudio Track Editorとして範囲操作を改善。選択端のドラッグ／Shift拡張、秒・サンプル単位のStart/End入力、ゼロクロス補助、サンプル線・点表示、表示倍率と独立スクロールバー、右クリック編集メニューを追加。
+- ユーザー指定に合わせ、Cutはコピー＋削除、Deleteは削除だけ。どちらも選択部分の両端で分割してその部分だけ取り除き、残る音声の時刻・元音源・包絡を保持する。時間を詰める処理は行わない。PasteはLogic Audio Track Editorの操作に合わせ、選択トラックの再生ヘッド位置へ独立したリージョンとして貼り付ける。Copy/Pasteはgain・fade・reverse metadataと元音源を共有する。異なるsample rateへのPasteは未対応。
+- ハサミのアイコンはSplitに限定。Cutは右クリックメニューとCmd/Ctrl+X。TrimもメニューとCmd/Ctrl+Tへ整理し、操作と合わない縮小矢印のアイコンを除去。Copy・Paste・Delete・Silence・Splitと虫眼鏡は同じ28px controls。Gain・Fadeをsidebarの先へ置き、細かい範囲入力はその下へ整理。
+- Editorルーラーのクリック／ドラッグをメインと同じtransportへ接続。リージョン開始位置と独立viewportを考慮し、音楽snapを適用せずサンプル境界へseek。範囲選択を維持、再生を継続し、Escape / pointer cancel / 選択対象変更で未確定seekを取り消す。
+- フェードは上端ハンドルでpreview・cancelし、release時に1 Undoとしてcommit。Silence / 部分Reverse / Normalizeはcancel可能なworkerで実行。新しい音源の波形ピークもworkerで用意し、UIで全サンプルを集計しない。競合編集の結果を破棄し、gesture中のcommitを延期する。DSP / CLAP ownersは従来のlive-update経路で保持する。
+- 全体移調はMelodyne型の音符単位補正ではないため通常UIから除去。音符検出・音符編集は未実装。coreの既存pitch API / testsは維持。
+- host workspace: **406 passed / 21 ignored**。最終の選択切替修正後はapp全体 **212 passed / 4 ignored** を再検証。macOS release成功。selection gestures、full-range Cut/Paste、non-ripple positions、Cut/Delete clipboard差、Undo、live transport、rulerのglobal座標・capture・Escape、source共有、包絡・render/serde、worker競合を確認。ログは `artifacts/audio-editor-workspace.log`、`audio-editor-app-final.log`、`audio-editor-release-final.log`。今回のGUI自動操作はnative file dialogを経由した最終fixture再確認まで完了しておらず、最終操作の証拠はmounted dispatch tests。Scarlet runtimeは再実行していない。
+
+- Native AArch64 / RISC-V64 release buildとELF audit成功。今回のMac用Nix devShellに含まれるtoolchainのnative stdはPICでなくlinkに失敗したため、既存Scarlet PIC SDKのcompilerで検証した。readelfは既存LLVM toolsをPATHに追加。sourceやCargo pinへのマシン固有patchは追加していない。ログは `artifacts/audio-editor-native-final.log`。
+
 ## 2026-10-03: SWS CLAP ウィンドウの影が黒くなる問題
 
 - CLAP hostの `gui_sws.rs` が `WindowCreateRequest.opaque = true` を固定していた。custom chromeの角丸・影はalphaを持つため、この指定ではSWSへの `set_window_has_alpha_content(true)` が省かれていた。

@@ -3,29 +3,42 @@
 use super::*;
 use std::sync::atomic::AtomicBool;
 
-#[derive(Clone, Copy)]
-enum RegionOperation {
+#[derive(Clone)]
+pub(super) enum RegionOperation {
+    #[cfg(test)]
     Transpose(f32),
     Normalize(f32),
+    Edit {
+        edit: resonara_core::audio_edit::AudioEdit,
+        selection: std::ops::Range<usize>,
+    },
 }
 
 impl RegionOperation {
-    fn label(self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
+            #[cfg(test)]
             Self::Transpose(_) => "Transpose region",
             Self::Normalize(_) => "Normalize region",
+            Self::Edit { edit, .. } => match edit {
+                resonara_core::audio_edit::AudioEdit::Silence(_) => "Silence selected audio",
+                resonara_core::audio_edit::AudioEdit::Reverse(_) => "Reverse selected audio",
+            },
         }
     }
 
-    fn progress(self) -> String {
+    fn progress(&self) -> String {
         match self {
+            #[cfg(test)]
             Self::Transpose(amount) => format!("Transposing region {amount:+.2} semitones…"),
             Self::Normalize(target) => format!("Normalizing region to {target:.1} dBFS…"),
+            Self::Edit { .. } => format!("{}…", self.label()),
         }
     }
 
-    fn process(self, original: &Clip, rate: u32, cancel: &AtomicBool) -> WorkerResult {
+    fn process(&self, original: &Clip, _rate: u32, cancel: &AtomicBool) -> WorkerResult {
         match self {
+            #[cfg(test)]
             Self::Transpose(amount) => {
                 let end = original
                     .source_offset
@@ -35,12 +48,19 @@ impl RegionOperation {
                     .samples
                     .get(original.source_offset..end)
                     .ok_or("Invalid region")?;
-                let samples = resonara_core::pitch::transpose_region(source, rate, amount, cancel)
-                    .map_err(|error| error.to_string())?;
+                let samples =
+                    resonara_core::pitch::transpose_region(source, _rate, *amount, cancel)
+                        .map_err(|error| error.to_string())?;
                 ProcessedAudio::new(samples, original.frames, cancel).map(RegionOutput::Audio)
             }
             Self::Normalize(target) => {
-                normalize_gain(original, target, cancel).map(RegionOutput::Gain)
+                normalize_gain(original, *target, cancel).map(RegionOutput::Gain)
+            }
+            Self::Edit { edit, .. } => {
+                let clip = resonara_core::audio_edit::edit_region_audio(original, edit, cancel)
+                    .map_err(|error| error.to_string())?;
+                let peaks = wave::PreparedPeaks::new(&clip.samples, cancel)?;
+                Ok(RegionOutput::Edited(clip, peaks))
             }
         }
     }
@@ -48,7 +68,9 @@ impl RegionOperation {
 
 // Only a worker constructs this after validating the complete buffer. Committing
 // it on the UI thread then requires only a length check and an Arc assignment.
+#[cfg(test)]
 struct ProcessedAudio(Arc<Vec<[f32; 2]>>);
+#[cfg(test)]
 impl ProcessedAudio {
     fn new(
         samples: Vec<[f32; 2]>,
@@ -71,8 +93,10 @@ impl ProcessedAudio {
 }
 
 enum RegionOutput {
+    #[cfg(test)]
     Audio(ProcessedAudio),
     Gain(f32),
+    Edited(Clip, wave::PreparedPeaks),
 }
 type WorkerResult = std::result::Result<RegionOutput, String>;
 
@@ -159,6 +183,7 @@ impl Daw {
         self.region_job.borrow().is_some()
     }
 
+    #[cfg(test)]
     pub(super) fn editor_transpose(&self) {
         let amount = match self.region_editor.transpose.get().trim().parse::<f32>() {
             Ok(value)
@@ -190,7 +215,7 @@ impl Daw {
         self.start_region_processing(RegionOperation::Normalize(target));
     }
 
-    fn start_region_processing(&self, operation: RegionOperation) {
+    pub(super) fn start_region_processing(&self, operation: RegionOperation) {
         if self.busy() || self.region_processing_active() || self.dialog.get() != Dialog::None {
             return;
         }
@@ -215,11 +240,13 @@ impl Daw {
         let input = original.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
+        let worker_operation = operation.clone();
+        let progress = operation.progress();
         let (tx, result) = mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("region-processing".into())
             .spawn(move || {
-                let output = operation.process(&input, rate, &worker_cancel);
+                let output = worker_operation.process(&input, rate, &worker_cancel);
                 let _ = tx.send(output);
             });
         if let Err(error) = worker {
@@ -238,7 +265,7 @@ impl Daw {
             result,
         });
         drop(m);
-        self.status.set(operation.progress());
+        self.status.set(progress);
         self.changed();
     }
 
@@ -252,7 +279,11 @@ impl Daw {
     pub(super) fn poll_region_processing(&self) {
         // Never commit in the middle of a gesture, file operation, or modal
         // edit. The user can continue playing and navigating during processing.
-        if self.busy() || self.dialog.get() != Dialog::None {
+        if self.busy()
+            || self.dialog.get() != Dialog::None
+            || self.editor_gesture_active()
+            || self.ruler_drag.borrow().is_some()
+        {
             return;
         }
         {
@@ -283,12 +314,20 @@ impl Daw {
         }
         match output {
             Ok(output) => {
-                let valid = match (&output, job.operation) {
+                let valid = match (&output, &job.operation) {
+                    #[cfg(test)]
                     (RegionOutput::Audio(audio), RegionOperation::Transpose(_)) => {
                         audio.0.len() == job.original.frames
                     }
                     (RegionOutput::Gain(gain), RegionOperation::Normalize(_)) => {
                         gain.is_finite() && (-60.0..=24.0).contains(gain)
+                    }
+                    (RegionOutput::Edited(clip, _), RegionOperation::Edit { selection, .. }) => {
+                        clip.start == job.original.start
+                            && clip.frames > 0
+                            && clip.source_offset == 0
+                            && clip.samples.len() == clip.frames
+                            && selection.end <= clip.frames
                     }
                     _ => false,
                 };
@@ -298,6 +337,7 @@ impl Daw {
                     self.changed();
                     return;
                 }
+                let committed = Cell::new(false);
                 self.edit(job.operation.label(), |m| {
                     // Polling CLAP state inside edit() can itself change the
                     // project. Recheck after that poll and before mutating it.
@@ -306,16 +346,37 @@ impl Daw {
                     }
                     let clip = &mut m.project.tracks[job.track].clips[job.clip];
                     match output {
+                        #[cfg(test)]
                         RegionOutput::Audio(audio) => {
                             clip.samples = audio.0;
                             clip.source_offset = 0;
                         }
                         RegionOutput::Gain(gain) => clip.set_gain_db(gain)?,
+                        RegionOutput::Edited(edited, peaks) => {
+                            *clip = edited;
+                            m.peaks.install(peaks);
+                        }
                     }
+                    committed.set(true);
                     Ok(())
                 });
+                #[cfg(test)]
                 if matches!(job.operation, RegionOperation::Transpose(_)) {
                     self.region_editor.transpose.set("0.00".into());
+                }
+                if let RegionOperation::Edit { selection, .. } = &job.operation {
+                    let m = self.model.borrow();
+                    let selected = m.selected == job.track
+                        && m.clip == Some(job.clip)
+                        && m.selected_bus.is_none()
+                        && m.version != job.version;
+                    drop(m);
+                    if selected && committed.get() {
+                        self.editor_set_selection(region_editor::Selection {
+                            anchor: selection.start,
+                            head: selection.end,
+                        });
+                    }
                 }
             }
             Err(error) => {
