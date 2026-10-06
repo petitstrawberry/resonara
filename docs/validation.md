@@ -1,12 +1,13 @@
 ## 2026-10-06 — macOS native event-loop correction
 
-ScarletUI is pinned to `e2930e20acb108ff8ccf2a48dfb1a6629bbf42ab`.
+ScarletUI is pinned to `86a765daaf26545fc0294aa7054d98630df9e368`.
 macOS now runs the application tick inside winit native callbacks, completing
 resize layout and GPU presentation before the redraw callback returns. The
 native event loop remains running throughout AppKit live-resize tracking.
 Per-pump mouse-button polling, which cancelled ordinary clicks, was removed;
 focus loss still cancels capture without generating a click. Callback-created
-scenes use the scoped active event loop. SWS retains its polling runner.
+scenes use the scoped active event loop. SWS retains its polling runner. Explicitly narrow sliders now honor their
+allocated width instead of overflowing it to 100 logical pixels.
 
 Release workspace tests: 407 passed, 21 existing opt-in tests ignored.
 Log: `artifacts/native-loop-git-tests.log`. Native resize and button interaction
