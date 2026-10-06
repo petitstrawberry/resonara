@@ -3925,7 +3925,7 @@ fn hiding_mixer_fills_arrangement_and_restores_split_after_resize() {
             assert!(s.arrangement_size.get().height > before + 280.);
             assert_eq!(s.panel_fraction.get(), split);
 
-            s.sync_content_size(Size::new(1280., 1032.));
+            s.sync_content_size(Size::new(1280., 1000.));
             pipeline.resize(Size::new(1280., 1032.));
             for _ in 0..8 {
                 let _ = pipeline.render();
@@ -3985,20 +3985,34 @@ fn native_resize_notifications_coalesce_to_final_size_without_duplicate_scene_de
         s.on_window_resize(&ctx, 1280, 860);
         s.on_window_resize(&ctx, 1188, 816);
         assert_eq!(s.size.get(), original);
-        s.sync_content_size(Size::new(original.width, original.height + 32.));
+        s.sync_content_size(original);
         s.animate_playhead(0.3);
         let _ = pipeline.render();
     }
     assert_eq!(notifications.load(Ordering::Relaxed), 0);
     assert_eq!(s.profiler.borrow().body_builds, 0);
-    s.sync_content_size(Size::new(1300., 842.));
-    assert_eq!(s.size.get(), Size::new(1300., 810.));
+    let surface = Size::new(1300., 842.);
+    pipeline.resize(surface);
+    for _ in 0..8 {
+        let _ = pipeline.render();
+    }
+    let chrome = scarlet_ui::views::WindowContentLayout::for_decoration(
+        scarlet_ui::platform::WindowDecoration::DEFAULT,
+    )
+    .decoration_size();
+    assert_eq!(
+        s.size.get(),
+        Size::new(surface.width - chrome.width, surface.height - chrome.height)
+    );
     assert_eq!(notifications.load(Ordering::Relaxed), 1);
-    s.sync_content_size(Size::new(1300., 842.));
+    pipeline.resize(surface);
+    for _ in 0..8 {
+        let _ = pipeline.render();
+    }
     assert_eq!(
         notifications.load(Ordering::Relaxed),
         1,
-        "equal sync size must not notify"
+        "equal content geometry must not notify"
     );
     s.size.unsubscribe(subscription);
     pipeline.teardown();
@@ -4590,7 +4604,7 @@ fn manual_timeline_scroll_suspends_follow_until_transport_restarts() {
 fn mixer_divider_resizes_meter_and_fader_within_the_content_limits() {
     wait_for_test_font();
     let s = Daw::new(project());
-    s.sync_content_size(Size::new(1280., 1032.));
+    s.sync_content_size(Size::new(1280., 1000.));
     let mut pipeline = scarlet_ui::RenderingPipeline::new();
     pipeline.set_root(
         Window::new("Resizable meters", s.clone())

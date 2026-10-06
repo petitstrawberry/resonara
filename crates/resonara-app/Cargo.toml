@@ -7,7 +7,7 @@ log = "=0.4.34"
 resonara-core = { path = "../resonara-core" }
 resonara-platform = { path = "../resonara-platform" }
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "f0a8b770352bc0b9e57df5c88a7520723a147114", default-features = false, features = ["std", "platform-winit"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "339f2550e726e6bb70388f3f7a9940f6c07ea26f", default-features = false, features = ["std", "platform-winit"] }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "f0a8b770352bc0b9e57df5c88a7520723a147114", default-features = false, features = ["std", "platform-sws"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "339f2550e726e6bb70388f3f7a9940f6c07ea26f", default-features = false, features = ["std", "platform-sws"] }

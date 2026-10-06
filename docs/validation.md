@@ -1,5 +1,17 @@
 # Validation record
 
+## 2026-10-06 — Backend decoration and content geometry
+
+ScarletUI is pinned to `339f2550e726e6bb70388f3f7a9940f6c07ea26f`.
+The winit backend now uses system decorations by default; SWS retains ScarletUI chrome.
+Resonara expands its content viewport and uses the existing `on_geometry_change`
+notification instead of subtracting 32 pixels from the platform surface height.
+Resize tests exercise actual pipeline layout, coalesced notifications, and unchanged
+geometry without repeated root rebuilds. Release workspace tests from the normal
+Git pins passed: 407 tests, 21 existing opt-in tests ignored. Logs are
+`artifacts/system-decoration-git-tests.log`. Native window interaction and Scarlet
+runtime are not established by these tests.
+
 Date: 2026-10-01. Base commit:
 `15b0ced5d49714790c879319034584ceb60d55f7`.
 This records the cloud validation and subsequent user-requested Mac handoff.

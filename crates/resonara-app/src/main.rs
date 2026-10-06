@@ -2317,8 +2317,7 @@ impl Daw {
             .background(BG),
         )
     }
-    fn sync_content_size(&self, window: Size) {
-        let size = Size::new(window.width, (window.height - 32.).max(600.));
+    fn sync_content_size(&self, size: Size) {
         if self.size.get() != size {
             self.size.set(size);
         }
@@ -2465,7 +2464,17 @@ impl View for Daw {
     fn create_element(&self) -> Box<dyn scarlet_ui::Element> {
         Box::new(scarlet_ui::ComponentElement::new_with_builder(
             self.clone(),
-            |s| Box::new(s.body()),
+            |s| {
+                let app = s.clone();
+                Box::new(
+                    s.body()
+                        .frame(f32::INFINITY, f32::INFINITY)
+                        .on_geometry_change(
+                            |geometry| geometry.size(),
+                            move |size| app.sync_content_size(size),
+                        ),
+                )
+            },
         ))
     }
     fn listenables(&self) -> Vec<&dyn Listenable> {
@@ -2521,7 +2530,7 @@ impl Application for Daw {
     }
     fn on_window_resize(&mut self, _: &WindowContext, _: u32, _: u32) {
         // Native resize events may be queued echoes. Publish the final actual
-        // window size once in on_window_sync, after the event batch is drained.
+        // content geometry is published after layout, following the final resize.
     }
     fn on_window_close_requested(&mut self, _: &WindowContext) -> bool {
         if self.busy() {
@@ -2537,8 +2546,7 @@ impl Application for Daw {
             true
         }
     }
-    fn on_window_sync(&mut self, _: &WindowContext, window: &mut dyn scarlet_ui::PlatformWindow) {
-        self.sync_content_size(window.size());
+    fn on_window_sync(&mut self, _: &WindowContext, _: &mut dyn scarlet_ui::PlatformWindow) {
         self.profiler.borrow_mut().sync();
     }
     fn on_frame_presented(&mut self, _: &WindowContext) {
