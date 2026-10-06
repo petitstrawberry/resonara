@@ -1,5 +1,14 @@
 # Validation record
 
+## 2026-10-06 — Native resize notification handling
+
+ScarletUI is pinned to `2ae7c2d0c90d5beafdcaddd39e36608803f34f75`.
+Platform resize notifications now update layout without asking winit to resize
+the native window back to the reported size. Explicit application resize requests
+remain separate; SWS keeps its backing-allocation handshake. Release workspace
+tests passed: 407 tests, 21 existing opt-in tests ignored. Log:
+`artifacts/resize-git-tests.log`. Native interaction is checked in Cadence separately.
+
 ## 2026-10-06 — Backend decoration and content geometry
 
 ScarletUI is pinned to `339f2550e726e6bb70388f3f7a9940f6c07ea26f`.

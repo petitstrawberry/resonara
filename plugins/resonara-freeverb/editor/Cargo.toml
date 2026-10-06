@@ -12,7 +12,7 @@ std = ["scarlet-ui/std"]
 scarlet = ["scarlet-ui/legacy-scarlet-std", "dep:scarlet-std"]
 [dependencies]
 scarlet-clap-gui = { path = "../../../crates/scarlet-clap-gui" }
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "339f2550e726e6bb70388f3f7a9940f6c07ea26f", default-features = false }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "2ae7c2d0c90d5beafdcaddd39e36608803f34f75", default-features = false }
 
 libm = "0.2"
 core_maths = "0.1"
