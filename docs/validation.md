@@ -1,5 +1,15 @@
 # Validation record
 
+## 2026-10-06 — Native extent and pointer reconciliation
+
+ScarletUI is pinned to `a97f17ae911eca925eaddc54f00f1f0d528a4b7a`.
+The runner compares native size with the rendered size on every tick, instead
+of comparing only the two native reads around the application sync hook. This
+updates the drawing extent after missed resize/restoration notifications. macOS
+reconciles pressed mouse buttons after pumping events and cancels stale capture
+if native tracking consumed mouse-up. Release workspace tests passed: 407 tests,
+21 existing opt-in tests ignored. Log: `artifacts/resize-final-git-tests.log`.
+
 ## 2026-10-06 — Native resize notification handling
 
 ScarletUI is pinned to `2ae7c2d0c90d5beafdcaddd39e36608803f34f75`.
