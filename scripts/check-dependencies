@@ -18,12 +18,12 @@ assert 'cpal' not in platform['dependencies'], 'CPAL must not leak into Scarlet 
 assert 'cpal' in platform['target']['cfg(not(target_os = "scarlet"))']['dependencies']
 assert 'scarlet-os' not in platform['dependencies'], 'Scheduler control must remain Scarlet-only'
 sas = platform['target']['cfg(target_os = "scarlet")']['dependencies']['sas-client']
-assert sas.get('git') == 'https://github.com/petitstrawberry/Scarlet' and sas.get('rev') == 'b3d2a55740a3d2ca49daad0ec7baba233f706f7a'
+assert sas.get('git') == 'https://github.com/petitstrawberry/Scarlet' and sas.get('rev') == 'd3b1c05127d4df3616f988b81a99f616e8a88064'
 assert 'path' not in sas, 'Native audio must use a portable Git pin'
 scheduler = platform['target']['cfg(target_os = "scarlet")']['dependencies']['scarlet-os']
 assert scheduler.get('git') == sas.get('git') and scheduler.get('rev') == sas.get('rev'), 'Scheduler and SAS must share the same Scarlet runtime'
 assert scheduler.get('features') == ['std'] and not scheduler.get('default-features', True)
-revision = '8468af9bcc977153259a82203962b84f9b78700a'
+revision = 'ce807d0f2dfc978c60d7f3b807026455ee101da4'
 repository = 'https://github.com/petitstrawberry/scarlet-ui'
 assert dependency.get('git') == repository, 'ScarletUI must use its Git source'
 assert dependency.get('rev') == revision, 'Review and update the ScarletUI pin explicitly'
@@ -35,7 +35,7 @@ assert 'resonara-freeverb-editor' not in app['dependencies'], 'Host must open Fr
 
 
 runtime_repository = 'https://github.com/petitstrawberry/Scarlet'
-runtime_revision = 'b3d2a55740a3d2ca49daad0ec7baba233f706f7a'
+runtime_revision = 'd3b1c05127d4df3616f988b81a99f616e8a88064'
 packages = tomllib.loads((root / 'Cargo.lock').read_text())['package']
 ui = [p for p in packages if p['name'].startswith('scarlet-ui') or p['name'] == 'scarlet-scroll-motion']
 expected = f'git+{repository}?rev={revision}#{revision}'

@@ -12,12 +12,12 @@ std = ["scarlet-ui/std"]
 scarlet = ["scarlet-ui/legacy-scarlet-std", "dep:scarlet-std"]
 [dependencies]
 scarlet-clap-gui = { path = "../../../crates/scarlet-clap-gui" }
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "a97f17ae911eca925eaddc54f00f1f0d528a4b7a", default-features = false }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "ce807d0f2dfc978c60d7f3b807026455ee101da4", default-features = false }
 
 libm = "0.2"
 core_maths = "0.1"
 [target.'cfg(target_os = "scarlet")'.dependencies]
-scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", optional = true }
+scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "=0.6.4"
 objc2-foundation = { version = "=0.3.2", features = ["NSString", "NSThread"] }
