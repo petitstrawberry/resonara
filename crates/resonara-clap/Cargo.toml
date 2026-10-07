@@ -16,4 +16,4 @@ objc2-app-kit = { version = "=0.3.2", features = ["NSApplication", "NSWindow", "
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "7c3ec90fde347202cbec1a3a9dfeae878ec2a391", default-features = false, features = ["std", "platform-sws"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "1b0f08aeb0a7057c9a6d0d7312554372411afff8", default-features = false, features = ["std", "platform-sws"] }
